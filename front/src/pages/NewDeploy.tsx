@@ -1,105 +1,104 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
-import UploadSection from '../components/UploadSection'
-import AnalysisSection from '../components/AnalysisSection'
-import TargetSection from '../components/TargetSection'
-import PlanSection from '../components/PlanSection'
-import ResultSection from '../components/ResultSection'
-import ProgressPanel from '../components/ProgressPanel'
-import RecentDeploys from '../components/RecentDeploys'
+import { api, sourceName } from '../api'
+import StepRail, { type RailItem } from '../components/StepRail'
+import ProviderMark from '../components/ProviderMark'
+import SourceStep from '../steps/SourceStep'
+import ScaleStep from '../steps/ScaleStep'
+import AnalysisStep from '../steps/AnalysisStep'
+import ReviewStep from '../steps/ReviewStep'
+import DeployStep from '../steps/DeployStep'
+import { costText, tierTotal } from '../format'
 import type {
   Analysis,
-  CostLine,
-  DeployRecord,
+  Choice,
+  Connection,
   DeployStatus,
-  PlanSummary,
+  Recommendation,
   ScaleInput,
-  StepKey,
-  StepStatus,
-  Target,
+  Source,
+  TerraformBundle,
 } from '../types'
 
-const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
-const isRunning = (s: DeployStatus) => Object.values(s.steps).includes('active')
+const STEPS = [
+  { label: '소스', title: '소스 가져오기', desc: 'zip 파일을 올리거나 GitHub public 저장소 주소를 넣으세요.' },
+  { label: '사용 규모', title: '사용 규모', desc: '대략적인 값이면 됩니다. 서버 크기와 비용을 고르는 데만 씁니다.' },
+  { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과, 연결된 배포 대상별 구성과 비용을 나란히 비교합니다.' },
+  { label: '코드 검토', title: '코드 검토', desc: 'AI가 만든 코드와 변경 계획입니다. 승인하기 전에는 아무것도 만들지 않습니다.' },
+  { label: '배포', title: '배포', desc: '이미지를 빌드해 배포하고 헬스체크까지 확인합니다.' },
+]
 
-function now() {
-  const d = new Date()
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '' }
+
+type Busy = null | 'analyze' | 'generate' | 'approve'
+
+const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+interface Props {
+  connections: Connection[]
+  userName: string
+  onShowHistory: () => void
+  onShowConnections: () => void
 }
 
-export default function NewDeploy({ onShowHistory }: { onShowHistory: () => void }) {
-  const [file, setFile] = useState<File | null>(null)
-  const [scale, setScale] = useState<ScaleInput>({ expectedUsers: '~100', purpose: '' })
-  const [analyzing, setAnalyzing] = useState(false)
+export default function NewDeploy({ connections, userName, onShowHistory, onShowConnections }: Props) {
+  const [step, setStep] = useState(0)
+  const [source, setSourceState] = useState<Source | null>(null)
+  const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
-  const [targets, setTargets] = useState<Target[]>(['aws', 'onprem'])
-  const [costs, setCosts] = useState<CostLine[] | null>(null)
-  const [plan, setPlan] = useState<PlanSummary | null>(null)
+  const [rec, setRec] = useState<Recommendation | null>(null)
+  const [choice, setChoiceState] = useState<Choice | null>(null)
+  const [bundle, setBundle] = useState<TerraformBundle | null>(null)
+  const [confirmed, setConfirmed] = useState(false)
   const [approved, setApproved] = useState(false)
   const [deploy, setDeploy] = useState<DeployStatus | null>(null)
   const [runId, setRunId] = useState(0)
-  const [records, setRecords] = useState<DeployRecord[]>([])
+  const [busy, setBusy] = useState<Busy>(null)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    api.history().then(setRecords).catch(() => {})
-  }, [])
-
-  // 분석이 끝났거나 배포 대상이 바뀌면 비용과 plan을 다시 받음
-  useEffect(() => {
-    if (!analysis || approved) return
-    setCosts(null)
-    setPlan(null)
-    if (targets.length === 0) return
-    let cancelled = false
-    Promise.all([
-      api.estimate(analysis.projectId, targets, scale),
-      api.plan(analysis.projectId, targets),
-    ])
-      .then(([c, p]) => {
-        if (cancelled) return
-        setCosts(c)
-        setPlan(p)
-      })
-      .catch((e) => !cancelled && setError(errMsg(e)))
-    return () => {
-      cancelled = true
+  // 앞 단계 입력이 바뀌면 뒤 단계 결과는 버림
+  const clearFrom = (level: 'analysis' | 'bundle') => {
+    if (level === 'analysis') {
+      setAnalysis(null)
+      setRec(null)
+      setChoiceState(null)
     }
-    // scale은 분석 이후 바꿀 수 없으므로 의존성에서 뺌
-  }, [analysis, targets, approved])
+    setBundle(null)
+    setConfirmed(false)
+  }
+  const setSource = (s: Source | null) => {
+    setSourceState(s)
+    clearFrom('analysis')
+  }
+  const setScale = (s: ScaleInput) => {
+    setScaleState(s)
+    if (analysis) clearFrom('analysis')
+  }
+  const setChoice = (c: Choice) => {
+    setChoiceState(c)
+    clearFrom('bundle')
+  }
 
-  // 승인 후 상태 폴링
+  const reached = approved ? 4 : bundle ? 3 : analysis && rec && choice ? 2 : source ? 1 : 0
+  const locked = approved
+
+  const option = rec?.options.find((o) => o.connectionId === choice?.connectionId) ?? null
+  const selectedTier = option?.tiers.find((t) => t.key === choice?.tier) ?? null
+  const usable = connections.filter((c) => c.status === 'connected')
+
   useEffect(() => {
-    if (!runId || !analysis || !file) return
+    if (!runId || !analysis) return
     let stopped = false
     const tick = async () => {
       try {
         const s = await api.status(analysis.projectId)
         if (stopped) return
         setDeploy(s)
-        if (isRunning(s)) {
-          setTimeout(tick, 800)
-          return
-        }
-        const ok = s.steps.health === 'done'
-        const app = file.name.replace(/\.zip$/i, '')
-        setRecords((prev) => {
-          const version = 'v' + (prev.filter((r) => r.app === app).length + 1)
-          const added: DeployRecord[] = targets.map((t) => ({
-            id: `${runId}-${t}-${Date.now()}`,
-            app,
-            version,
-            target: t,
-            method: t === 'aws' ? 'Terraform' : 'Docker Compose',
-            status: ok ? 'success' : 'failed',
-            note: ok ? undefined : '헬스체크 실패',
-            createdAt: now(),
-          }))
-          return [...added, ...prev]
-        })
+        if (s.state === 'running') setTimeout(tick, 700)
+        else setBusy(null)
       } catch (e) {
-        if (!stopped) setError(errMsg(e))
+        if (stopped) return
+        setError(errMsg(e))
+        setBusy(null)
       }
     }
     tick()
@@ -108,101 +107,190 @@ export default function NewDeploy({ onShowHistory }: { onShowHistory: () => void
     }
   }, [runId])
 
-  const chooseFile = (f: File) => {
-    setFile(f)
-    setAnalysis(null)
-    setCosts(null)
-    setPlan(null)
+  const run = async (kind: Exclude<Busy, null>, fn: () => Promise<void>) => {
+    setBusy(kind)
+    setError(null)
+    try {
+      await fn()
+      // approve는 폴링이 끝날 때 busy를 푼다
+      if (kind !== 'approve') setBusy(null)
+    } catch (e) {
+      setError(errMsg(e))
+      setBusy(null)
+    }
+  }
+
+  const analyze = () =>
+    run('analyze', async () => {
+      if (!source) return
+      if (!analysis || !rec) {
+        const a = await api.analyze(source, scale)
+        const r = await api.recommend(a.projectId, scale)
+        setAnalysis(a)
+        setRec(r)
+        setChoiceState(r.options.length ? r.recommended : null)
+      }
+      setStep(2)
+    })
+
+  const generate = () =>
+    run('generate', async () => {
+      if (!analysis || !choice) return
+      if (!bundle) setBundle(await api.generate(analysis.projectId, choice))
+      setStep(3)
+    })
+
+  const approve = () =>
+    run('approve', async () => {
+      if (!analysis || !choice) return
+      await api.approve(analysis.projectId, choice)
+      setApproved(true)
+      setDeploy(null)
+      setStep(4)
+      setRunId((n) => n + 1)
+    })
+
+  const retry = () =>
+    run('approve', async () => {
+      if (!analysis || !choice) return
+      await api.approve(analysis.projectId, choice)
+      setRunId((n) => n + 1)
+    })
+
+  const restart = () => {
+    setStep(0)
+    setSourceState(null)
+    setScaleState(DEFAULT_SCALE)
+    clearFrom('analysis')
     setApproved(false)
     setDeploy(null)
     setError(null)
   }
 
-  const runAnalyze = async () => {
-    if (!file) return
-    setAnalyzing(true)
-    setError(null)
-    try {
-      setAnalysis(await api.analyze(file, scale))
-    } catch (e) {
-      setError(errMsg(e))
-    } finally {
-      setAnalyzing(false)
+  const railItems: RailItem[] = STEPS.map((s, i) => {
+    let sub: string | undefined
+    if (i === 0 && source) sub = sourceName(source)
+    if (i === 1 && source) sub = `월 ${scale.expectedUsers}명`
+    if (i === 2 && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
+    if (i === 3 && bundle) sub = `${bundle.plan.add}개 추가`
+    if (i === 4 && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
+
+    let state: RailItem['state'] = 'todo'
+    if (i === 4 && deploy?.state === 'failed') state = 'failed'
+    else if (i === step) state = 'current'
+    else if (i < reached || (i === 4 && deploy?.state === 'success')) state = 'done'
+
+    return { label: s.label, sub, state, enabled: i <= reached && busy === null }
+  })
+
+  const meta = STEPS[step]
+
+  let next: { label: string; onClick: () => void; disabled?: boolean } | null = null
+  if (step === 0) next = { label: '다음', onClick: () => setStep(1), disabled: !source }
+  if (step === 1)
+    next = {
+      label: busy === 'analyze' ? '코드 읽는 중…' : analysis ? '다음' : '분석하고 구성 추천받기',
+      onClick: analyze,
+      disabled: !analysis && usable.length === 0,
     }
-  }
-
-  const toggleTarget = (t: Target) =>
-    setTargets((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
-
-  const startDeploy = async () => {
-    if (!analysis) return
-    setApproved(true)
-    setError(null)
-    try {
-      await api.approve(analysis.projectId, targets)
-      setRunId((n) => n + 1)
-    } catch (e) {
-      setApproved(false)
-      setError(errMsg(e))
+  if (step === 2 && !locked)
+    next = {
+      label: busy === 'generate' ? '코드 작성 중…' : bundle ? '다음' : '배포 코드 만들기',
+      onClick: generate,
+      disabled: !choice,
     }
-  }
-
-  const steps: Record<StepKey, StepStatus> = deploy?.steps ?? {
-    upload: file ? 'done' : 'active',
-    analyze: analyzing ? 'active' : analysis ? 'done' : 'waiting',
-    approve: approved ? 'done' : analysis ? 'active' : 'waiting',
-    build: approved ? 'active' : 'waiting',
-    deploy: 'waiting',
-    health: 'waiting',
-  }
+  if (step === 2 && locked) next = { label: '다음', onClick: () => setStep(3) }
+  if (step === 3 && !locked)
+    next = { label: busy === 'approve' ? '승인 처리 중…' : '승인하고 배포', onClick: approve, disabled: !confirmed }
+  if (step === 3 && locked) next = { label: '배포 화면으로', onClick: () => setStep(4) }
 
   return (
-    <div className="layout">
-      <div className="main-col">
-        <div className="page-head">
-          <h1>새 배포</h1>
-          <p>zip을 올리면 AI가 분석하고 비용이 담긴 계획서를 만듭니다. 승인하면 AWS와 온프레미스에 배포합니다.</p>
-        </div>
+    <div className="deploy-layout">
+      <aside className="deploy-side">
+        <StepRail items={railItems} onSelect={setStep} />
+        {option && selectedTier && (
+          <div className="cost-note">
+            <span>월 예상 비용</span>
+            <strong>{costText(tierTotal(selectedTier))}</strong>
+            <small className="with-mark">
+              <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
+            </small>
+            {rec && (rec.recommended.connectionId !== option.connectionId || rec.recommended.tier !== selectedTier.key) && (
+              <small className="muted">AI 추천과 다른 선택</small>
+            )}
+          </div>
+        )}
+      </aside>
+
+      <section className="panel">
+        <header className="panel-head">
+          <span className="eyebrow">
+            {step + 1} / {STEPS.length}
+          </span>
+          <h1>{meta.title}</h1>
+          <p>{meta.desc}</p>
+        </header>
 
         {error && (
           <div className="error" role="alert">
-            요청이 실패했습니다: {error}
+            요청이 실패했습니다. {error}
           </div>
         )}
 
-        <UploadSection
-          file={file}
-          scale={scale}
-          analyzing={analyzing}
-          analyzed={Boolean(analysis)}
-          locked={approved}
-          onFile={chooseFile}
-          onScale={setScale}
-          onAnalyze={runAnalyze}
-        />
-        <AnalysisSection analysis={analysis} loading={analyzing} />
-        <TargetSection
-          enabled={Boolean(analysis)}
-          locked={approved}
-          targets={targets}
-          costs={costs}
-          scale={scale}
-          onToggle={toggleTarget}
-        />
-        <PlanSection
-          key={targets.join(',')}
-          plan={plan}
-          enabled={Boolean(analysis)}
-          approved={approved}
-          onApprove={startDeploy}
-        />
-        {deploy && <ResultSection status={deploy} onRetry={startDeploy} />}
-      </div>
+        <div className="panel-body">
+          {step === 0 && <SourceStep source={source} locked={locked} onSource={setSource} />}
+          {step === 1 && (
+            <ScaleStep
+              scale={scale}
+              locked={locked || busy === 'analyze'}
+              connections={connections}
+              onChange={setScale}
+              onShowConnections={onShowConnections}
+            />
+          )}
+          {step === 2 && analysis && rec && choice && (
+            <AnalysisStep analysis={analysis} rec={rec} choice={choice} locked={locked || busy !== null} onChoice={setChoice} />
+          )}
+          {step === 3 && bundle && option && selectedTier && (
+            <ReviewStep
+              bundle={bundle}
+              tier={selectedTier}
+              target={option}
+              approver={userName}
+              confirmed={confirmed}
+              locked={locked}
+              onConfirm={setConfirmed}
+            />
+          )}
+          {step === 4 && (
+            <DeployStep
+              status={deploy}
+              targetName={option?.name ?? ''}
+              retrying={busy === 'approve'}
+              onRetry={retry}
+              onRestart={restart}
+              onHistory={onShowHistory}
+            />
+          )}
+        </div>
 
-      <aside className="side-col">
-        <ProgressPanel steps={steps} urls={deploy?.urls ?? {}} />
-        <RecentDeploys records={records} onShowAll={onShowHistory} />
-      </aside>
+        {step < 4 && (
+          <footer className="panel-foot">
+            {step > 0 ? (
+              <button className="btn btn-ghost" onClick={() => setStep(step - 1)} disabled={busy !== null}>
+                이전
+              </button>
+            ) : (
+              <span />
+            )}
+            {next && (
+              <button className="btn btn-primary" onClick={next.onClick} disabled={next.disabled || busy !== null}>
+                {next.label}
+              </button>
+            )}
+          </footer>
+        )}
+      </section>
     </div>
   )
 }

@@ -1,184 +1,343 @@
 import type {
   Analysis,
-  CostLine,
+  Choice,
+  Connection,
+  ConnectionInput,
   DeployRecord,
   DeployStatus,
-  PlanSummary,
+  Recommendation,
   ScaleInput,
-  Target,
+  Session,
+  Source,
+  SsoDiscovery,
+  TerraformBundle,
+  TierKey,
+  User,
 } from '../types'
+import { ApiError, emitUnauthorized } from './http'
+import { buildFiles, buildPlan, CATALOG, findTier, logScript, publicUrl } from './catalog'
+import { PROVIDERS } from '../providers'
+import { now } from '../format'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-// 파일명에 fail 이 들어가면 헬스체크 실패 시나리오로 진행 (데모용)
+// 소스 이름에 fail 이 들어가면 헬스체크 실패 시나리오로 진행 (데모용)
 let failScenario = false
 let deployStartedAt = 0
-let deployTargets: Target[] = []
+let deployChoice: Choice | null = null
 
-export async function analyze(file: File, _scale: ScaleInput): Promise<Analysis> {
-  failScenario = /fail/i.test(file.name)
-  await wait(1400)
+export const sourceName = (s: Source) =>
+  s.kind === 'zip'
+    ? s.file.name.replace(/\.zip$/i, '')
+    : s.url.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'app'
+
+// ---------- 인증 (SSO) ----------
+// 실제로는 백엔드가 IdP와 OIDC/SAML로 주고받고 HttpOnly 쿠키를 심음.
+// mock은 데모용으로 탭 세션 저장소에 로그인 여부만 기억
+
+const SESSION_KEY = 'pc-mock-session'
+const PERSONAL_DOMAINS = ['gmail.com', 'naver.com', 'daum.net', 'hanmail.net', 'kakao.com', 'outlook.com', 'yahoo.com']
+const IDPS: [string, SsoDiscovery['protocol']][] = [
+  ['Microsoft Entra ID', 'oidc'],
+  ['Okta', 'oidc'],
+  ['Google Workspace', 'oidc'],
+  ['Keycloak', 'saml'],
+]
+
+let currentUser: User | null = null
+
+function readSession(): User | null {
+  if (currentUser) return currentUser
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY)
+    currentUser = raw ? (JSON.parse(raw) as User) : null
+  } catch {
+    currentUser = null
+  }
+  return currentUser
+}
+
+function requireUser(): User {
+  const u = readSession()
+  if (!u) {
+    emitUnauthorized()
+    throw new ApiError(401, '로그인이 만료되었습니다.')
+  }
+  return u
+}
+
+function requireAdmin() {
+  if (requireUser().role !== 'admin') throw new ApiError(403, '배포 대상은 관리자만 바꿀 수 있습니다.')
+}
+
+export async function session(): Promise<Session | null> {
+  await wait(250)
+  const user = readSession()
+  return user ? { user, csrfToken: 'mock-' + user.id } : null
+}
+
+export async function discover(email: string): Promise<SsoDiscovery> {
+  await wait(500)
+  const domain = email.split('@')[1]?.toLowerCase() ?? ''
+  if (PERSONAL_DOMAINS.includes(domain)) throw new ApiError(400, '개인 메일은 쓸 수 없습니다. 회사 이메일을 입력해 주세요.')
+  const [idp, protocol] = IDPS[[...domain].reduce((n, c) => n + c.charCodeAt(0), 0) % IDPS.length]
+  return {
+    org: domain.split('.')[0].toUpperCase(),
+    idp,
+    protocol,
+    redirectUrl: `/api/auth/sso/start?domain=${encodeURIComponent(domain)}`,
+  }
+}
+
+/** mock 전용: IdP 왕복을 흉내 내고 로그인 처리. 이메일에 +member 가 있으면 일반 사용자 */
+export async function mockCompleteSso(email: string, d: SsoDiscovery): Promise<Session> {
+  await wait(1200)
+  const local = email.split('@')[0]
+  const user: User = {
+    id: 'u_' + local.replace(/\W/g, ''),
+    name: local.replace(/\+.*/, ''),
+    email,
+    org: d.org,
+    role: local.includes('+member') ? 'member' : 'admin',
+  }
+  currentUser = user
+  try {
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(user))
+  } catch {
+    // 저장소를 못 쓰면 새로고침 때 다시 로그인
+  }
+  return { user, csrfToken: 'mock-' + user.id }
+}
+
+export async function logout(): Promise<void> {
+  await wait(150)
+  currentUser = null
+  try {
+    sessionStorage.removeItem(SESSION_KEY)
+  } catch {
+    // 무시
+  }
+}
+
+// ---------- 연결 ----------
+
+let connections: Connection[] = [
+  {
+    id: 'c1',
+    provider: 'aws',
+    name: '개인 AWS',
+    status: 'connected',
+    detail: '123456789012 · ap-northeast-2',
+    checkedAt: '2026-10-07 13:40',
+    fields: { roleArn: 'arn:aws:iam::123456789012:role/paved-clouds', region: 'ap-northeast-2', budget: '30' },
+  },
+  {
+    id: 'c2',
+    provider: 'onprem',
+    name: '동아리방 서버',
+    status: 'connected',
+    detail: 'deploy@192.168.0.24 · 4 vCPU / 8GB · Docker 27.1',
+    checkedAt: '2026-10-07 13:42',
+    fields: { host: '192.168.0.24', port: '22', user: 'deploy', path: '/srv/apps' },
+  },
+  {
+    id: 'c3',
+    provider: 'gcp',
+    name: '학교 GCP 크레딧',
+    status: 'error',
+    detail: 'paved-demo-4412 · asia-northeast3',
+    error: '서비스 계정에 Cloud Run 관리자 권한이 없습니다.',
+    checkedAt: '2026-10-07 13:45',
+    fields: { projectId: 'paved-demo-4412', serviceAccount: 'paved@paved-demo-4412.iam.gserviceaccount.com', region: 'asia-northeast3', budget: '50' },
+  },
+]
+
+function describe(input: ConnectionInput): string {
+  const f = input.fields
+  switch (input.provider) {
+    case 'aws':
+      return `${f.roleArn?.split(':')[4] || '계정 확인 중'} · ${f.region}`
+    case 'gcp':
+      return `${f.projectId} · ${f.region}`
+    case 'azure':
+      return `${(f.subscriptionId ?? '').slice(0, 8)}… · ${f.region}`
+    case 'onprem':
+      return `${f.user}@${f.host} · 4 vCPU / 8GB · Docker 27.1`
+  }
+}
+
+export async function listConnections(): Promise<Connection[]> {
+  await wait(150)
+  return connections
+}
+
+export async function saveConnection(input: ConnectionInput): Promise<Connection> {
+  requireAdmin()
+  await wait(900)
+  const conn: Connection = {
+    id: input.id ?? 'c' + Date.now(),
+    provider: input.provider,
+    name: input.name,
+    status: 'connected',
+    detail: describe(input),
+    checkedAt: now(),
+    fields: input.fields,
+  }
+  connections = input.id ? connections.map((c) => (c.id === input.id ? conn : c)) : [...connections, conn]
+  return conn
+}
+
+export async function checkConnection(id: string): Promise<Connection> {
+  await wait(800)
+  const c = connections.find((x) => x.id === id)!
+  const next = { ...c, checkedAt: now() }
+  connections = connections.map((x) => (x.id === id ? next : x))
+  return next
+}
+
+export async function deleteConnection(id: string): Promise<void> {
+  requireAdmin()
+  await wait(200)
+  connections = connections.filter((c) => c.id !== id)
+}
+
+// ---------- 분석, 추천 ----------
+
+export async function analyze(source: Source, _scale: ScaleInput): Promise<Analysis> {
+  failScenario = /fail/i.test(source.kind === 'zip' ? source.file.name : source.url)
+  await wait(source.kind === 'github' ? 2000 : 1400)
   return {
     projectId: 'p_' + Math.random().toString(36).slice(2, 8),
-    framework: 'FastAPI',
-    port: 8000,
-    db: 'SQLite 감지',
-    fileStorage: '사용 안 함',
-    notice: {
-      title: 'SQLite는 컨테이너 재시작 시 데이터가 사라집니다. RDS 전환을 제안합니다.',
-      detail: 'db_mode: create (AWS 배포 시 RDS 신규 생성, 온프레미스는 컨테이너 볼륨 유지)',
-    },
+    stack: [
+      { label: '프레임워크', value: 'FastAPI 0.111' },
+      { label: '런타임', value: 'Python 3.12' },
+      { label: '포트', value: '8000' },
+      { label: 'DB', value: 'SQLite' },
+      { label: '정적 파일', value: '없음' },
+      { label: '환경 변수', value: 'SECRET_KEY 외 2개' },
+    ],
+    findings: [
+      {
+        level: 'warn',
+        title: 'SQLite 파일에 데이터를 저장하고 있습니다',
+        detail: '서버 한 대 구성이면 디스크에 그대로 두면 되지만, 컨테이너 구성에서는 재시작할 때 지워지므로 PostgreSQL로 옮깁니다.',
+      },
+      { level: 'info', title: 'Dockerfile이 없어서 새로 만듭니다', detail: 'python:3.12-slim 기반, uvicorn으로 8000번 포트 실행.' },
+      { level: 'info', title: '헬스체크 경로 /health 를 찾았습니다', detail: '배포 후 확인과 로드밸런서 헬스체크에 씁니다.' },
+    ],
     evidence: [
-      'requirements.txt에 fastapi, uvicorn이 있음',
-      'app/db.py에서 sqlite3.connect 호출을 찾음',
-      '.env에 DATABASE_URL 없음, 외부 DB 주소 없음',
+      'requirements.txt — fastapi, uvicorn, sqlalchemy',
+      'app/db.py:4 — sqlite3.connect("app.db")',
+      'app/main.py:12 — @app.get("/health")',
+      '.env.example — SECRET_KEY, ADMIN_EMAIL, SMTP_HOST',
     ],
   }
 }
 
-export async function estimate(
-  _projectId: string,
-  targets: Target[],
-  scale: ScaleInput,
-): Promise<CostLine[]> {
-  await wait(500)
-  const big = scale.expectedUsers === '~10,000' || scale.expectedUsers === '10,000+'
-  const lines: CostLine[] = []
-  if (targets.includes('aws')) {
-    lines.push(
-      {
-        target: 'aws',
-        resource: 'ECS 서비스',
-        spec: big ? 'cpu 512, memory 1024 × 2' : 'cpu 256, memory 512',
-        monthlyUsd: big ? 36.04 : 9.01,
-      },
-      {
-        target: 'aws',
-        resource: 'RDS',
-        spec: big ? 'db.t4g.small, 20GB' : '신규 생성 (db_mode: create)',
-        monthlyUsd: big ? 28.47 : 14.6,
-      },
-      { target: 'aws', resource: '공용 ALB, 로그 그룹', spec: '미리 만든 공용 기반 사용', monthlyUsd: 2.1 },
-      { target: 'aws', resource: 'ECR', spec: '이미지 1개, 약 180MB', monthlyUsd: 0.02 },
-    )
-  }
-  if (targets.includes('onprem')) {
-    lines.push(
-      { target: 'onprem', resource: '앱 컨테이너', spec: 'Docker Compose, restart: always', monthlyUsd: null },
-      { target: 'onprem', resource: 'SQLite 볼륨', spec: './data 마운트', monthlyUsd: null },
-    )
-  }
-  return lines
-}
+const total = (resources: { monthlyUsd: number }[]) => resources.reduce((s, r) => s + r.monthlyUsd, 0)
 
-const AWS_PLAN = `  # aws_ecr_repository.app will be created
-  + resource "aws_ecr_repository" "app" {
-      + name                 = "sample-app"
-      + image_tag_mutability = "MUTABLE"
-    }
-
-  # aws_db_instance.main will be created
-  + resource "aws_db_instance" "main" {
-      + engine              = "postgres"
-      + instance_class      = "db.t4g.micro"
-      + allocated_storage   = 20
-      + publicly_accessible = false
-    }
-
-  # aws_ecs_service.app will be created
-  + resource "aws_ecs_service" "app" {
-      + desired_count = 1
-      + launch_type   = "FARGATE"
-    }
-
-  # aws_lb_listener_rule.app will be updated in-place
-  ~ resource "aws_lb_listener_rule" "app" {
-      ~ priority = 110 -> 120
-    }
-
-Plan: 9 to add, 1 to change, 0 to destroy.`
-
-const ONPREM_COMPOSE = `# 온프레미스는 Terraform 대신 docker-compose.yml 을 SSH로 전달합니다.
-services:
-  app:
-    image: sample-app:v4
-    ports: ["8000:8000"]
-    volumes: ["./data:/app/data"]
-    restart: always`
-
-export async function plan(_projectId: string, targets: Target[]): Promise<PlanSummary> {
+export async function recommend(_projectId: string, scale: ScaleInput): Promise<Recommendation> {
   await wait(700)
-  const aws = targets.includes('aws')
-  const parts = []
-  if (aws) parts.push(AWS_PLAN)
-  if (targets.includes('onprem')) parts.push(ONPREM_COMPOSE)
-  return { add: aws ? 9 : 0, change: aws ? 1 : 0, destroy: 0, text: parts.join('\n\n') }
+  const usable = connections.filter((c) => c.status === 'connected')
+  const options = usable.map((c) => ({
+    connectionId: c.id,
+    provider: c.provider,
+    name: c.name,
+    tiers: CATALOG[c.provider].map(({ resources, ...t }) => ({
+      ...t,
+      resources: resources.map(({ addr: _addr, ...r }) => r),
+    })),
+  }))
+
+  const tier: TierKey = scale.expectedUsers === '~100' ? 'lean' : scale.expectedUsers === '~1,000' ? 'balanced' : 'roomy'
+  // 큰 규모는 서버 한 대(온프레미스)에 몰지 않음. 나머지 중 가장 싼 곳
+  const candidates = options.filter((o) => tier !== 'roomy' || o.provider !== 'onprem')
+  const best = [...candidates].sort(
+    (a, b) => total(findTier(a.provider, tier).resources) - total(findTier(b.provider, tier).resources),
+  )[0]
+
+  const where = best ? `${best.name}(${PROVIDERS[best.provider].label})` : ''
+  const reason = !best
+    ? '연결된 배포 대상이 없습니다.'
+    : best.provider === 'onprem'
+      ? `이미 연결된 ${where}에 올리면 추가 비용 없이 운영할 수 있습니다. 사용자가 늘면 클라우드로 옮기세요.`
+      : `월 사용자 ${scale.expectedUsers}명이면 '${findTier(best.provider, tier).label}' 구성이 맞습니다. 연결된 대상 중 가장 싼 곳은 ${where}입니다.`
+
+  return {
+    recommended: { connectionId: best?.connectionId ?? '', tier },
+    reason,
+    options,
+    assumptions: [
+      `월 사용자 ${scale.expectedUsers}명, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
+      '클라우드는 각 대상의 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
+      '온프레미스는 전기, 회선 비용을 넣지 않음',
+    ],
+  }
 }
 
-export async function approve(_projectId: string, targets: Target[]): Promise<void> {
+// ---------- 코드 생성, 배포 ----------
+
+export async function generate(_projectId: string, choice: Choice): Promise<TerraformBundle> {
+  await wait(1100)
+  const conn = connections.find((c) => c.id === choice.connectionId)!
+  const tier = findTier(conn.provider, choice.tier)
+  const n = tier.resources.length
+  return {
+    tool: conn.provider === 'onprem' ? 'compose' : 'terraform',
+    files: buildFiles(conn.provider, tier),
+    plan: { add: n, change: 0, destroy: 0, text: buildPlan(conn.provider, tier) },
+  }
+}
+
+export async function approve(_projectId: string, choice: Choice): Promise<void> {
+  requireUser()
   await wait(300)
   // 실패 후 다시 승인하면 AI 수정안이 반영된 것으로 보고 성공시킴
   if (deployStartedAt) failScenario = false
   deployStartedAt = Date.now()
-  deployTargets = targets
+  deployChoice = choice
 }
 
-// 경과 시간에 따라 단계가 진행되는 것처럼 흉내
 export async function status(_projectId: string): Promise<DeployStatus> {
-  await wait(150)
+  await wait(120)
+  const conn = connections.find((c) => c.id === deployChoice?.connectionId)!
+  const tier = findTier(conn.provider, deployChoice!.tier)
+  const script = logScript(conn.provider, tier, conn.fields.host)
+  const end = script[script.length - 1][0] + 1200
   const t = Date.now() - deployStartedAt
-  const steps: DeployStatus['steps'] = {
-    upload: 'done',
-    analyze: 'done',
-    approve: 'done',
-    build: 'waiting',
-    deploy: 'waiting',
-    health: 'waiting',
-  }
-  const urls: DeployStatus['urls'] = {}
+  const log = script.filter(([at]) => at <= t).map(([, l]) => l)
+  if (t < end) return { state: 'running', log }
 
-  if (t < 2500) {
-    steps.build = 'active'
-    return { steps, urls }
-  }
-  steps.build = 'done'
-  if (t < 5500) {
-    steps.deploy = 'active'
-    return { steps, urls }
-  }
-  steps.deploy = 'done'
-  if (t < 7000) {
-    steps.health = 'active'
-    return { steps, urls }
-  }
   if (failScenario) {
-    steps.health = 'failed'
     return {
-      steps,
-      urls,
+      state: 'failed',
+      log: [...log, 'curl: (7) Failed to connect: Connection refused', 'health check failed after 5 attempts'],
       diagnosis: {
-        cause: '앱이 127.0.0.1에서만 listen 하고 있어서 ALB 헬스체크 요청이 컨테이너에 닿지 않습니다.',
-        fix: 'Dockerfile CMD를 uvicorn app.main:app --host 0.0.0.0 --port 8000 으로 바꾼 뒤 재배포합니다.',
-        log: `[ecs] service sample-app: task stopped (Essential container exited)
-[alb] target 10.0.3.41:8000 unhealthy: Request timed out
-[app] INFO:     Uvicorn running on http://127.0.0.1:8000`,
+        cause: '앱이 127.0.0.1에서만 요청을 받고 있어서 컨테이너 바깥에서 접속할 수 없습니다.',
+        fix: 'Dockerfile의 실행 명령에 --host 0.0.0.0 을 넣고 같은 계획으로 다시 배포합니다. 인프라는 바뀌지 않습니다.',
+        patch: {
+          file: 'Dockerfile',
+          before: ['CMD ["uvicorn", "app.main:app", "--port", "8000"]'],
+          after: ['CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'],
+        },
       },
     }
   }
-  steps.health = 'done'
-  if (deployTargets.includes('aws')) urls.aws = 'https://sample-app.oneship.dev'
-  if (deployTargets.includes('onprem')) urls.onprem = 'http://192.168.0.24:8000'
-  return { steps, urls }
+  return {
+    state: 'success',
+    log: [...log, '{"status":"ok"}', 'health check passed'],
+    url: publicUrl(conn.provider, tier.key, conn.fields.host),
+  }
 }
 
 export async function history(): Promise<DeployRecord[]> {
   await wait(200)
   return [
-    { id: 'd6', app: 'sample-app', version: 'v3', target: 'aws', method: 'Terraform', status: 'success', createdAt: '2026-10-07 14:12' },
-    { id: 'd5', app: 'sample-app', version: 'v3', target: 'onprem', method: 'Docker Compose', status: 'success', createdAt: '2026-10-07 14:10' },
-    { id: 'd4', app: 'sample-app', version: 'v2', target: 'aws', method: 'Terraform', status: 'failed', note: '헬스체크 실패, v1로 롤백', createdAt: '2026-10-06 21:47' },
-    { id: 'd3', app: 'sample-app', version: 'v1', target: 'aws', method: 'Terraform', status: 'success', createdAt: '2026-10-05 18:03' },
-    { id: 'd2', app: 'todo-api', version: 'v2', target: 'onprem', method: 'Docker Compose', status: 'success', createdAt: '2026-10-04 11:30' },
-    { id: 'd1', app: 'todo-api', version: 'v1', target: 'onprem', method: 'Docker Compose', status: 'failed', note: '포트 8000 사용 중', createdAt: '2026-10-04 11:02' },
+    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.ap-northeast-2.elb.amazonaws.com', approvedBy: 'jinny', createdAt: '2026-10-07 14:12' },
+    { id: 'd5', app: 'club-attendance', version: 'v2', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'failed', note: '헬스체크 실패 → 포트 수정 후 v3', approvedBy: 'totoro', createdAt: '2026-10-07 13:58' },
+    { id: 'd4', app: 'club-attendance', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', approvedBy: 'jinny', createdAt: '2026-10-05 18:03' },
+    { id: 'd3', app: 'todo-api', version: 'v2', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', url: 'http://192.168.0.24:8080', approvedBy: 'minsu', createdAt: '2026-10-04 11:30' },
+    { id: 'd2', app: 'todo-api', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'failed', note: 'requirements.txt 누락', approvedBy: 'minsu', createdAt: '2026-10-04 11:02' },
+    { id: 'd1', app: 'portfolio', version: 'v1', tier: '권장', provider: 'gcp', target: '학교 GCP 크레딧', monthlyUsd: 17.62, status: 'success', url: 'https://portfolio-8xk2-du.a.run.app', approvedBy: 'jinny', createdAt: '2026-09-28 20:15' },
   ]
 }

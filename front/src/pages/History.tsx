@@ -1,85 +1,83 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import { STATUS_TEXT, targetName } from '../components/RecentDeploys'
-import type { DeployRecord, Target } from '../types'
+import ProviderMark from '../components/ProviderMark'
+import { costText, usd } from '../format'
+import type { DeployRecord } from '../types'
 
-type Filter = 'all' | Target
+const STATUS_TEXT: Record<DeployRecord['status'], string> = {
+  success: '성공',
+  failed: '실패',
+  running: '진행 중',
+}
 
 export default function History() {
   const [records, setRecords] = useState<DeployRecord[] | null>(null)
-  const [filter, setFilter] = useState<Filter>('all')
 
   useEffect(() => {
     api.history().then(setRecords).catch(() => setRecords([]))
   }, [])
 
-  const rows = useMemo(
-    () => (records ?? []).filter((r) => filter === 'all' || r.target === filter),
-    [records, filter],
-  )
+  // 앱별로 묶어서 최신 배포가 위로
+  const groups = useMemo(() => {
+    const map = new Map<string, DeployRecord[]>()
+    for (const r of records ?? []) map.set(r.app, [...(map.get(r.app) ?? []), r])
+    return [...map.entries()]
+  }, [records])
+
+  const monthly = groups.reduce((s, [, rs]) => {
+    const live = rs.find((r) => r.status === 'success')
+    return s + (live?.monthlyUsd ?? 0)
+  }, 0)
 
   return (
-    <div className="single">
-      <div className="page-head page-head-row">
+    <div className="page">
+      <div className="page-head">
         <div>
           <h1>배포 이력</h1>
-          <p>앱별로 언제, 어디에, 어떤 방식으로 배포했는지 기록합니다.</p>
-        </div>
-        <div className="segmented">
-          {(
-            [
-              ['all', '전체'],
-              ['aws', 'AWS'],
-              ['onprem', '온프레미스'],
-            ] as [Filter, string][]
-          ).map(([k, label]) => (
-            <button key={k} className={filter === k ? 'is-on' : ''} onClick={() => setFilter(k)}>
-              {label}
-            </button>
-          ))}
+          <p>앱별 배포 기록입니다. 배포 대상이 달라도 한곳에서 봅니다. 지금 떠 있는 앱 기준 월 예상 비용은 {costText(monthly)}입니다.</p>
         </div>
       </div>
 
-      <section className="card">
-        <table className="table">
-          <thead>
-            <tr>
-              <th>앱</th>
-              <th>대상</th>
-              <th>방식</th>
-              <th>시각</th>
-              <th>비고</th>
-              <th className="num">결과</th>
-            </tr>
-          </thead>
-          <tbody>
-            {records === null && (
-              <tr>
-                <td colSpan={6} className="empty">불러오는 중…</td>
-              </tr>
-            )}
-            {records !== null && rows.length === 0 && (
-              <tr>
-                <td colSpan={6} className="empty">기록이 없습니다.</td>
-              </tr>
-            )}
-            {rows.map((r) => (
-              <tr key={r.id}>
-                <td>
-                  <strong>{r.app}</strong> <span className="muted">{r.version}</span>
-                </td>
-                <td>{targetName(r)}</td>
-                <td className="muted">{r.method}</td>
-                <td className="muted mono">{r.createdAt}</td>
-                <td className="muted">{r.note ?? '-'}</td>
-                <td className="num">
-                  <em className={'rs-' + r.status}>{STATUS_TEXT[r.status]}</em>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </section>
+      {records === null && <p className="muted">불러오는 중…</p>}
+      {records !== null && groups.length === 0 && <p className="muted">아직 배포한 앱이 없습니다.</p>}
+
+      {groups.map(([app, rs]) => {
+        const live = rs.find((r) => r.status === 'success')
+        return (
+          <section key={app} className="app-block">
+            <header>
+              <div>
+                <h2>{app}</h2>
+                {live?.url && (
+                  <a href={live.url} target="_blank" rel="noreferrer" className="mono small">
+                    {live.url}
+                  </a>
+                )}
+              </div>
+              {live && (
+                <span className="app-cost">
+                  {live.tier} · {live.monthlyUsd > 0 ? `${usd(live.monthlyUsd)}/월` : '추가 비용 없음'}
+                </span>
+              )}
+            </header>
+            <ol className="timeline">
+              {rs.map((r) => (
+                <li key={r.id} className={'is-' + r.status}>
+                  <span className="t-ver">{r.version}</span>
+                  <span className="t-main">
+                    <span className="with-mark">
+                      <ProviderMark provider={r.provider} /> {r.target} · {r.tier} 구성
+                    </span>
+                    <small>승인 {r.approvedBy}{r.note ? ` · ${r.note}` : ''}</small>
+                  </span>
+                  <span className="t-time mono">{r.createdAt}</span>
+                  <span className={'t-status rs-' + r.status}>{STATUS_TEXT[r.status]}</span>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )
+      })}
     </div>
   )
 }
