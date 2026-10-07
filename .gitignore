@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+*.tfstate
+*.tfstate.*
+.terraform/
+*.pem
+infra/deployments/*
+!infra/deployments/_template/

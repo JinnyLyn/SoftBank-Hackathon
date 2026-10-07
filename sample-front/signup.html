@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>회원가입 · Launchpad</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%235b4bff'/%3E%3Cpath d='M16 6c4 3 6 7 5 12l-3 3h-4l-3-3c-1-5 1-9 5-12z' fill='%23fff'/%3E%3Ccircle cx='16' cy='13' r='2' fill='%235b4bff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="mock-api.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body data-page="signup">
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="brand" href="index.html" aria-label="Launchpad 홈">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="22" height="22"><path d="M16 5c4.2 3.1 6.3 7.3 5.2 12.4L18 21h-4l-3.2-3.6C9.7 12.3 11.8 8.1 16 5z" fill="currentColor"/><circle cx="16" cy="13" r="2.2" fill="var(--brand)"/><path d="M12.5 22.5 16 28l3.5-5.5z" fill="currentColor" opacity=".55"/></svg>
+        </span>
+        Launchpad
+      </a>
+      <nav class="nav" id="nav" aria-label="계정"></nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="container" id="flash" aria-live="polite"></div>
+    <section class="container auth">
+      <div class="card auth-card">
+        <h1>계정 만들기</h1>
+        <p class="muted">30초면 충분해요. 가입하면 바로 아이디어를 올릴 수 있어요.</p>
+        <p class="flash flash-err" id="auth-error" role="alert" hidden></p>
+        <form id="auth-form" class="form">
+          <label for="name">이름</label>
+          <input id="name" name="name" type="text" maxlength="30" autocomplete="nickname" required>
+          <label for="email">이메일</label>
+          <input id="email" name="email" type="email" maxlength="190" autocomplete="email" required>
+          <label for="password">비밀번호 <span class="muted">(8자 이상)</span></label>
+          <input id="password" name="password" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+          <button class="btn btn-primary btn-block" type="submit">가입하고 시작하기</button>
+        </form>
+        <p class="auth-switch muted">이미 계정이 있나요? <a href="login.html">로그인</a></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <span>© Launchpad · 예비 창업자를 위한 아이디어 보드</span>
+      <span class="host" id="host" title="이 요청을 처리한 컨테이너" hidden>컨테이너 <code></code></span>
+    </div>
+  </footer>
+</body>
+</html>

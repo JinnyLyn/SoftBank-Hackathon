@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Launchpad · 아이디어 보드</title>
+  <meta name="description" content="창업 아이디어를 한 줄로 올리고, 다른 참여자의 응원으로 반응을 확인하는 아이디어 보드">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%235b4bff'/%3E%3Cpath d='M16 6c4 3 6 7 5 12l-3 3h-4l-3-3c-1-5 1-9 5-12z' fill='%23fff'/%3E%3Ccircle cx='16' cy='13' r='2' fill='%235b4bff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="mock-api.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body data-page="board">
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <a class="brand" href="index.html" aria-label="Launchpad 홈">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="22" height="22"><path d="M16 5c4.2 3.1 6.3 7.3 5.2 12.4L18 21h-4l-3.2-3.6C9.7 12.3 11.8 8.1 16 5z" fill="currentColor"/><circle cx="16" cy="13" r="2.2" fill="var(--brand)"/><path d="M12.5 22.5 16 28l3.5-5.5z" fill="currentColor" opacity=".55"/></svg>
+        </span>
+        Launchpad
+      </a>
+      <nav class="nav" id="nav" aria-label="계정"></nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="container" id="flash" aria-live="polite"></div>
+
+    <section class="hero">
+      <div class="container hero-inner">
+        <p class="eyebrow">예비 창업자를 위한 아이디어 보드</p>
+        <h1>아이디어를 올리고,<br><span class="grad">응원</span>으로 반응을 확인하세요.</h1>
+        <p class="lead">떠오른 생각을 한 줄로 올리면 다른 참여자들이 응원으로 반응합니다. 응원을 가장 많이 받은 아이디어가 맨 위에 올라옵니다.</p>
+        <div class="hero-cta" id="hero-cta"></div>
+        <dl class="stats" id="stats"></dl>
+      </div>
+    </section>
+
+    <section class="container board">
+      <div class="board-main">
+        <div class="section-head">
+          <h2>지금 뜨는 아이디어</h2>
+          <span class="muted">응원 순</span>
+        </div>
+        <ul class="ideas" id="ideas"></ul>
+        <div class="card empty" id="empty" hidden>
+          <h3>아직 올라온 아이디어가 없어요</h3>
+          <p>첫 번째 아이디어의 주인공이 되어 보세요.</p>
+        </div>
+      </div>
+      <aside class="board-side">
+        <div class="card composer" id="composer"></div>
+      </aside>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <span>© Launchpad · 예비 창업자를 위한 아이디어 보드</span>
+      <span class="host" id="host" title="이 요청을 처리한 컨테이너" hidden>컨테이너 <code></code></span>
+    </div>
+  </footer>
+</body>
+</html>
