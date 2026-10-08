@@ -43,6 +43,22 @@ def main():
         git(seed, "branch", "JinnyLyn")
         git(seed, "branch", "totorosi")
         git(base, "clone", "--bare", str(seed), str(remote))
+        nested_repo = base / "subdirectory clone with spaces"
+        git(base, "clone", str(remote), str(nested_repo))
+        nested_cwd = nested_repo / "docs"
+        nested_cwd.mkdir()
+        run(nested_cwd, [sys.executable, "../scripts/setup_git.py", "JinnyLyn"])
+        expected_hooks = (nested_repo / ".git" / "paved-hooks").resolve()
+        actual_hooks = git(nested_repo, "config", "--get", "core.hooksPath").stdout.strip()
+        assert actual_hooks == expected_hooks.as_posix(), f"잘못된 훅 설치 경로: {actual_hooks}"
+        assert (expected_hooks / "pre-commit").is_file()
+        assert not (base / ".git").exists(), "clone 외부에 .git 디렉터리를 생성했습니다."
+        run(nested_cwd, [sys.executable, "../scripts/setup_git.py", "--check"])
+        run(nested_repo, [sys.executable, "scripts/setup_git.py", "--check"])
+        run(nested_repo, [sys.executable, "scripts/setup_git.py", "JinnyLyn"])
+        run(nested_cwd, [sys.executable, "../scripts/setup_git.py", "--check"])
+        ok("하위 폴더 설치 위치·루트/하위 폴더 상태 확인·반복 설치")
+
         git(base, "clone", str(remote), str(repo))
         git(repo, "config", "user.name", "Hook Test")
         git(repo, "config", "user.email", "hook-test@example.invalid")

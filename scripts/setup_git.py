@@ -36,9 +36,8 @@ def main():
     team = json.loads((root / ".github/team-branches.json").read_text(encoding="utf-8"))
     allowed = team["members"]
     source = root / ".githooks"
-    common = Path(git("rev-parse", "--git-common-dir").stdout.strip())
-    if not common.is_absolute():
-        common = root / common
+    # 하위 폴더에서 실행해도 현재 clone의 공통 Git 디렉터리를 사용한다.
+    common = Path(git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
     target = (common / "paved-hooks").resolve()
     expected = ["guard.sh", "pre-commit", "pre-merge-commit", "pre-push", "reference-transaction"]
     active = git("config", "--get", "core.hooksPath", required=False).stdout.strip()
