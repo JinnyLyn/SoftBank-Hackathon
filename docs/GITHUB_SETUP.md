@@ -29,6 +29,8 @@ CODEOWNERS는 main의 파일을 사용한다. 초기 설정 PR이 합쳐지기 �
 
 Actions 권한은 `contents: read`이고 저장소 인증 정보는 checkout에 남기지 않는다. 외부 Action 버전은 전체 commit SHA로 고정한다. AWS 키·LLM 키를 사용하는 작업은 없다.
 
+Codex 상세 요약은 댓글 작성 작업에 한해 `pull-requests: read`, `issues: write`를 추가한다. 기본 브랜치의 코드로 게시된 리뷰를 모으고 요약 댓글 하나를 갱신한다. 활성화·수동 갱신·권한과 한계는 [Codex 코드 리뷰 상세 요약](CODEX_REVIEW_SUMMARY.md)을 따른다.
+
 앱별 실행·테스트 명령이 생기면 해당 CI를 추가하고 정상 실행 후 필수 검사로 등록한다. 실제 배포 권한·승인·rollback 방식은 별도 합의한다.
 
 ## 각 팀원이 한 번 실행

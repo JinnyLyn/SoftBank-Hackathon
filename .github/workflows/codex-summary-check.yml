@@ -1,0 +1,29 @@
+name: Codex Summary Check
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/codex_review_summary*'
+      - '.github/workflows/codex*'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/codex_review_summary*'
+      - '.github/workflows/codex*'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Codex summary tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 검증할 코드 받기
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: 요약·갱신 회귀 검사
+        run: node --test scripts/codex_review_summary.test.cjs
