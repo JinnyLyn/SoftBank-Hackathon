@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+. "$(git config --get core.hooksPath)/guard.sh"
+require_assigned_head
+while read -r local_ref local_oid remote_ref remote_oid; do
+    case "$remote_ref" in
+        refs/heads/*)
+            [ "$remote_ref" = "refs/heads/$assigned" ] ||
+                fail "원격 $remote_ref 로 직접 푸시할 수 없습니다. $assigned 브랜치만 푸시하세요."
+            is_zero "$local_oid" && fail '개인 브랜치를 삭제하지 않습니다.'
+            if ! is_zero "$remote_oid"; then
+                git cat-file -e "$remote_oid^{commit}" 2>/dev/null ||
+                    fail '원격 변경을 먼저 fetch한 뒤 확인하세요.'
+                git merge-base --is-ancestor "$remote_oid" "$local_oid" ||
+                    fail '원격 기록을 덮어쓰는 푸시는 허용하지 않습니다. 먼저 동기화하세요.'
+            fi
+            ;;
+    esac
+done
+exit 0

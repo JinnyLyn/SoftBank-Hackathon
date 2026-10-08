@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+. "$(git config --get core.hooksPath)/guard.sh"
+require_assigned_head

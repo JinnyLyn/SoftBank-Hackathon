@@ -1,8 +1,4 @@
-# Code owners — auto-requested as PR reviewers (and notified) when a PR is opened.
-# Docs: https://docs.github.com/articles/about-code-owners
-# NOTE: The PR author is never auto-requested on their own PR.
-#       Draft PRs do not trigger requests until marked ready-for-review.
-
-# All files
-*   @JinnyLyn
-*   @totorosi
+# 기본 리뷰·머지 담당. PR 작성자 자신에게는 자동 리뷰 요청이 생기지 않는다.
+# JinnyLyn 본인 PR은 PR 전용 우회로 팀원 승인 없이 머지할 수 있다.
+# CODEOWNERS는 브랜치별 쓰기 권한을 제한하는 설정이 아니다.
+* @JinnyLyn

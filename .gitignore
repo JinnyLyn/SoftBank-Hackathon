@@ -8,3 +8,21 @@
 *.pem
 infra/deployments/*
 !infra/deployments/_template/
+
+# Terraform 실행 계획과 비밀 변수 파일
+*.tfplan
+tfplan
+*.tfvars
+*.tfvars.json
+!*.example.tfvars
+!*.example.tfvars.json
+
+# 로컬 실행·업로드 작업 영역
+.paved-runtime/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+node_modules/
+CLAUDE.local.md
