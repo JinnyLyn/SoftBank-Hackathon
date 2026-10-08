@@ -10,6 +10,7 @@
 | `paved-main-pr-review` | 기본 브랜치 main | PR, 승인 1명, CODEOWNERS 승인, 새 커밋 시 승인 무효화, 마지막 push의 독립 승인, 대화 해결. merge commit만 허용. 삭제·강제 푸시 금지 |
 | `paved-only-team-branches` | main·개인 5개 외 모든 브랜치 | 생성·갱신 금지. 우회 없음 |
 | `paved-personal-branch-history` | 개인 5개 | 삭제·강제 푸시 금지. 우회 없음 |
+| `paved-main-ci` | 기본 브랜치 main | Windows·Ubuntu Git guard 성공, 최신 main 기준 검사. 우회 없음 |
 
 개인 브랜치: `JinnyLyn`, `JinVibe`, `Ophelia0419`, `totorosi`, `wisetg`.
 
@@ -24,7 +25,7 @@ CODEOWNERS는 main의 파일을 사용한다. 초기 설정 PR이 합쳐지기 �
 - `Git guard (ubuntu-latest)`
 - `Git guard (windows-latest)`
 
-처음 PR에서 두 작업이 실제로 성공한 것을 확인한 뒤, 별도 `paved-main-ci` ruleset의 필수 status check로 등록한다. 대상은 기본 브랜치, 우회 목록은 비우고 최신 main 기준 검사를 요구한다. 이렇게 분리해야 본인 PR의 리뷰를 생략해도 CI는 유지된다. 최초 실행 전부터 존재하지 않는 검사명을 필수로 걸지 않는다.
+2026-10-08 [설정 PR #3의 최초 CI](https://github.com/JinnyLyn/SoftBank-Hackathon/actions/runs/37748541823)에서 두 작업의 성공을 확인하고 `paved-main-ci` ruleset의 필수 status check로 등록했다. 대상은 기본 브랜치, 우회 목록은 비워 두고 최신 main 기준 검사를 요구한다. 이렇게 분리해 본인 PR의 리뷰를 생략해도 CI는 유지한다. 이후 새 검사를 도입할 때도 최초 성공을 확인한 뒤 필수로 등록한다.
 
 Actions 권한은 `contents: read`이고 저장소 인증 정보는 checkout에 남기지 않는다. 외부 Action 버전은 전체 commit SHA로 고정한다. AWS 키·LLM 키를 사용하는 작업은 없다.
 
