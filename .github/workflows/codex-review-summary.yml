@@ -28,10 +28,12 @@ concurrency:
 jobs:
   summarize:
     if: >-
-      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'workflow_dispatch' && github.ref_name == github.event.repository.default_branch) ||
-      (github.event_name == 'pull_request_review' && github.event.review.user.login == 'chatgpt-codex-connector[bot]') ||
-      (github.event_name == 'pull_request_review_comment' && github.event.comment.user.login == 'chatgpt-codex-connector[bot]') ||
+      (github.event_name == 'pull_request_review' && github.event.review.user.login == 'chatgpt-codex-connector[bot]' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_review_comment' && github.event.comment.user.login == 'chatgpt-codex-connector[bot]' &&
+        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
         github.event.comment.user.login == 'chatgpt-codex-connector[bot]')
     runs-on: ubuntu-latest
@@ -46,11 +48,18 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
-          sparse-checkout: scripts/codex_review_summary.cjs
+          sparse-checkout: |
+            scripts/codex_review_summary.cjs
+            .github/workflows/codex-review-summary.yml
           sparse-checkout-cone-mode: false
       - name: Codex 리뷰 상세 요약 갱신
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
+            const fs = require('node:fs');
+            if (!fs.existsSync('.github/workflows/codex-review-summary.yml')) {
+              core.notice('기본 브랜치에 요약 워크플로가 아직 설치되지 않았습니다. 병합 후 활성화됩니다.');
+              return;
+            }
             const { run } = require('./scripts/codex_review_summary.cjs');
             await run({ github, context, core });

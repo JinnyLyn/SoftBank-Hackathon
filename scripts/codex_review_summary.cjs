@@ -198,6 +198,11 @@ async function run({ github, context, core }) {
     core.info('열려 있는 기본 브랜치 대상 PR만 요약합니다.');
     return;
   }
+  // Review events from forks have a read-only token. Manual runs use main's token.
+  if (pull.head.repo?.full_name !== owner + '/' + repo && context.eventName !== 'workflow_dispatch') {
+    core.info('fork PR의 자동 요약은 지원하지 않습니다. 기본 브랜치에서 수동 갱신하세요.');
+    return;
+  }
   const [reviews, reviewComments, issueComments, threadStates] = await Promise.all([
     github.paginate(github.rest.pulls.listReviews, { ...params, per_page: 100 }),
     github.paginate(github.rest.pulls.listReviewComments, { ...params, per_page: 100 }),

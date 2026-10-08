@@ -2,6 +2,8 @@
 
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
 const { run, renderSummary, readThreadStates, MARKER } = require('./codex_review_summary.cjs');
 const TICK = String.fromCharCode(96);
 const HEAD = '93a4b78470c6dc3dfa1f39ec911ded45d012c9b9';
@@ -172,12 +174,13 @@ test('thread states are paginated beyond the first 100 threads', async () => {
 function fakeApi({ headChanged = false, existing = true, closed = false } = {}) {
   const writes = [];
   let reads = 0;
-  const pull = { head: { sha: HEAD }, base: { ref: 'main' }, state: closed ? 'closed' : 'open' };
+  const pull = { head: { sha: HEAD, repo: { full_name: 'example/repo' } },
+    base: { ref: 'main' }, state: closed ? 'closed' : 'open' };
   const github = {
     rest: {
       pulls: {
         get: async () => ({ data: { ...pull, head: {
-          sha: headChanged && reads++ ? OLD : HEAD,
+          ...pull.head, sha: headChanged && reads++ ? OLD : HEAD,
         } } }),
         listReviews: 'reviews', listReviewComments: 'reviewComments',
       },
@@ -200,7 +203,7 @@ function fakeApi({ headChanged = false, existing = true, closed = false } = {}) 
       pageInfo: { hasNextPage: false },
     } } } }),
   };
-  const context = { repo: { owner: 'example', repo: 'repo' },
+  const context = { repo: { owner: 'example', repo: 'repo' }, eventName: 'workflow_dispatch',
     payload: { inputs: { pr_number: '4' }, repository: { default_branch: 'main' } } };
   return { github, context, core: { info() {} }, writes };
 }
@@ -235,4 +238,53 @@ test('invalid manual PR input fails before any API access or write', async () =>
     await assert.rejects(() => run(api), /PR 번호/);
     assert.equal(api.writes.length, 0);
   }
+});
+
+test('fork review events skip writes while manual main runs can refresh them', async () => {
+  for (const eventName of ['pull_request_target', 'pull_request_review', 'pull_request_review_comment', 'issue_comment', 'workflow_dispatch']) {
+    const api = fakeApi();
+    api.context.eventName = eventName;
+    const getPull = api.github.rest.pulls.get;
+    api.github.rest.pulls.get = async params => {
+      const result = await getPull(params);
+      result.data.head.repo = { full_name: 'contributor/repo' };
+      return result;
+    };
+    await run(api);
+    assert.equal(api.writes.length, eventName === 'workflow_dispatch' ? 1 : 0);
+  }
+});
+
+// Execute the actual github-script entry point, including its first-install guard.
+const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/codex-review-summary.yml'), 'utf8');
+const entryPoint = workflow.match(/          script: \|\n([\s\S]*)$/)[1]
+  .split('\n').map(line => line.slice(12)).join('\n');
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const invokeEntryPoint = new AsyncFunction('require', 'github', 'context', 'core', entryPoint);
+
+test('first-install review events skip cleanly when main has no summary workflow', async () => {
+  let notices = 0;
+  await invokeEntryPoint(name => {
+    assert.equal(name, 'node:fs', 'must not load PR code or the absent module');
+    return { existsSync: () => false };
+  }, {}, {}, { notice: () => notices++ });
+  assert.equal(notices, 1);
+});
+
+test('installed workflow invokes the summary module', async () => {
+  let calls = 0;
+  const github = {};
+  const context = {};
+  const core = {};
+  await invokeEntryPoint(name => name === 'node:fs' ? { existsSync: () => true } : {
+    run: async args => { calls++; assert.deepEqual(args, { github, context, core }); },
+  }, github, context, core);
+  assert.equal(calls, 1);
+});
+
+test('an installed workflow with a missing script still fails rather than hiding a regression', async () => {
+  await assert.rejects(() => invokeEntryPoint(name => {
+    if (name === 'node:fs') return { existsSync: () => true };
+    throw new Error('MODULE_NOT_FOUND');
+  }, {}, {}, {}), /MODULE_NOT_FOUND/);
 });
