@@ -1,0 +1,31 @@
+#!/bin/sh
+# branch/switch -c/worktree add 등으로 생기는 로컬 브랜치 ref도 검사한다.
+set -eu
+[ "$1" = prepared ] || exit 0
+. "$(git config --get core.hooksPath)/guard.sh"
+load_assignment
+while read -r old_oid new_oid ref; do
+    case "$ref" in
+        refs/heads/main)
+            is_zero "$new_oid" && fail 'main을 삭제·개명하지 않습니다.'
+            # main은 origin/main에서 이미 확인된 이력으로 앞으로 이동하는 것만 허용한다.
+            git merge-base --is-ancestor "$new_oid" refs/remotes/origin/main 2>/dev/null ||
+                fail 'main에 새 커밋을 만들 수 없습니다. 개인 브랜치와 PR을 사용하세요.'
+            current_oid=$(git rev-parse --verify "$ref" 2>/dev/null || true)
+            if [ -n "$current_oid" ]; then
+                git merge-base --is-ancestor "$current_oid" "$new_oid" ||
+                    fail '로컬 main 이력을 되돌리지 않습니다.'
+            fi
+            ;;
+        "refs/heads/$assigned")
+            is_zero "$new_oid" && fail '개인 브랜치를 삭제·개명하지 않습니다.'
+            ;;
+        refs/heads/*)
+            fail "배정되지 않은 로컬 브랜치는 생성·변경할 수 없습니다: $ref (배정: $assigned)"
+            ;;
+        *)
+            # fetch의 원격 추적 ref, 태그 등은 이 브랜치 정책의 대상이 아니다.
+            ;;
+    esac
+done
+exit 0
