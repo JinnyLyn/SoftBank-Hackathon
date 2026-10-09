@@ -1,0 +1,27 @@
+{
+  "platform": {
+    "region": "sa-east-1",
+    "deploy_id": "a1b2c3d4",
+    "image": "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps:a1b2c3d4-r1",
+    "cpu_architecture": "X86_64",
+    "listener_port": 8001,
+    "database_url_parameter_arn": "",
+    "health_check_grace_seconds": 90,
+    "foundation": {
+      "alb_arn": "arn:aws:elasticloadbalancing:sa-east-1:123456789012:loadbalancer/app/paved-clouds-alb/0123456789abcdef",
+      "alb_dns_name": "paved-clouds-alb-123456789.sa-east-1.elb.amazonaws.com",
+      "alb_security_group_id": "sg-0123456789abcdef0",
+      "allowed_listener_ports": { "from": 8001, "to": 8049 },
+      "assign_public_ip": false,
+      "certificate_arn": "",
+      "cluster_name": "paved-clouds",
+      "database_url_parameter_arn": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/database-url",
+      "db_security_group_id": "sg-0fedcba9876543210",
+      "ecr_repository_url": "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps",
+      "execution_role_arn": "arn:aws:iam::123456789012:role/paved-clouds-task-execution",
+      "listener_protocol": "HTTP",
+      "task_subnet_ids": ["subnet-0123456789abcdef0", "subnet-0fedcba9876543210"],
+      "vpc_id": "vpc-0123456789abcdef0"
+    }
+  }
+}
