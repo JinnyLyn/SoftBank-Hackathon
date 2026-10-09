@@ -1,4 +1,10 @@
-import type { Tier } from './types'
+import type { Source, Tier } from './types'
+
+/** 소스에서 앱 이름을 뽑음 (zip 파일 이름, 저장소 이름) */
+export const sourceName = (s: Source) =>
+  s.kind === 'zip'
+    ? s.file.name.replace(/\.zip$/i, '')
+    : s.url.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'app'
 
 export const usd = (n: number) => '$' + n.toFixed(2)
 

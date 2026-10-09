@@ -15,6 +15,7 @@ import type {
 import { buildFiles, buildPlan, CATALOG, findTier, logScript, publicUrl } from './catalog'
 import { isEnabled, PROVIDERS } from '../providers'
 import { now } from '../format'
+export { sourceName } from '../format'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -23,10 +24,6 @@ let failScenario = false
 let deployStartedAt = 0
 let deployChoice: Choice | null = null
 
-export const sourceName = (s: Source) =>
-  s.kind === 'zip'
-    ? s.file.name.replace(/\.zip$/i, '')
-    : s.url.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'app'
 
 // ---------- 연결 ----------
 

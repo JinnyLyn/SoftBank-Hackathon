@@ -1,5 +1,4 @@
 import type {
-  Analysis,
   Choice,
   Connection,
   ConnectionInput,
@@ -7,13 +6,13 @@ import type {
   DeployStatus,
   Recommendation,
   ScaleInput,
-  Source,
   TerraformBundle,
 } from '../types'
 import * as mock from './mock'
+import * as backend from './real'
 import { req, send } from './http'
 
-export { sourceName } from './mock'
+export { sourceName } from '../format'
 export { ApiError } from './http'
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false'
@@ -31,19 +30,7 @@ const real = {
   checkConnection: (id: string) => req<Connection>(`/connections/${id}/check`, { method: 'POST' }),
   deleteConnection: (id: string) => req<void>(`/connections/${id}`, { method: 'DELETE' }),
 
-  analyze(source: Source, scale: ScaleInput) {
-    const form = new FormData()
-    if (source.kind === 'zip') form.append('file', source.file)
-    else {
-      form.append('repo_url', source.url)
-      form.append('branch', source.branch)
-    }
-    form.append('expected_users', scale.expectedUsers)
-    form.append('traffic_pattern', scale.pattern)
-    form.append('purpose', scale.purpose)
-    form.append('monthly_budget_usd', String(scale.monthlyBudgetUsd))
-    return req<Analysis>('/projects', { method: 'POST', body: form })
-  },
+  analyze: backend.analyze,
   recommend: (projectId: string, scale: ScaleInput) =>
     req<Recommendation>(`/projects/${projectId}/recommend`, send('POST', scale)),
   generate: (projectId: string, choice: Choice) =>
