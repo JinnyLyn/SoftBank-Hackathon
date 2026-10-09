@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+"""플랫폼 백엔드(back/)와 deploy.sh를 잇는 worker. 표준 라이브러리만 쓴다.
+
+백엔드는 소스·분석 결과·계획·승인·배포 대기열을 저장만 하고 Terraform·Docker·AWS는 실행하지 않는다(back/API.md).
+이 worker가 그 빈 자리를 채운다. 두 가지 일을 한다.
+
+  planner   등록됐지만 아직 계획이 없는 프로젝트를 찾아, 분석 결과로 구성·비용을 정하고
+            `deploy.sh up --plan-only`로 Terraform 계획을 만들어 백엔드에 등록한다(POST /api/plans).
+  executor  사용자가 승인해 대기열에 들어간 작업을 가져와(claim) 이미지를 빌드하고 저장된 계획 그대로 적용한 뒤
+            상태(deploying → healthy | failed)와 접속 주소를 보고한다.
+
+지키는 규칙(AGENTS.md)
+  - 승인된 저장 plan만 적용한다. 적용 직전에 plan 파일의 SHA-256이 승인된 값과 같은지 확인한다.
+  - Docker 빌드는 승인된 작업에서만 한다(planner는 이미지를 만들지 않는다).
+  - 비밀(API 키·토큰·DB 비밀번호)은 로그·이벤트에 남기지 않는다. WORKER_API_TOKEN은 환경 변수로만 받는다.
+  - 실패는 자동 롤백하지 않고 그대로 보고한다(자동 복구 범위가 미결이다). 원인은 diagnose 결과를 이벤트에 담는다.
+  - LLM 호출은 하지 않는다. 분석 결과(result)는 다른 담당 모듈이 백엔드에 기록한 것을 읽기만 한다.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cost  # noqa: E402
+
+HERE = Path(__file__).resolve().parent
+INFRA = HERE.parent
+DEPLOY_ID_RE = re.compile(r"^[a-z0-9]{4,8}$")
+HEALTH_PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]*$")
+ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+SECRET_KEY_RE = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY)")
+SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
+TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+# 로그를 백엔드로 보내기 전에 한 번 더 가린다(백엔드도 가리지만 호출 측에서도 비밀을 보내지 않아야 한다)
+REDACT_RES = [
+    re.compile(r"(?i)\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
+    re.compile(r"(?i)(secret|password|passwd|token|api[_-]?key|access[_-]?key)[A-Za-z_]*\s*[=:]\s*\S+"),
+    re.compile(r"mysql://[^\s:@]+:[^\s@]+@"),
+]
+# 환경 변수 "값"에 들어 있으면 안 되는 비밀의 모양(이름이 무해해도 값이 비밀이면 계획 변수와 작업 정의에 평문으로 남는다)
+SECRET_VALUE_RES = REDACT_RES + [
+    re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\."),
+]
+
+
+class PlanError(Exception):
+    """계획을 만들 수 없는 프로젝트(분석 결과 부족, 예산 초과 등)."""
+
+
+class ApiError(Exception):
+    def __init__(self, status, body):
+        super().__init__(f"HTTP {status}: {body[:200]}")
+        self.status = status
+        self.body = body
+
+
+@dataclass
+class Config:
+    api_url: str = "http://127.0.0.1:8000"
+    token: str = field(default="", repr=False)   # repr에 찍히지 않게 한다
+    deploy_sh: Path = INFRA / "scripts" / "deploy.sh"
+    deployments_dir: Path = INFRA / "deployments"
+    bash: str = field(default_factory=lambda: find_bash())
+    region: str = ""
+    poll_seconds: float = 5.0
+    plan_timeout: int = 900
+    build_timeout: int = 1200
+    apply_timeout: int = 1500
+
+
+def log(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
+
+
+def redact(text):
+    for rx in REDACT_RES:
+        text = rx.sub("[가림]", text)
+    return text
+
+
+# --- 백엔드 API -------------------------------------------------------------------------------------
+class Api:
+    def __init__(self, base, token, timeout=30):
+        self.base = base.rstrip("/")
+        self.token = token
+        self.timeout = timeout
+
+    def _call(self, method, path, body=None, raw=None):
+        headers = {"Accept": "application/json"}
+        data = None
+        if raw is not None:
+            data = raw
+            headers["Content-Type"] = "application/octet-stream"
+        elif body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        if path.startswith("/api/worker/"):
+            headers["X-Worker-Token"] = self.token   # worker 전용 경로에만 붙인다
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                text = r.read().decode("utf-8", "replace")
+                return r.status, (json.loads(text) if text.strip() else None)
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read().decode("utf-8", "replace")) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ApiError(0, f"백엔드에 연결하지 못했습니다: {e}") from None
+
+    def get(self, path):
+        return self._call("GET", path)[1]
+
+    def post(self, path, body=None):
+        return self._call("POST", path, body=body)[1]
+
+    def post_bytes(self, path, data):
+        return self._call("POST", path, raw=data)[1]
+
+
+# --- 하위 프로세스 ---------------------------------------------------------------------------------
+def popen(cmd, cwd=None, env=None, merge_stderr=False):
+    """새 프로세스 그룹(POSIX)으로 시작해서 시간 초과 때 자식(terraform·docker)까지 함께 종료할 수 있게 한다."""
+    kwargs = {} if os.name == "nt" else {"start_new_session": True}
+    return subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE, **kwargs)
+
+
+def kill_tree(proc):
+    """bash만 죽이면 그 아래의 terraform apply·docker build가 계속 돌아 state 잠금을 쥐고 리소스를 만든다. 프로세스 트리 전체를 종료한다."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+        else:
+            import signal
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def run_streaming(cmd, timeout, on_line=None, cwd=None, env=None):
+    """명령을 실행하며 출력(stdout+stderr)을 한 줄씩 on_line으로 넘긴다. (종료 코드, 전체 출력)을 돌려준다.
+
+    시간 초과면 자식 프로세스까지 종료하고 출력 끝에 그 사실을 남긴다. on_line에서 난 예외는 읽기를 멈추지 않도록 삼킨다
+    (보고 실패 때문에 apply 출력 읽기가 끊기면 최종 결과를 보고하지 못한다)."""
+    lines = []
+    timed_out = []
+    with popen(cmd, cwd=cwd, env=env, merge_stderr=True) as proc:
+        def expire():
+            timed_out.append(True)
+            kill_tree(proc)
+        timer = threading.Timer(timeout, expire)
+        timer.start()
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                lines.append(line)
+                if on_line:
+                    try:
+                        on_line(line)
+                    except Exception as e:   # noqa: BLE001
+                        log(f"출력 처리 중 오류(무시하고 계속 읽습니다): {type(e).__name__}: {str(e)[:150]}")
+            proc.wait()
+        finally:
+            timer.cancel()
+    if timed_out:
+        lines.append(f"[worker] 제한 시간({timeout}초)을 넘겨 작업과 하위 프로세스를 종료했습니다")
+    return proc.returncode, "\n".join(lines)
+
+
+def run_capture(cmd, timeout, cwd=None, env=None):
+    """표준 출력과 표준 오류를 따로 받는다(이미지 주소처럼 표준 출력만 필요한 명령용). 시간 초과면 자식까지 종료하고 TimeoutExpired를 낸다."""
+    with popen(cmd, cwd=cwd, env=env) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_tree(proc)
+            proc.communicate()
+            raise
+    return proc.returncode, out, err
+
+
+def child_env(cfg):
+    env = dict(os.environ)
+    env.pop("WORKER_API_TOKEN", None)   # 하위 프로세스(빌드·Terraform)에 토큰을 넘기지 않는다
+    if cfg.region:
+        env["AWS_REGION"] = cfg.region
+    return env
+
+
+def posix(path):
+    """bash에 넘길 경로. Windows의 C:/... 는 Git Bash가 안정적으로 여는 /c/... 형태로 바꾼다(deploy.sh 시험에서 겪은 문제)."""
+    s = Path(path).as_posix()
+    m = re.match(r"^([A-Za-z]):/(.*)$", s)
+    return f"/{m.group(1).lower()}/{m.group(2)}" if m and os.name == "nt" else s
+
+
+def find_bash():
+    """실제로 스크립트를 실행할 수 있는 bash. Windows에서 PATH의 bash는 WSL 중계 실행 파일일 수 있어 직접 확인한다."""
+    cands = [os.environ.get("BASH_EXE"), shutil.which("bash")]
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")):
+        if base:
+            cands += [os.path.join(base, "Git", "bin", "bash.exe"), os.path.join(base, "Programs", "Git", "bin", "bash.exe")]
+    for c in cands:
+        if not c or not os.path.exists(c):
+            continue
+        try:
+            r = subprocess.run([c, "-c", "echo $((40+2))"], capture_output=True, text=True, timeout=30)
+            if r.returncode == 0 and r.stdout.strip() == "42":
+                return c
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return "bash"
+
+
+def deploy(cfg, *args):
+    return [cfg.bash, posix(cfg.deploy_sh), *args]
+
+
+# --- planner ---------------------------------------------------------------------------------------
+def app_config_from_analysis(result, tier):
+    """분석 결과(result)에서 앱 설정과 Dockerfile 경로를 읽어 app-config.schema.json 규칙으로 검증한다.
+
+    분석 결과의 계약(LLM 담당과 합의 필요):
+      result["app_config"]  container_port, health_check_path, use_database, environment, init_command(선택)
+      result["dockerfile"]  소스 안의 Dockerfile 상대 경로(생략하면 Dockerfile)
+    task_size·min_tasks·max_tasks 는 LLM이 아니라 선택한 구성 단계(tier)가 정한다.
+    """
+    if not isinstance(result, dict) or not isinstance(result.get("app_config"), dict):
+        raise PlanError("분석 결과에 app_config가 없습니다(container_port, health_check_path 등이 필요합니다)")
+    c = result["app_config"]
+    port = c.get("container_port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise PlanError(f"app_config.container_port가 올바르지 않습니다: {port!r}")
+    health = c.get("health_check_path", "/")
+    if not isinstance(health, str) or not HEALTH_PATH_RE.match(health) or len(health) > 128:
+        raise PlanError(f"app_config.health_check_path가 올바르지 않습니다: {health!r}")
+    env = c.get("environment", {})
+    if not isinstance(env, dict) or len(env) > 20:
+        raise PlanError("app_config.environment는 20개 이하의 객체여야 합니다")
+    for k, v in env.items():
+        if not isinstance(k, str) or not ENV_KEY_RE.match(k) or k == "DATABASE_URL" or SECRET_KEY_RE.search(k):
+            raise PlanError(f"환경 변수 이름이 허용되지 않습니다(비밀로 보이거나 DATABASE_URL): {k!r}")
+        if not isinstance(v, str):
+            raise PlanError(f"환경 변수 값은 문자열이어야 합니다: {k}")
+        if any(rx.search(v) for rx in SECRET_VALUE_RES):
+            raise PlanError(f"환경 변수 {k}의 값이 비밀(키·토큰·접속 URL)처럼 보입니다. 값은 계획에 평문으로 남아서 허용하지 않습니다")
+    init = c.get("init_command")
+    if init is not None and (not isinstance(init, list) or len(init) > 10 or not all(isinstance(x, str) and 0 < len(x) <= 200 for x in init)):
+        raise PlanError("app_config.init_command는 비어 있지 않은 문자열 배열(최대 10개)이어야 합니다")
+    dockerfile = result.get("dockerfile", "Dockerfile")
+    if not isinstance(dockerfile, str) or not dockerfile or dockerfile.startswith("/") or ".." in dockerfile or len(dockerfile) > 200:
+        raise PlanError(f"dockerfile 경로가 올바르지 않습니다: {dockerfile!r}")
+    t = cost.TIERS[tier]
+    app = {"container_port": port, "health_check_path": health, "task_size": t["task_size"],
+           "min_tasks": t["min_tasks"], "max_tasks": t["max_tasks"],
+           "use_database": bool(c.get("use_database", False)), "environment": dict(env)}
+    if init:
+        app["init_command"] = list(init)
+    return app, dockerfile
+
+
+def scale_from_analysis(result):
+    """사용 규모·예산. 백엔드 API에 받는 곳이 없어서 분석 결과의 scale 필드에서 읽는다(없으면 기본값)."""
+    s = result.get("scale") if isinstance(result, dict) else None
+    s = s if isinstance(s, dict) else {}
+    budget = s.get("monthly_budget_usd")
+    if budget is not None:
+        try:
+            budget = float(budget)
+        except (TypeError, ValueError):
+            raise PlanError(f"scale.monthly_budget_usd가 숫자가 아닙니다: {budget!r}") from None
+        if budget < 0:
+            raise PlanError("scale.monthly_budget_usd는 0 이상이어야 합니다")
+    return s.get("expected_users"), s.get("traffic_pattern"), budget
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def discard_unapplied(cfg, deploy_id):
+    """계획만 만들고 적용하지 않은 배포 폴더를 지운다(백엔드 등록 실패 뒤 같은 ID로 다시 시도할 수 있게).
+    state나 이력이 하나라도 있으면(적용된 적이 있으면) 지우지 않는다."""
+    d = cfg.deployments_dir / deploy_id
+    if not d.is_dir():
+        return
+    applied = list(d.glob("*.tfstate*")) + [d / "history.log", d / "applied.app.json"]
+    if any(p.exists() for p in applied):
+        return
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
+    """프로젝트 하나의 배포 계획을 만들어 백엔드에 등록하고 plan 파일을 올린다. 등록한 계획(PlanOut)을 돌려준다."""
+    prices = prices or cost.load_prices()
+    result = analysis.get("result", {})
+    users, pattern, budget = scale_from_analysis(result)
+    rec = cost.recommend(users, pattern, budget, prices, arch)
+    if rec["recommended"] is None:
+        raise PlanError(rec["reason"])
+    tier = rec["recommended"]
+    est = rec["estimates"][tier]
+    app, dockerfile = app_config_from_analysis(result, tier)
+
+    env = child_env(cfg)
+    rc, out, err = run_capture(deploy(cfg, "make-id", f"{project['name']}|{project['id']}"), 60, env=env)
+    deploy_id = out.strip()
+    if rc != 0 or not DEPLOY_ID_RE.match(deploy_id):
+        raise PlanError(f"배포 ID를 만들지 못했습니다: {err.strip()[-200:]}")
+    rc, out, err = run_capture(deploy(cfg, "image-ref", deploy_id), 120, cwd=str(INFRA), env=env)
+    image = out.strip().splitlines()[-1] if out.strip() else ""
+    if rc != 0 or ":" not in image:
+        raise PlanError(f"이미지 주소를 만들지 못했습니다: {err.strip()[-200:]}")
+
+    tmp = Path(tempfile.mkdtemp(prefix="pc-app-"))
+    try:
+        app_file = tmp / "app.json"
+        app_file.write_text(json.dumps(app, ensure_ascii=False), encoding="utf-8")
+        log(f"계획 생성: 프로젝트 {project['id']} → 배포 ID {deploy_id}, 단계 {tier}")
+        rc, out = run_streaming(deploy(cfg, "up", "--id", deploy_id, "--image", image, "--app", posix(app_file), "--plan-only"),
+                                cfg.plan_timeout, cwd=str(INFRA), env=env)
+        if rc != 0:
+            raise PlanError("Terraform 계획을 만들지 못했습니다: " + redact(out)[-300:])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    plan_file = cfg.deployments_dir / deploy_id / "tfplan"
+    if not plan_file.is_file():
+        raise PlanError("계획 파일(tfplan)이 만들어지지 않았습니다")
+    digest = sha256_file(plan_file)
+
+    variables = {
+        "deploy_id": deploy_id, "image": image, "dockerfile": dockerfile, "app": app,
+        "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
+        "resources": est["resources"],
+        "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "excluded": est["excluded"]},
+    }
+    summary = "\n".join([
+        f"{est['label']} 구성({tier}): {app['task_size']} 태스크 {app['min_tasks']}개(최대 {app['max_tasks']}개), 포트 {app['container_port']}, "
+        f"헬스체크 {app['health_check_path']}, 앱 전용 DB {'사용' if app['use_database'] else '미사용'}",
+        f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS) ${est['shared_monthly']:.2f}",
+        f"기준: {est['region']}, {est['pricing_as_of']} 가격표. 제외: " + "; ".join(est["excluded"]),
+        f"선택 이유: {rec['reason']}",
+    ])
+    body = {
+        "project_id": project["id"], "analysis_id": analysis.get("id"), "target": "aws", "module_id": "ecs-web-app",
+        "variables": variables, "summary": summary,
+        "cost_estimate": {"amount": f"{est['total_monthly']:.4f}", "currency": est["currency"], "period": "month",
+                          "pricing_as_of": est["pricing_as_of"]},
+        "terraform_plan_sha256": digest,
+    }
+    try:
+        plan = api.post("/api/plans", body)
+        api.post_bytes(f"/api/worker/plans/{plan['id']}/terraform-plan", plan_file.read_bytes())
+    except ApiError:
+        discard_unapplied(cfg, deploy_id)   # 같은 프로젝트를 다시 시도할 수 있게 한다
+        raise
+    log(f"계획 등록 완료: {plan['id']} (월 ${est['total_monthly']:.2f}, sha {digest[:12]})")
+    return plan
+
+
+# --- executor --------------------------------------------------------------------------------------
+REPORT_RETRIES = 4
+REPORT_RETRY_DELAY = 2.0   # 초. 시험에서는 0으로 줄인다
+
+
+def report(api, deployment_id, status, event_type, message, level="info", details=None, url=None):
+    """배포 상태 이벤트를 보낸다. 연결 실패나 5xx는 몇 번 다시 시도한다(결과 보고가 한 번의 일시 오류로 사라지지 않게).
+    4xx(상태 전이 거부 등)는 다시 시도해도 같으니 바로 올린다."""
+    body = {"status": status, "level": level, "event_type": event_type, "message": message[:4000]}
+    if details is not None:
+        body["details"] = details
+    if url:
+        body["url"] = url
+    for attempt in range(REPORT_RETRIES):
+        try:
+            return api.post(f"/api/worker/deployments/{deployment_id}/events", body)
+        except ApiError as e:
+            transient = e.status == 0 or e.status >= 500
+            if not transient or attempt == REPORT_RETRIES - 1:
+                raise
+            time.sleep(REPORT_RETRY_DELAY)
+
+
+def tail(text, n=40):
+    return redact("\n".join(text.splitlines()[-n:]))[-6000:]
+
+
+def fail_job(api, deployment_id, event_type, message, details=None):
+    log(f"배포 실패({event_type}): {message}")
+    report(api, deployment_id, "failed", event_type, message, level="error", details=details)
+
+
+def execute_job(api, cfg, job):
+    """claim한 작업 하나를 실행한다. 어떤 경우에도 결과를 failed 또는 healthy 로 보고한다(처리 도중 멈춘 채 두지 않는다)."""
+    dep = job["deployment_id"]
+    v = job.get("variables") or {}
+    deploy_id = v.get("deploy_id", "")
+    image = v.get("image", "")
+    dockerfile = v.get("dockerfile", "Dockerfile")
+    try:
+        if not DEPLOY_ID_RE.match(deploy_id):
+            return fail_job(api, dep, "invalid_job", f"작업의 deploy_id가 올바르지 않습니다: {deploy_id!r}")
+        tag = image.rsplit(":", 1)[-1] if ":" in image else ""
+        if not TAG_RE.match(tag):
+            return fail_job(api, dep, "invalid_job", "작업의 이미지 주소에서 태그를 읽지 못했습니다")
+        plan_file = cfg.deployments_dir / deploy_id / "tfplan"
+        expected = job.get("terraform_plan_sha256") or ""
+        if not SHA256_RE.match(expected) or not plan_file.is_file() or sha256_file(plan_file) != expected:
+            return fail_job(api, dep, "plan_mismatch",
+                            "저장된 Terraform 계획이 승인된 계획과 다릅니다(파일이 없거나 SHA-256이 다릅니다). 적용하지 않았습니다")
+        env = child_env(cfg)
+
+        log(f"이미지 빌드: {deploy_id}")
+        rc, out, err = run_capture(deploy(cfg, "build", "--id", deploy_id, "--source", posix(job.get("source_path", "")),
+                                          "--dockerfile", dockerfile, "--tag", tag), cfg.build_timeout, cwd=str(INFRA), env=env)
+        built = out.strip().splitlines()[-1] if out.strip() else ""
+        if rc != 0:
+            return fail_job(api, dep, "build_failed", "이미지를 빌드하거나 올리지 못했습니다", {"log_tail": tail(err)})
+        if built != image:
+            return fail_job(api, dep, "image_mismatch", "빌드한 이미지가 계획에 적힌 이미지와 다릅니다. 적용하지 않았습니다",
+                            {"planned": image, "built": built})
+
+        state = {"deploying": False}
+
+        def on_line(line):
+            # deploy.sh apply는 DB·Terraform 적용(provisioning)을 끝내고 헬스체크를 기다리기 시작할 때 이 문구를 남긴다
+            # 보고에 성공했을 때만 표시한다. 실패하면 끝난 뒤 healthy 보고 전에 다시 보낸다(백엔드는 provisioning에서 healthy로 바로 갈 수 없다)
+            if "헬스체크 대기" in line and not state["deploying"]:
+                report(api, dep, "deploying", "apply_done", "인프라 적용이 끝났고 헬스체크를 기다립니다")
+                state["deploying"] = True
+
+        log(f"적용: {deploy_id}")
+        rc, out = run_streaming(deploy(cfg, "apply", deploy_id), cfg.apply_timeout, on_line, cwd=str(INFRA), env=env)
+        if rc != 0:
+            details = {"log_tail": tail(out)}
+            drc, dout, derr = run_capture(deploy(cfg, "diagnose", deploy_id), 180, cwd=str(INFRA), env=env)
+            if drc == 0 and dout.strip():
+                try:
+                    details["diagnose"] = json.loads(dout)
+                except ValueError:
+                    pass
+            if len(json.dumps(details, ensure_ascii=False).encode("utf-8")) > 30 * 1024:
+                details.pop("diagnose", None)   # 백엔드 한도(32 KiB)를 넘으면 진단 JSON은 빼고 로그만 보낸다
+            return fail_job(api, dep, "apply_failed", "배포가 실패했습니다. 이력과 진단은 details를 확인하세요", details)
+
+        outputs = cfg.deployments_dir / deploy_id / "outputs.json"
+        try:
+            url = json.loads(outputs.read_text(encoding="utf-8"))["url"]["value"]
+        except (OSError, ValueError, KeyError):
+            return fail_job(api, dep, "no_url", "배포는 끝났지만 접속 주소(outputs.json의 url)를 읽지 못했습니다", {"log_tail": tail(out)})
+        if not state["deploying"]:
+            report(api, dep, "deploying", "apply_done", "인프라 적용이 끝났습니다")
+        report(api, dep, "healthy", "healthy", "헬스체크를 통과했습니다", details={"log_tail": tail(out, 12)}, url=url)
+        log(f"배포 완료: {url}")
+    except ApiError as e:
+        log(f"백엔드 보고 실패: {e}")   # 보고가 안 되면 더 할 수 있는 것이 없다. 작업은 다음 점검에서 사람이 확인한다
+    except Exception as e:   # noqa: BLE001 - 예상 못 한 오류도 failed로 남긴다
+        try:
+            fail_job(api, dep, "worker_error", f"worker 오류: {type(e).__name__}: {redact(str(e))[:300]}")
+        except ApiError as e2:
+            log(f"백엔드 보고 실패: {e2}")
+
+
+# --- 반복 ------------------------------------------------------------------------------------------
+@dataclass
+class State:
+    failures: dict = field(default_factory=dict)   # 프로젝트 id → (실패 횟수, 마지막 시각)
+    done: set = field(default_factory=set)         # 이미 계획이 있는 프로젝트
+    retry_after: float = 120.0
+    max_tries: int = 3
+
+
+def list_projects(api, max_pages=10):
+    """프로젝트 목록 전체(next_cursor를 따라간다). 첫 페이지만 읽으면 오래된 프로젝트가 앞을 채울 때 새 프로젝트가 영영 계획되지 않는다."""
+    items, cursor = [], None
+    for _ in range(max_pages):
+        path = "/api/projects?limit=20" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
+        page = api.get(path) or {}
+        items.extend(page.get("items", []))
+        cursor = page.get("next_cursor")
+        if not cursor:
+            break
+    return items
+
+
+def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
+    for project in list_projects(api):
+        pid = project["id"]
+        if pid in state.done:
+            continue
+        tries, last = state.failures.get(pid, (0, 0.0))
+        if tries >= state.max_tries or (tries and time.time() - last < state.retry_after):
+            continue
+        if api.get(f"/api/projects/{pid}/plans"):
+            state.done.add(pid)
+            continue
+        try:
+            analysis = api.get(f"/api/projects/{pid}/analyses/latest")
+        except ApiError as e:
+            if e.status == 404:
+                continue   # 분석 결과가 아직 없다. 분석 담당 모듈이 기록할 때까지 기다린다
+            raise
+        try:
+            plan_project(api, cfg, project, analysis, prices, arch)
+            state.done.add(pid)
+        except (PlanError, ApiError, subprocess.TimeoutExpired, OSError) as e:
+            state.failures[pid] = (tries + 1, time.time())
+            log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {redact(str(e))[:300]}")
+
+
+def tick(api, cfg, state, prices=None, arch="X86_64"):
+    """한 번 점검한다: 승인된 작업이 있으면 실행하고, 계획이 없는 프로젝트가 있으면 계획을 만든다."""
+    got = api.post("/api/worker/deployments/claim")
+    job = (got or {}).get("job")
+    if job:
+        log(f"작업 시작: 배포 {job['deployment_id']}")
+        execute_job(api, cfg, job)
+    plan_pending(api, cfg, state, prices, arch)
+    return bool(job)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--api-url", default=os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8000"))
+    p.add_argument("--deploy-sh", default=os.environ.get("DEPLOY_SH", str(INFRA / "scripts" / "deploy.sh")))
+    p.add_argument("--poll", type=float, default=float(os.environ.get("POLL_SECONDS", "5")), help="점검 간격(초)")
+    p.add_argument("--once", action="store_true", help="한 번만 점검하고 끝낸다")
+    p.add_argument("--arch", default=os.environ.get("TARGET_ARCH", ""), help="X86_64 또는 ARM64(기본: 이 PC의 docker)")
+    a = p.parse_args(argv)
+    token = os.environ.get("WORKER_API_TOKEN", "")
+    if not token:
+        print("오류: WORKER_API_TOKEN 환경 변수가 필요합니다(백엔드와 같은 값)", file=sys.stderr)
+        return 2
+    cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll)
+    arch = a.arch
+    if not arch:
+        rc, out, _ = run_capture(deploy(cfg, "detect-arch"), 30, env=child_env(cfg))
+        arch = out.strip() if rc == 0 and out.strip() in ("X86_64", "ARM64") else "X86_64"
+    api = Api(cfg.api_url, cfg.token)
+    state = State()
+    log(f"worker 시작: {cfg.api_url} (아키텍처 {arch})")
+    while True:
+        try:
+            tick(api, cfg, state, arch=arch)
+        except ApiError as e:
+            log(f"백엔드 오류: {e}")
+        if a.once:
+            return 0
+        time.sleep(cfg.poll_seconds)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
