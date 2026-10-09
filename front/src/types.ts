@@ -111,13 +111,28 @@ export interface Patch {
   after: string[]
 }
 
+/** 백엔드 배포 계획(PlanOut)에서 승인에 필요한 정보 */
+export interface PlanInfo {
+  planId: string
+  moduleId: string
+  summary: string
+  /** 사용자가 승인하는 계획 내용의 식별자. 서버가 만든 값을 그대로 돌려보내야 함 */
+  fingerprint: string
+  /** AWS는 Terraform plan 파일이 서버에 올라와 있어야 승인 가능 */
+  ready: boolean
+  pricingAsOf?: string
+}
+
 export interface TerraformBundle {
   /** 온프레미스는 Terraform 대신 docker compose 사용 */
   tool: 'terraform' | 'compose'
   /** 실패 진단 수정안을 반영해 다시 만든 경우, 이번에 바뀐 내용 (재승인 화면에 표시) */
   patches?: Patch[]
   files: { name: string; content: string }[]
-  plan: { add: number; change: number; destroy: number; text: string }
+  /** 개수를 알 수 없으면(백엔드가 plan 요약만 줄 때) null */
+  plan: { add: number | null; change: number | null; destroy: number | null; text: string }
+  /** 실제 백엔드 계획일 때만 있음 */
+  planInfo?: PlanInfo
 }
 
 export interface DeployStatus {

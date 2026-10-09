@@ -3,7 +3,7 @@ import CodeView from '../components/CodeView'
 import ProviderMark from '../components/ProviderMark'
 import { PROVIDERS } from '../providers'
 import type { Provider, TerraformBundle, Tier } from '../types'
-import { costText, tierTotal } from '../format'
+import { costText, countText, tierTotal } from '../format'
 
 interface Props {
   bundle: TerraformBundle
@@ -53,15 +53,15 @@ export default function ReviewStep({ bundle, tier, target, confirmed, locked, on
       <div className="summary-strip">
         <div>
           <span>추가</span>
-          <strong className="c-add">{plan.add}</strong>
+          <strong className="c-add">{countText(plan.add)}</strong>
         </div>
         <div>
           <span>변경</span>
-          <strong>{plan.change}</strong>
+          <strong>{countText(plan.change)}</strong>
         </div>
         <div>
           <span>삭제</span>
-          <strong className={plan.destroy ? 'c-del' : ''}>{plan.destroy}</strong>
+          <strong className={plan.destroy ? 'c-del' : ''}>{countText(plan.destroy)}</strong>
         </div>
         <div>
           <span>대상</span>
@@ -79,6 +79,36 @@ export default function ReviewStep({ bundle, tier, target, confirmed, locked, on
         </div>
       </div>
 
+      {bundle.planInfo && (
+        <dl className="plan-info">
+          <div>
+            <dt>모듈</dt>
+            <dd className="mono">{bundle.planInfo.moduleId}</dd>
+          </div>
+          {bundle.planInfo.pricingAsOf && (
+            <div>
+              <dt>가격 기준</dt>
+              <dd>{bundle.planInfo.pricingAsOf}</dd>
+            </div>
+          )}
+          <div>
+            <dt>승인 식별자</dt>
+            <dd className="mono" title={bundle.planInfo.fingerprint}>
+              {bundle.planInfo.fingerprint.slice(0, 12)}…
+            </dd>
+          </div>
+          <div>
+            <dt>Terraform plan 파일</dt>
+            <dd className={bundle.planInfo.ready ? 'c-add' : 'c-del'}>{bundle.planInfo.ready ? '준비됨' : '아직 없음'}</dd>
+          </div>
+        </dl>
+      )}
+      {bundle.planInfo && !bundle.planInfo.ready && (
+        <p className="conn-error">
+          서버에 Terraform plan 파일이 아직 올라오지 않아 승인할 수 없습니다. 준비되면 이 화면을 다시 열어 주세요.
+        </p>
+      )}
+
       <div className="code-box">
         <div className="code-tabs">
           {['plan', ...bundle.files.map((f) => f.name)].map((name) => (
@@ -94,11 +124,18 @@ export default function ReviewStep({ bundle, tier, target, confirmed, locked, on
       </div>
 
       <label className={'confirm' + (confirmed ? ' is-on' : '')}>
-        <input type="checkbox" checked={confirmed} disabled={locked} onChange={(e) => onConfirm(e.target.checked)} />
+        <input
+          type="checkbox"
+          checked={confirmed}
+          disabled={locked || bundle.planInfo?.ready === false}
+          onChange={(e) => onConfirm(e.target.checked)}
+        />
         <span>
           {isServer
-            ? `${target.name}에 띄울 컨테이너 ${plan.add}개를 확인했습니다.`
-            : `만들어질 리소스 ${plan.add}개와 월 예상 비용 ${costText(cost)}을 확인했습니다.`}
+            ? `${target.name}에 띄울 컨테이너 ${countText(plan.add)}개를 확인했습니다.`
+            : plan.add === null
+              ? `배포 계획과 월 예상 비용 ${costText(cost)}을 확인했습니다.`
+              : `만들어질 리소스 ${plan.add}개와 월 예상 비용 ${costText(cost)}을 확인했습니다.`}
           <small>
             {isServer
               ? '승인하면 SSH로 서버에 접속해 docker compose up 을 실행합니다.'

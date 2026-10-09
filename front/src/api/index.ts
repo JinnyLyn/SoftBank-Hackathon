@@ -4,8 +4,6 @@ import type {
   ConnectionInput,
   DeployRecord,
   DeployStatus,
-  Recommendation,
-  ScaleInput,
   TerraformBundle,
 } from '../types'
 import * as mock from './mock'
@@ -31,14 +29,10 @@ const real = {
   deleteConnection: (id: string) => req<void>(`/connections/${id}`, { method: 'DELETE' }),
 
   analyze: backend.analyze,
-  recommend: (projectId: string, scale: ScaleInput) =>
-    req<Recommendation>(`/projects/${projectId}/recommend`, send('POST', scale)),
-  generate: (projectId: string, choice: Choice) =>
-    req<TerraformBundle>(`/projects/${projectId}/code`, send('POST', choice)),
-  approve: (projectId: string, choice: Choice) => req<void>(`/projects/${projectId}/deploy`, send('POST', choice)),
-  /** 실패 진단의 수정안을 반영하고 검증·plan을 다시 만듦. 결과는 다시 승인받아야 배포됨 */
-  applyFix: (projectId: string, choice: Choice) =>
-    req<TerraformBundle>(`/projects/${projectId}/fix`, send('POST', choice)),
+  recommend: backend.recommend,
+  generate: backend.generate,
+  approve: backend.approve,
+  applyFix: backend.applyFix as (projectId: string, choice: Choice) => Promise<TerraformBundle>,
   status: (projectId: string) => req<DeployStatus>(`/projects/${projectId}/status`),
   history: () => req<DeployRecord[]>('/deployments'),
 }

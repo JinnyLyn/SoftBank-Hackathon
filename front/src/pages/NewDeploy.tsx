@@ -237,7 +237,7 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
     let sub: string | undefined
     if (i === 0 && source) sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명 · ${budgetValid(scale.monthlyBudgetUsd) ? usd(scale.monthlyBudgetUsd) : '예산 미입력'}`
     if (i === 1 && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
-    if (i === 2 && bundle) sub = `${bundle.plan.add}개 추가`
+    if (i === 2 && bundle) sub = bundle.plan.add === null ? '계획 준비됨' : `${bundle.plan.add}개 추가`
     if (i === 2 && !bundle && codeState === 'loading') sub = '코드 준비 중'
     if (i === 3 && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
 

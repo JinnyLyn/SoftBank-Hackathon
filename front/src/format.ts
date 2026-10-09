@@ -1,4 +1,4 @@
-import type { Source, Tier } from './types'
+import type { Source, Tier, TierKey } from './types'
 
 /** 소스에서 앱 이름을 뽑음 (zip 파일 이름, 저장소 이름) */
 export const sourceName = (s: Source) =>
@@ -7,6 +7,16 @@ export const sourceName = (s: Source) =>
     : s.url.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'app'
 
 export const usd = (n: number) => '$' + n.toFixed(2)
+
+/** 개수를 모르면 '-' */
+export const countText = (n: number | null) => (n === null ? '-' : String(n))
+
+/** 구성 크기별 고정 문구. LLM이나 백엔드가 아니라 화면이 정함 */
+export const TIER_META: Record<TierKey, { label: string; fit: string }> = {
+  lean: { label: '작게 시작', fit: '시연, MVP, 하루 수십 명' },
+  balanced: { label: '권장', fit: '동아리, 초기 서비스, 하루 수백 명' },
+  roomy: { label: '여유 있게', fit: '본격 운영, 하루 수천 명 이상' },
+}
 
 export const tierTotal = (t: Tier) => t.resources.reduce((s, r) => s + r.monthlyUsd, 0)
 
