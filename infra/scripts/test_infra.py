@@ -528,7 +528,7 @@ def part_d():
                           "listener_port": 8001, "health_check_grace_seconds": 90, "foundation": {"alb_dns_name": "OLD"}}}
     (sdir / "app.auto.tfvars.json").write_text(json.dumps(app0), encoding="utf-8")
     (sdir / "platform.auto.tfvars.json").write_text(json.dumps(plat0), encoding="utf-8")
-    rc, out, err = sh(f'd={P(sdir)}; snapshot_healthy "$d"')
+    rc, out, err = sh(f'd={P(sdir)}; pin_plan_inputs "$d"; snapshot_healthy "$d"')
     stamp = out.strip()
     app1 = copy.deepcopy(app0); app1["app"].update(container_port=9999, health_check_path="/nope", task_size="medium", environment={"X": "1"})
     plat1 = copy.deepcopy(plat0); plat1["platform"].update(image="IMG:bad", cpu_architecture="ARM64", health_check_grace_seconds=5)
@@ -688,6 +688,88 @@ def part_d():
     (rdir3 / "platform.auto.tfvars.json").write_text("KEEP", encoding="utf-8")
     rc, out, err = sh(f'reset_inputs {P(rdir3)}')
     say("ok" if (rdir3 / "platform.auto.tfvars.json").read_text(encoding="utf-8") == "KEEP" else "fail", "D 입력 되돌리기: apply된 적 없는 배포(up --plan-only 직후)는 그대로 둔다")
+
+    # ---- 저장 plan과 입력의 일치: plan 시점 입력을 고정하고, 바뀌면 apply를 막고, 이력은 고정본으로 남긴다 (리뷰 지적) ----
+    def pin_dir(name, app_cfg, image, plan_file=True):
+        pdir = WORK / name
+        pdir.mkdir(parents=True, exist_ok=True)
+        for f in pdir.iterdir():
+            if f.is_file():
+                f.unlink()
+        (pdir / "app.auto.tfvars.json").write_text(json.dumps({"app": app_cfg}), encoding="utf-8")
+        (pdir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "image": image, "foundation": {}}}), encoding="utf-8")
+        if plan_file:
+            (pdir / "tfplan").write_text("x", encoding="utf-8")
+        return pdir
+
+    appA = {"container_port": 8000, "health_check_path": "/health"}
+    appB = {"container_port": 9999, "health_check_path": "/nope"}
+
+    # 확인 함수 자체
+    pdir = pin_dir("pin_ok", appA, "IMG:a")
+    rc, out, err = sh(f'd={P(pdir)}; pin_plan_inputs "$d"; check_plan_inputs "$d"')
+    say("ok" if rc == 0 else "fail", "D 입력 고정: 계획 뒤 입력이 그대로면 통과", err[:80])
+    pdir = pin_dir("pin_app", appA, "IMG:a")
+    rc, out, err = sh(f'd={P(pdir)}; pin_plan_inputs "$d"')
+    (pdir / "app.auto.tfvars.json").write_text(json.dumps({"app": appB}), encoding="utf-8")
+    rc, out, err = sh(f'd={P(pdir)}; check_plan_inputs "$d"')
+    say("ok" if rc != 0 and "app.auto.tfvars.json" in err and "바뀌었습니다" in err else "fail", "D 입력 고정: 계획 뒤 앱 설정이 바뀌면 거부", err[:100])
+    pdir = pin_dir("pin_plat", appA, "IMG:a")
+    rc, out, err = sh(f'd={P(pdir)}; pin_plan_inputs "$d"')
+    (pdir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "image": "IMG:other", "foundation": {}}}), encoding="utf-8")
+    rc, out, err = sh(f'd={P(pdir)}; check_plan_inputs "$d"')
+    say("ok" if rc != 0 and "platform.auto.tfvars.json" in err else "fail", "D 입력 고정: 계획 뒤 이미지 등 플랫폼 입력이 바뀌면 거부", err[:100])
+    pdir = pin_dir("pin_none", appA, "IMG:a")
+    rc, out, err = sh(f'd={P(pdir)}; check_plan_inputs "$d"')
+    say("ok" if rc != 0 and "보관본" in err else "fail", "D 입력 고정: 보관본이 없는 계획(이전 버전이 만든 것)은 거부하고 다시 plan하라고 안내", err[:100])
+
+    # 이력·applied는 현재 입력 파일이 아니라 고정본으로 남는다
+    pdir = pin_dir("pin_hist", appA, "IMG:a")
+    rc, out, err = sh(f'd={P(pdir)}; pin_plan_inputs "$d"')
+    (pdir / "app.auto.tfvars.json").write_text(json.dumps({"app": appB}), encoding="utf-8")
+    (pdir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "image": "IMG:other", "foundation": {}}}), encoding="utf-8")
+    rc, out, err = sh(f'd={P(pdir)}; save_applied "$d"; snapshot_healthy "$d"')
+    stamp = out.strip()
+    applied_app = json.loads((pdir / "applied.app.json").read_text(encoding="utf-8"))["app"]
+    applied_img = json.loads((pdir / "applied.platform.json").read_text(encoding="utf-8"))["platform"]["image"]
+    hist_app = json.loads((pdir / "history" / f"{stamp}.app.json").read_text(encoding="utf-8"))["app"] if stamp else None
+    ok = applied_app == appA and applied_img == "IMG:a" and hist_app == appA
+    say("ok" if ok else "fail", "D 이력·applied.*는 계획 때 고정한 입력으로 남는다(현재 파일이 달라졌어도 따라가지 않음)", f"{applied_app} {applied_img} {hist_app}"[:100])
+
+    # apply_saved 전체 흐름(terraform·헬스체크는 모의): 입력이 바뀌었으면 terraform apply에 도달하지 않는다
+    mock_tf = (f'tf() {{ case "$2" in apply) echo APPLY_CALLED >> "$1/calls.log";; output) '
+               f'if [ "$3" = -raw ]; then echo IMG:a; else echo "{{}}"; fi;; esac; }}; '
+               'export_foundation() { :; }; confirm() { :; }')
+    pdir = pin_dir("pin_apply_changed", appA, "IMG:a")
+    rc, out, err = sh(f'{mock_tf}; wait_healthy() {{ return 0; }}; d={P(pdir)}; pin_plan_inputs "$d"')
+    (pdir / "app.auto.tfvars.json").write_text(json.dumps({"app": appB}), encoding="utf-8")
+    rc, out, err = sh(f'{mock_tf}; wait_healthy() {{ return 0; }}; apply_saved {P(pdir)} abcd1234')
+    ok = (rc != 0 and not (pdir / "calls.log").exists() and not (pdir / "history.log").exists()
+          and not (pdir / "applied.app.json").exists() and (pdir / "tfplan").exists())
+    say("ok" if ok else "fail", "D apply: 계획 뒤 입력이 바뀌면 terraform apply에 도달하지 않고 이력·applied도 만들지 않는다(계획은 그대로 남음)", f"rc={rc} {err[:100]}")
+
+    pdir = pin_dir("pin_apply_ok", appA, "IMG:a")
+    rc, out, err = sh(f'{mock_tf}; wait_healthy() {{ return 0; }}; d={P(pdir)}; pin_plan_inputs "$d"; apply_saved "$d" abcd1234')
+    ok = (rc == 0 and (pdir / "calls.log").exists() and (pdir / "history.log").exists()
+          and json.loads((pdir / "applied.app.json").read_text(encoding="utf-8"))["app"] == appA
+          and not (pdir / "tfplan").exists() and not (pdir / "plan.app.json").exists() and not (pdir / "plan.platform.json").exists())
+    say("ok" if ok else "fail", "D apply: 입력이 그대로면 적용하고 이력·applied를 남기며 계획과 고정본을 정리한다", f"rc={rc} {err[:100]}")
+    pdir = pin_dir("pin_apply_unhealthy", appA, "IMG:a")
+    rc, out, err = sh(f'{mock_tf}; wait_healthy() {{ WAIT_REASON=시간초과; return 1; }}; d={P(pdir)}; pin_plan_inputs "$d"; apply_saved "$d" abcd1234')
+    att = (pdir / "attempts.log").read_text(encoding="utf-8") if (pdir / "attempts.log").exists() else ""
+    ok = rc != 0 and "|fail|" in att and not (pdir / "history.log").exists() and not (pdir / "plan.app.json").exists()
+    say("ok" if ok else "fail", "D apply: 헬스체크가 실패하면 실패만 기록하고(정상 이력 없음) 고정본을 정리한다", f"rc={rc} {att[:80]}")
+
+    # 새 plan: 이전 계획을 먼저 지우고 입력을 고정한다. plan이 실패해도 옛 계획이 새 입력과 짝이 안 맞은 채 남지 않는다
+    mock_plan = ('tf() { case "$2" in plan) : > "$1/tfplan";; show) echo "{}";; esac; }; confirm() { :; }')
+    pdir = pin_dir("pin_newplan", appA, "IMG:a", plan_file=False)
+    rc, out, err = sh(f'{mock_plan}; PLAN_ONLY=1; plan_confirm_apply {P(pdir)} abcd1234')
+    ok = (rc == 0 and (pdir / "tfplan").exists() and (pdir / "plan.app.json").exists()
+          and (pdir / "plan.app.json").read_bytes() == (pdir / "app.auto.tfvars.json").read_bytes())
+    say("ok" if ok else "fail", "D plan: 계획을 만들면서 입력을 고정한다", f"rc={rc} {err[:100]}")
+    pdir = pin_dir("pin_failplan", appA, "IMG:a")   # 옛 tfplan이 있는 상태
+    rc, out, err = sh('tf() { case "$2" in plan) return 1;; esac; }; confirm() { :; }; PLAN_ONLY=1; plan_confirm_apply ' + P(pdir) + ' abcd1234')
+    say("ok" if rc != 0 and not (pdir / "tfplan").exists() else "fail", "D plan: 새 plan이 실패하면 옛 계획을 지운다(새 입력과 어긋난 계획을 적용하지 못하게)", f"rc={rc}")
 
     # update·rollback이 foundation 값을 지금 출력으로 갱신한다
     fdir = WORK / "fresh"

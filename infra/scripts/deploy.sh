@@ -524,12 +524,32 @@ record_attempt() {  # record_attempt <디렉터리> <ok|fail> <이미지> [사�
   printf '%s|%s|%s|%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" "$image" "$reason" >> "$d/attempts.log"
 }
 
-# 지금 정상으로 확인된 입력을 보관하고 스냅샷 이름을 출력한다
+# 계획(plan)을 만들 때의 입력을 고정해 둔다(plan.app.json, plan.platform.json).
+# 승인은 이 입력으로 만든 저장 plan에 대한 것이다. apply 뒤의 이력과 롤백 기준은 그 사이에 바뀔 수 있는
+# 현재 입력 파일(*.auto.tfvars.json)이 아니라 이 고정본으로 남긴다
+pin_plan_inputs() {
+  cp "$1/app.auto.tfvars.json" "$1/plan.app.json"
+  cp "$1/platform.auto.tfvars.json" "$1/plan.platform.json"
+}
+
+unpin_plan_inputs() { rm -f "$1/plan.app.json" "$1/plan.platform.json"; }
+
+# 고정한 입력이 그대로인지 확인한다. 다르면 승인받은 계획과 지금 입력이 달라진 것이라 적용하지 않는다
+check_plan_inputs() {
+  local d="$1" f
+  for f in app platform; do
+    [ -f "$d/plan.$f.json" ] || die "계획을 만들 때의 입력 보관본(plan.$f.json)이 없습니다. 이전 버전이 만든 계획일 수 있으니 --plan-only 로 계획을 다시 만드세요"
+    cmp -s "$d/plan.$f.json" "$d/$f.auto.tfvars.json" \
+      || die "계획을 만든 뒤 입력 파일($f.auto.tfvars.json)이 바뀌었습니다. 승인받은 계획과 달라서 적용하지 않습니다. --plan-only 로 계획을 다시 만들어 승인받으세요"
+  done
+}
+
+# 지금 정상으로 확인된 입력(계획을 만들 때 고정한 것)을 보관하고 스냅샷 이름을 출력한다
 snapshot_healthy() {
   local d="$1" stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
   mkdir -p "$d/history"
-  cp "$d/app.auto.tfvars.json" "$d/history/$stamp.app.json"
-  cp "$d/platform.auto.tfvars.json" "$d/history/$stamp.platform.json"
+  cp "$d/plan.app.json" "$d/history/$stamp.app.json"
+  cp "$d/plan.platform.json" "$d/history/$stamp.platform.json"
   echo "$stamp"
 }
 
@@ -546,8 +566,8 @@ current_image() { tf "$1" output -raw image 2>/dev/null; }
 # 마지막으로 apply한 입력을 보관한다(apply_saved가 terraform apply 직후에 부른다). "지금 배포된 것"의 설정 기준이 된다.
 # 입력 파일(app.auto.tfvars.json)은 --plan-only로 바꿔 놓고 적용하지 않은 값일 수 있어서 기준으로 삼을 수 없다
 save_applied() {
-  cp "$1/app.auto.tfvars.json" "$1/applied.app.json"
-  cp "$1/platform.auto.tfvars.json" "$1/applied.platform.json"
+  cp "$1/plan.app.json" "$1/applied.app.json"
+  cp "$1/plan.platform.json" "$1/applied.platform.json"
 }
 
 image_in_file() { grep -o '"image": *"[^"]*"' "$1" | head -1 | sed -E 's/.*: *"//; s/"$//'; }
@@ -643,7 +663,7 @@ reset_inputs() {
   [ -f "$d/applied.app.json" ] && [ -f "$d/applied.platform.json" ] || return 0
   cp "$d/applied.app.json" "$d/app.auto.tfvars.json"
   cp "$d/applied.platform.json" "$d/platform.auto.tfvars.json"
-  rm -f "$d/tfplan" "$d/plan.json"
+  rm -f "$d/tfplan" "$d/plan.json"; unpin_plan_inputs "$d"
   arn="$(jget "$d/applied.platform.json" platform database_url_parameter_arn 2>/dev/null || true)"
   if [ -n "$arn" ] && [ "$arn" != "None" ]; then
     [ -f "$d/db-isolated" ] || printf '%s\n' "$(db_name_of "$(basename "$d")")" > "$d/db-isolated"
@@ -714,9 +734,13 @@ count_stopped_tasks() {  # count_stopped_tasks <리전> <클러스터> <배포 I
 # plan 저장 → 승인 → 저장된 plan 그대로 apply → 헬스체크 대기
 plan_confirm_apply() {
   local d="$1" id="$2"
+  # 이전 계획과 그 입력 보관본을 먼저 지운다. 새 plan이 실패했을 때 옛 tfplan이 새 입력과 짝이 맞지 않은 채 남지 않게 한다
+  rm -f "$d/tfplan" "$d/plan.json"; unpin_plan_inputs "$d"
+  pin_plan_inputs "$d"
   log "plan"
   tf "$d" plan -input=false -out=tfplan -no-color | tail -n 40
   tf "$d" show -json tfplan > "$d/plan.json"
+  check_plan_inputs "$d"   # plan을 만드는 동안 입력이 바뀌지 않았는지
   log "승인 화면용 계획 저장: $d/plan.json"
 
   if [ "${PLAN_ONLY:-0}" = "1" ]; then
@@ -732,8 +756,10 @@ plan_confirm_apply() {
 apply_saved() {
   local d="$1" id="$2" image
   [ -f "$d/tfplan" ] || die "저장된 계획이 없습니다. 먼저 --plan-only 로 계획을 만드세요"
+  # 승인받은 계획을 만들 때의 입력과 지금 입력이 같은지 확인한다. 다르면 이력이 실제 적용된 것과 다른 설정을 롤백 기준으로 저장한다
+  check_plan_inputs "$d"
   UP_PHASE=""   # 여기서부터는 state가 생길 수 있어 폴더를 지우지 않는다
-  image="$(input_image "$d")"
+  image="$(image_in_file "$d/plan.platform.json")"
   # 앱 전용 DB는 승인된 뒤에만 만든다 (계획 단계에서는 접속 정보 ARN만 쓰고 아무것도 만들지 않는다)
   if [ -f "$d/db-isolated" ] && [ ! -f "$d/db-provisioned" ]; then
     export_foundation
@@ -752,14 +778,17 @@ apply_saved() {
   # 한 번 적용한 계획은 다시 쓸 수 없다. 남겨 두면 오해를 부르니 지운다
   rm -f "$d/tfplan"
 
-  if wait_healthy "$id"; then
+  local healthy=0
+  wait_healthy "$id" && healthy=1
+  if [ "$healthy" = 1 ]; then
     record_attempt "$d" ok "$image" ""
     record_healthy "$d"
   else
     record_attempt "$d" fail "$image" "${WAIT_REASON:-헬스체크 실패}"
     log "헬스체크 실패. 원인: deploy.sh diagnose $id"
-    return 1
   fi
+  unpin_plan_inputs "$d"   # 이 계획은 적용이 끝났다(이력과 applied.*는 위에서 이 보관본으로 남겼다)
+  [ "$healthy" = 1 ]
 }
 
 cmd_apply() {
