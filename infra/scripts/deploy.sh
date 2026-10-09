@@ -4,8 +4,12 @@
 # infra/README.md의 "배포 1건" 절차를 그대로 실행한다. 사람이 하던 명령을 순서대로 묶은 것이다.
 #
 # 사용법
-#   deploy.sh up       --id a1b2c3d4 --image <ecr_url>:a1b2c3d4-r1 --app app.json [--port 8001|auto] [--yes]
-#                      [--plan-only] [--shared-db] [--grace 초] [--skip-nat-check] [--arch ARM64]
+#   deploy.sh build    --id a1b2c3d4 --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그]   # 이미지를 빌드해 ECR에 올리고 주소를 출력
+#   deploy.sh make-id  "프로젝트 이름"      # 이름(한글 포함)에서 배포 ID를 만든다
+#   deploy.sh image-ref a1b2c3d4           # 이 배포의 이미지 주소(ECR 주소:태그)를 미리 정해 출력한다(plan용, build --tag 와 짝)
+#   deploy.sh detect-arch                  # 이 PC의 docker 기준 X86_64 또는 ARM64를 출력한다
+#   deploy.sh up       (--id a1b2c3d4 | --name "프로젝트 이름") --image <ecr_url>:a1b2c3d4-r1 --app app.json [--port 8001|auto] [--yes]
+#                      [--plan-only] [--shared-db] [--grace 초] [--skip-nat-check] [--arch ARM64]   # 아키텍처 기본값은 이 PC의 docker
 #   deploy.sh update   a1b2c3d4 [--image <ecr_url>:tag] [--app app.json] [--yes] [--plan-only]
 #   deploy.sh rollback a1b2c3d4 [--to <이미지>] [--yes] [--plan-only]
 #   deploy.sh apply    a1b2c3d4            # 위 명령을 --plan-only 로 만든, 승인된 저장 계획만 적용한다
@@ -416,8 +420,40 @@ print(json.dumps(td))
 PYEOF
 }
 
-# 1회성 DB 작업을 실행하고 종료 코드를 확인한다. 로그(비밀 마스킹)는 표준 오류로 보여 준다
+# foundation의 DB 작업용 Lambda로 DB 작업(provision | drop | verify)을 실행한다. Fargate 작업(db_task 아래쪽)과 같은 일을
+# 몇 초에 끝낸다(Fargate는 컨테이너를 띄우는 데만 약 70초). 결과 로그의 마커(PROVISION_OK, VERIFY_OK 등)는 같다
+db_lambda() {  # db_lambda <mode> <id> <함수 이름>
+  local mode="$1" id="$2" fn="$3" rgn tmp status ok logtxt PY; PY="$(pick_python)"
+  rgn="$(region)"; tmp="$(mktemp -d)"
+  printf '{"mode":"%s","id":"%s"}' "$mode" "$id" > "$tmp/payload.json"
+  log "DB 작업($mode) 실행 중 (Lambda)..."
+  status="$(awsn lambda invoke --region "$rgn" --function-name "$fn" --cli-binary-format raw-in-base64-out \
+    --payload "file://$(file_uri_path "$tmp/payload.json")" --query 'FunctionError' --output text \
+    "$(file_uri_path "$tmp/out.json")" 2>"$tmp/err")" \
+    || { local e; e="$(head -c 300 "$tmp/err" | mask)"; rm -rf "${tmp:?}"; die "DB 작업 Lambda를 호출하지 못했습니다: $e"; }
+  ok="$("$PY" -c "import json,sys;d=json.load(open(sys.argv[1],encoding='utf-8'));print('1' if d.get('ok') is True else '0')" "$tmp/out.json" 2>/dev/null || echo 0)"
+  logtxt="$("$PY" -c "import json,sys;d=json.load(open(sys.argv[1],encoding='utf-8'));print(d.get('log') or d.get('errorMessage') or '')" "$tmp/out.json" 2>/dev/null | tr -d '\r' | mask || true)"
+  rm -rf "${tmp:?}"
+  [ -n "$logtxt" ] && printf '%s\n' "$logtxt" | sed 's/^/    | /' >&2
+  if [ "$ok" != "1" ] || { [ -n "$status" ] && [ "$status" != "None" ]; }; then
+    die "DB 작업($mode)이 실패했습니다 (Lambda). 위 로그를 확인하세요"
+  fi
+  DB_TASK_LOG="$logtxt"
+}
+
+# 1회성 DB 작업을 실행하고 종료 코드를 확인한다. 로그(비밀 마스킹)는 표준 오류로 보여 준다.
+# foundation에 DB 작업용 Lambda가 있으면 그것을 쓰고(빠름), 없으면(옛 foundation, NAT를 끈 구성) Fargate 작업으로 한다.
+# PAVED_DB_VIA_FARGATE=1 이면 Lambda가 있어도 Fargate로 한다
 db_task() {
+  local fn; fn="$(fjson db_provisioner_lambda_name 2>/dev/null || true)"
+  if [ -n "$fn" ] && [ "$fn" != "None" ] && [ -z "${PAVED_DB_VIA_FARGATE:-}" ]; then
+    db_lambda "$1" "$2" "$fn"
+    return
+  fi
+  db_task_fargate "$@"
+}
+
+db_task_fargate() {
   local mode="$1" id="$2" rgn cluster td_arn task_arn code subnets sg pub tid events why
   rgn="$(region)"; cluster="$(fjson cluster_name)"
   ensure_tools_image
@@ -482,6 +518,7 @@ db_provision() {
   unset pw url
   db_task provision "$id"
   : > "$d/db-provisioned"
+  rm -f "$d/init.done"   # 새로 만든 DB에는 아직 테이블이 없다
 }
 
 cmd_db_check() {
@@ -731,6 +768,207 @@ count_stopped_tasks() {  # count_stopped_tasks <리전> <클러스터> <배포 I
   echo "$out"
 }
 
+# 이 PC의 docker가 만드는 이미지의 CPU 아키텍처(ECS cpu_architecture 값). docker가 없거나 알 수 없으면 X86_64.
+# 이미지와 ECS 태스크의 아키텍처가 다르면 태스크가 바로 죽는다
+detect_arch() {
+  local a
+  a="$(docker info --format '{{.Architecture}}' 2>/dev/null | tr -d '\r' || true)"
+  case "$a" in aarch64|arm64) echo ARM64 ;; *) echo X86_64 ;; esac
+}
+
+# 프로젝트 이름(한글 포함)에서 배포 ID(소문자·숫자 4~8자)를 만든다. 같은 이름은 항상 같은 ID다.
+# 이름의 영문·숫자를 앞에 최대 4자 쓰고, 이름의 해시로 8자까지 채운다. 한글만 있는 이름도 서로 구분된다
+make_id() {  # make_id <이름>
+  [ -n "${1// /}" ] || die "이름이 비어 있습니다"
+  "$(pick_python)" -c "
+import hashlib, re, sys
+n = sys.argv[1].strip()
+slug = re.sub('[^a-z0-9]', '', n.lower())[:4]
+print((slug + hashlib.sha256(n.encode('utf-8')).hexdigest())[:8])
+" "$1"
+}
+
+# app 설정의 init_command(문자열 배열)를 한 줄 JSON으로 낸다. 없으면 아무것도 내지 않는다
+init_command_json() {  # init_command_json <app tfvars json>
+  "$(pick_python)" -c "
+import json, sys
+a = json.load(open(sys.argv[1], encoding='utf-8')).get('app', {})
+c = a.get('init_command') or []
+if not isinstance(c, list) or not all(isinstance(x, str) and x for x in c) or len(c) > 10:
+    sys.exit('init_command는 비어 있지 않은 문자열 배열(최대 10개)이어야 합니다')
+if c:
+    print(json.dumps(c, ensure_ascii=False))
+" "$1"
+}
+
+# 앱 이미지로 초기화 명령(테이블 생성·마이그레이션)을 1회 실행한다. app 설정의 init_command를 쓰고 없으면 건너뛴다.
+# 앱과 같은 작업 정의(같은 이미지·DATABASE_URL 비밀·네트워크)에 명령만 바꿔서 실행하므로 앱 DB 계정으로 돈다.
+# 여러 번 실행돼도 안전해야 한다(예: CREATE TABLE IF NOT EXISTS). update·rollback의 적용마다 다시 실행된다
+app_init_task() {  # app_init_task <배포 디렉터리> <id>
+  local d="$1" cmd rgn cluster td sg lg subnets pub ov task_arn code why tid events
+  cmd="$(init_command_json "$d/plan.app.json")" || die "app 설정의 init_command가 올바르지 않습니다"
+  [ -n "$cmd" ] || return 0
+  # 이미지와 명령이 직전에 성공한 초기화와 같으면(설정만 바꾸는 update 등) 다시 돌리지 않는다. 약 55초를 아끼고 비멱등 명령의 중복 실행을 피한다
+  local fp; fp="$(printf '%s|%s' "$(image_in_file "$d/plan.platform.json")" "$cmd" | "$(pick_python)" -c "import hashlib,sys;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())")"
+  if [ -f "$d/init.done" ] && [ "$(cat "$d/init.done")" = "$fp" ]; then
+    log "앱 초기화 작업 건너뜀: 같은 이미지·명령으로 이미 실행했습니다"
+    return 0
+  fi
+  rgn="$(region)"; cluster="$(tf "$d" output -raw cluster_name)"
+  td="$(tf "$d" output -raw task_definition_arn)" || die "task_definition_arn 출력이 없습니다(배포 템플릿이 옛 버전입니다)"
+  sg="$(tf "$d" output -raw task_security_group_id)"; lg="$(tf "$d" output -raw log_group_name)"
+  subnets="$(fjson task_subnet_ids | tr -d '[]" ' )"
+  pub="DISABLED"; grep -Eq '"assign_public_ip": *true' "$FOUNDATION_JSON" && pub="ENABLED"
+  ov="$d/init-overrides.json"
+  printf '{"containerOverrides":[{"name":"app","command":%s}]}' "$cmd" > "$ov"
+  log "앱 초기화 작업 실행: $cmd"
+  task_arn="$(awsn ecs run-task --region "$rgn" --cluster "$cluster" --launch-type FARGATE --task-definition "$td" \
+    --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$sg],assignPublicIp=$pub}" \
+    --overrides "file://$(file_uri_path "$ov")" --query 'tasks[0].taskArn' --output text)" \
+    || { rm -f "$ov"; die "앱 초기화 작업을 시작하지 못했습니다"; }
+  rm -f "$ov"
+  [ -n "$task_arn" ] && [ "$task_arn" != "None" ] || die "앱 초기화 작업을 시작하지 못했습니다"
+  # 작업이 멈출 때까지 기다린다. 제한 시간(INIT_TIMEOUT, 기본 300초)을 넘기면 작업을 멈춰서 계속 과금되거나 다음 시도와 겹치지 않게 한다
+  local waited=0 limit="${INIT_TIMEOUT:-300}" poll="${INIT_POLL:-5}" st
+  while :; do
+    st="$(aws ecs describe-tasks --region "$rgn" --cluster "$cluster" --tasks "$task_arn" --query 'tasks[0].lastStatus' --output text 2>/dev/null | tr -d '' || true)"
+    [ "$st" != "STOPPED" ] || break
+    if [ "$waited" -ge "$limit" ]; then
+      awsn ecs stop-task --region "$rgn" --cluster "$cluster" --task "$task_arn" --reason "paved-clouds: init timeout" >/dev/null 2>&1 || true
+      die "앱 초기화 작업이 ${limit}초 안에 끝나지 않아 멈췄습니다(작업 상태: ${st:-알 수 없음}). init_command가 끝나지 않는 명령인지 확인하세요"
+    fi
+    sleep "$poll"; waited=$((waited + poll))
+  done
+  code="$(aws ecs describe-tasks --region "$rgn" --cluster "$cluster" --tasks "$task_arn" \
+    --query 'tasks[0].containers[0].exitCode' --output text 2>/dev/null || echo "")"
+  why="$(aws ecs describe-tasks --region "$rgn" --cluster "$cluster" --tasks "$task_arn" \
+    --query 'tasks[0].[stoppedReason,containers[0].reason]' --output text 2>/dev/null | tr '\t' ' ' | mask || true)"
+  tid="${task_arn##*/}"
+  events="$(awsn logs get-log-events --region "$rgn" --log-group-name "$lg" --log-stream-name "app/app/$tid" \
+    --query 'events[].message' --output text 2>/dev/null | tr '\t' '\n' | mask || true)"
+  [ -n "$events" ] && printf '%s\n' "$events" | sed 's/^/    | /' >&2
+  if [ "$code" != "0" ]; then
+    { [ "$code" != "None" ] && [ -n "$code" ]; } || code="없음(컨테이너가 시작되지 못함)"
+    die "앱 초기화 작업이 실패했습니다 (종료 코드 $code). 사유: ${why:-알 수 없음}"
+  fi
+  printf '%s
+' "$fp" > "$d/init.done"
+  log "앱 초기화 작업 완료"
+}
+
+# ZIP을 폴더로 푼다. 경로 이탈(../, 절대 경로), 심볼릭 링크, 과도한 크기·파일 수를 거부한다(업로드는 신뢰하지 않는다).
+# 압축 안에 최상위 폴더가 하나뿐이면(GitHub 아카이브) 그 폴더를 기준으로 삼는다. 기준 폴더를 출력한다
+extract_zip() {  # extract_zip <zip> <대상 폴더>
+  "$(pick_python)" - "$1" "$2" <<'PYEOF'
+import os, stat, sys, zipfile
+src, dst = sys.argv[1], sys.argv[2]
+MAX_FILES = 20000
+MAX_BYTES = int(os.environ.get("ZIP_MAX_BYTES", 1 << 30))   # 풀었을 때 총 크기 한도(기본 1 GiB)
+MAX_RATIO = 200                                              # 파일 하나의 압축률 한도(압축 폭탄 차단)
+os.makedirs(dst, exist_ok=True)
+root = os.path.realpath(dst)
+with zipfile.ZipFile(src) as z:
+    infos = z.infolist()
+    if len(infos) > MAX_FILES or sum(i.file_size for i in infos) > MAX_BYTES:
+        sys.exit("ZIP이 너무 큽니다(파일 수 또는 풀었을 때 크기 한도 초과)")
+    for i in infos:
+        name = i.filename.replace("\\", "/")
+        if name.startswith("/") or ".." in name.split("/") or (len(name) > 1 and name[1] == ":"):
+            sys.exit(f"ZIP에 허용되지 않는 경로가 있습니다: {name}")
+        if i.flag_bits & 0x1:
+            sys.exit("암호가 걸린 ZIP은 지원하지 않습니다")
+        if stat.S_ISLNK(i.external_attr >> 16):
+            sys.exit(f"ZIP에 심볼릭 링크가 있습니다: {name}")
+        target = os.path.realpath(os.path.join(root, name))
+        if target != root and not target.startswith(root + os.sep):
+            sys.exit(f"ZIP 경로가 대상 폴더 밖을 가리킵니다: {name}")
+        if i.file_size > (1 << 20) and i.compress_size and i.file_size / i.compress_size > MAX_RATIO:
+            sys.exit(f"압축률이 비정상적으로 높은 파일이 있습니다(압축 폭탄 의심): {name}")
+    # extractall 대신 직접 풀면서 실제로 쓴 바이트를 센다(헤더에 적힌 크기가 거짓이어도 한도를 지킨다)
+    written = 0
+    for i in infos:
+        name = i.filename.replace("\\", "/")
+        target = os.path.join(root, name)
+        if i.is_dir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with z.open(i) as src_f, open(target, "wb") as out_f:
+            while True:
+                chunk = src_f.read(1 << 20)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_BYTES:
+                    sys.exit("ZIP이 너무 큽니다(풀었을 때 크기 한도 초과)")
+                out_f.write(chunk)
+entries = [e for e in os.listdir(root) if e not in ("__MACOSX",)]
+base = os.path.join(root, entries[0]) if len(entries) == 1 and os.path.isdir(os.path.join(root, entries[0])) else root
+print(base)
+PYEOF
+}
+
+# 이 배포의 이미지 주소(ECR 주소:태그)를 미리 정해 출력한다. 계획은 이미지가 없어도 만들 수 있으므로(승인 뒤에 빌드),
+# plan에 쓸 주소를 먼저 정하고 빌드할 때 같은 태그(build --tag)를 쓴다
+cmd_image_ref() {  # image-ref <id>
+  local id="${1:-}"; [ -n "$id" ] || die "사용법: image-ref <id>"
+  valid_id "$id"; need aws
+  export_foundation
+  echo "$(fjson ecr_repository_url):$id-r$(date +%s)"
+}
+
+# 소스(ZIP 또는 폴더)에서 이미지를 빌드해 foundation ECR에 올리고 이미지 주소를 표준 출력으로 낸다(진행 로그는 표준 오류).
+# 승인된 배포에만 실행한다(AGENTS.md 7장: Docker 빌드·실행에는 배포 승인과 실행 범위를 적용한다).
+# 빌드에는 호스트의 AWS 키나 docker 소켓을 넘기지 않는다
+cmd_build() {
+  local id="" source="" dockerfile="Dockerfile" tag=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --id) id="$2"; shift 2 ;;
+      --source) source="$2"; shift 2 ;;
+      --dockerfile) dockerfile="$2"; shift 2 ;;
+      --tag) tag="$2"; shift 2 ;;
+      *) die "알 수 없는 옵션: $1" ;;
+    esac
+  done
+  [ -n "$id" ] && [ -n "$source" ] || die "사용법: build --id <id> --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그]"
+  valid_id "$id"
+  # 태그를 미리 정하면 승인 전에 이미지 주소(ECR 주소:태그)를 알 수 있어 plan을 먼저 만들 수 있다
+  [ -z "$tag" ] || [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || die "--tag 형식이 올바르지 않습니다: $tag"
+  case "$dockerfile" in /*|*..*) die "--dockerfile은 소스 안의 상대 경로여야 합니다: $dockerfile" ;; esac
+  need docker; need aws
+  export_foundation
+  local rgn ecr registry work ctx arch platform image cfg
+  rgn="$(region)"; ecr="$(fjson ecr_repository_url)"; registry="${ecr%%/*}"
+  work="$(mktemp -d)"
+  # docker 로그인 토큰(ECR, 12시간 유효)이 든 임시 폴더라서 Ctrl-C·종료 신호에도 지운다(put_secret_param과 같은 이유)
+  trap "rm -rf '${work}'" EXIT
+  trap 'exit 130' INT TERM HUP
+  if [ -d "$source" ]; then
+    ctx="$source"
+  elif [ -f "$source" ]; then
+    ctx="$(extract_zip "$source" "$work/src")" || { rm -rf "${work:?}"; die "ZIP을 풀지 못했습니다"; }
+  else
+    rm -rf "${work:?}"; die "소스를 찾을 수 없습니다: $source"
+  fi
+  [ -f "$ctx/$dockerfile" ] || { rm -rf "${work:?}"; die "Dockerfile을 찾지 못했습니다: $ctx/$dockerfile"; }
+  arch="$(detect_arch)"; platform="linux/amd64"; [ "$arch" = "ARM64" ] && platform="linux/arm64"
+  [ -n "$tag" ] || tag="$id-r$(date +%s)"
+  image="$ecr:$tag"
+  log "이미지 빌드: $image ($platform)"
+  cfg="$work/docker"; mkdir -p "$cfg"; echo '{}' > "$cfg/config.json"
+  # 사용자의 docker 설정(자격증명 도우미)을 건드리지 않으려고 임시 설정 폴더를 쓴다
+  (
+    export DOCKER_CONFIG; DOCKER_CONFIG="$(native_path "$cfg")"
+    docker build --platform "$platform" -f "$(native_path "$ctx/$dockerfile")" -t "$image" "$(native_path "$ctx")" >&2
+    aws ecr get-login-password --region "$rgn" | docker login --username AWS --password-stdin "$registry" >/dev/null
+    docker push "$image" >&2
+  ) || { rm -rf "${work:?}"; die "이미지를 빌드하거나 올리지 못했습니다"; }
+  rm -rf "${work:?}"
+  log "이미지를 올렸습니다. 아키텍처: $arch"
+  echo "$image"
+}
+
 # plan 저장 → 승인 → 저장된 plan 그대로 apply → 헬스체크 대기
 plan_confirm_apply() {
   local d="$1" id="$2"
@@ -760,6 +998,13 @@ apply_saved() {
   check_plan_inputs "$d"
   UP_PHASE=""   # 여기서부터는 state가 생길 수 있어 폴더를 지우지 않는다
   image="$(image_in_file "$d/plan.platform.json")"
+  # 계획 단계에서는 이미지가 없어도 되므로(승인 뒤에 빌드·푸시), 적용 직전에 ECR에 실제로 있는지 확인한다.
+  # 없으면 태스크가 이미지를 받지 못해 서킷 브레이커까지 8분 넘게 기다리게 된다
+  export_foundation
+  if ! ( check_image_exists "$image" ); then
+    record_attempt "$d" fail "$image" "ECR에 이미지가 없음"
+    return 1
+  fi
   # 앱 전용 DB는 승인된 뒤에만 만든다 (계획 단계에서는 접속 정보 ARN만 쓰고 아무것도 만들지 않는다)
   if [ -f "$d/db-isolated" ] && [ ! -f "$d/db-provisioned" ]; then
     export_foundation
@@ -777,6 +1022,15 @@ apply_saved() {
   tf "$d" output -json > "$d/outputs.json"
   # 한 번 적용한 계획은 다시 쓸 수 없다. 남겨 두면 오해를 부르니 지운다
   rm -f "$d/tfplan"
+
+  # 앱 초기화 작업(테이블 생성 등). /health가 DB 연결만 확인하는 앱은 테이블이 없어도 헬스체크를 통과해서,
+  # 이 단계가 없으면 "배포 성공"인데 실제 기능은 500 오류가 나는 상태가 된다
+  if ! ( app_init_task "$d" "$id" ); then
+    record_attempt "$d" fail "$image" "앱 초기화 작업 실패"
+    log "앱 초기화 작업이 실패했습니다. 원인: deploy.sh diagnose $id"
+    unpin_plan_inputs "$d"
+    return 1
+  fi
 
   local healthy=0
   wait_healthy "$id" && healthy=1
@@ -800,10 +1054,11 @@ cmd_apply() {
 }
 
 cmd_up() {
-  local id="" image="" port="auto" app="" grace="" shared_db=0
+  local id="" name="" image="" port="auto" app="" grace="" shared_db=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --port) port="$2"; shift 2 ;;
       --app) app="$2"; shift 2 ;;
@@ -816,8 +1071,12 @@ cmd_up() {
       *) die "알 수 없는 옵션: $1" ;;
     esac
   done
-  [ -n "$id" ] && [ -n "$image" ] && [ -n "$app" ] || die "--id --image --app 이 모두 필요합니다"
+  [ -z "$id" ] || [ -z "$name" ] || die "--id 와 --name 은 함께 쓸 수 없습니다"
+  [ -z "$name" ] || id="$(make_id "$name")"
+  [ -n "$id" ] && [ -n "$image" ] && [ -n "$app" ] || die "--id(또는 --name) --image --app 이 모두 필요합니다"
   valid_id "$id"
+  [ -n "${ARCH:-}" ] || ARCH="$(detect_arch)"
+  [ "$ARCH" = "X86_64" ] || [ "$ARCH" = "ARM64" ] || die "--arch는 X86_64 또는 ARM64여야 합니다: $ARCH"
   [ "$port" = "auto" ] || [[ "$port" =~ ^[0-9]+$ ]] || die "--port는 숫자 또는 auto여야 합니다"
   [ -z "$grace" ] || [[ "$grace" =~ ^[0-9]+$ ]] || die "--grace는 숫자(초)여야 합니다"
   [ -f "$app" ] || die "app 파일이 없습니다: $app"
@@ -831,7 +1090,8 @@ cmd_up() {
 
   export_foundation
   nat_preflight
-  check_image_exists "$image"
+  # 계획만 만들 때는 이미지가 아직 없어도 된다(승인 뒤에 빌드·푸시한다). 적용 직전(apply_saved)에 반드시 확인한다
+  [ "${PLAN_ONLY:-0}" = "1" ] || check_image_exists "$image"
 
   if [ "$port" = "auto" ]; then
     port="$(pick_port)" || die "허용 범위에 빈 포트가 없습니다"
@@ -900,6 +1160,7 @@ redeploy() {
     ensure_db_isolation "$d" "$id" "$app"
   fi
   refresh_foundation "$d"
+  # up과 달리 update·rollback의 이미지는 이미 있어야 한다(rollback 대상이 보관 개수 제한으로 지워졌다면 승인 전에 알린다)
   check_image_exists "$(input_image "$d")"
   export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
   plan_confirm_apply "$d" "$id"
@@ -1037,8 +1298,14 @@ cmd_status() {
     tail -n 5 "$d/attempts.log" | sed -E 's#\|[^|]*/#|#; s/^/  /'
   fi
   if [ -f "$d/db-isolated" ]; then echo "DB: 앱 전용 $(cat "$d/db-isolated")"; else echo "DB: 공유 또는 미사용"; fi
-  aws ecs describe-services --region "$(region)" --cluster "$cluster" --services "$svc" \
-    --query 'services[0].{상태:status,원하는:desiredCount,실행중:runningCount,대기:pendingCount}' --output table
+  # 한글 키를 --query에 쓰면 Windows Git Bash에서 aws가 JMESPath를 해석하지 못한다. 값만 받아 여기서 이름을 붙인다
+  local st dc rc pc svc_out
+  # 프로세스 치환(< <(...))은 aws 실패를 알리지 못해서 조회가 실패해도 빈 값이 정상 응답처럼 찍힌다. 변수로 받아 실패를 확인한다
+  svc_out="$(aws ecs describe-services --region "$(region)" --cluster "$cluster" --services "$svc" \
+    --query 'services[0].[status,desiredCount,runningCount,pendingCount]' --output text | tr -d '\r')" \
+    || die "서비스 상태를 조회하지 못했습니다(자격 증명이나 서비스 이름을 확인하세요)"
+  read -r st dc rc pc <<< "$svc_out"
+  echo "서비스: 상태 $st, 원하는 개수 $dc, 실행 중 $rc, 대기 $pc"
   aws elbv2 describe-target-health --region "$(region)" \
     --target-group-arn "$(tf "$d" output -raw target_group_arn)" \
     --query 'TargetHealthDescriptions[].[Target.Id,TargetHealth.State,TargetHealth.Reason]' --output table
@@ -1147,11 +1414,15 @@ main() {
     apply) cmd_apply "$@" ;;
     status) cmd_status "$@" ;;
     diagnose) cmd_diagnose "$@" ;;
+    build) cmd_build "$@" ;;
+    make-id) make_id "${1:-}" ;;
+    detect-arch) detect_arch ;;
+    image-ref) cmd_image_ref "$@" ;;
     foundation-state) cmd_foundation_state ;;
     db-check) export_foundation; cmd_db_check "$@" ;;
     drop-db) export_foundation; cmd_drop_db "$@" ;;
     destroy) cmd_destroy "$@" ;;
-    *) sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 1 ;;
+    *) sed -n '2,28p' "${BASH_SOURCE[0]}"; exit 1 ;;
   esac
 }
 # 직접 실행할 때만 main을 돌린다. test_infra.py가 함수만 시험하려고 source로 불러올 때는 돌리지 않는다
