@@ -4,8 +4,8 @@
 **/*.py[cod]
 **/.env
 **/.env.*
-*.pem
-*.key
+**/*.pem
+**/*.key
 *.p12
 *.pfx
 id_rsa
