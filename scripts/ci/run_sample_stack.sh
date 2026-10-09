@@ -18,7 +18,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-"${compose[@]}" up --build --detach --wait --wait-timeout 180
+# Compose의 healthy/completed_successfully 의존 순서를 따른다.
+# init-db는 정상 종료하는 일회성 작업이므로 모든 서비스를 running으로 기다리지 않는다.
+"${compose[@]}" up --build --detach
 python3 - <<'PY'
 import json
 import time

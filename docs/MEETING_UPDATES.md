@@ -27,8 +27,8 @@
 | 영역 | 확인한 코드 | 이번 CI |
 |---|---|---|
 | `sample-front/` | main의 HTML·JavaScript, API 부재 시 브라우저 MOCK 자동 전환 | 실제 Chrome에서 MOCK 사용자 흐름, 실제 연동으로 오인하지 않는지 검사 |
-| `sample-back/` | [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4): Python 3.12·FastAPI·MySQL 8.4, 앱 시작 시 테이블 생성, 같은 서버의 정적 파일·API | 합쳐지면 실제 Docker/API/DB/브라우저 검사 활성화. 샘플의 구현을 플랫폼 전체 마이그레이션 정책으로 일반화하지 않음 |
-| `front/` | [PR #7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7): React·TypeScript·Vite, 기본 MOCK, SSO/API 가안 | 합쳐지면 잠긴 의존성으로 타입 검사·두 설정의 빌드. SSO·실제 API·배포 검증 아님 |
+| `sample-back/` | [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4), `d5816c1`: Python 3.12·FastAPI·MySQL 8.4, 별도 `init-db` 작업으로 테이블 초기화, 같은 서버의 정적 파일·API | 합쳐지면 실제 Docker/API/DB/브라우저 검사 활성화. 샘플의 구현을 플랫폼 전체 마이그레이션 정책으로 일반화하지 않음 |
+| `front/` | [PR #7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7), `f5646f9`: React·TypeScript·Vite, 기본 MOCK, AWS/온프레미스, 예산·실패 수정 후 재승인. 최신 README는 SSO를 범위에서 제외 | 합쳐지면 잠긴 의존성으로 타입 검사·두 설정의 빌드. 실제 API·배포 검증 아님 |
 | `infra/` | [PR #6](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/6): bootstrap/foundation/앱 모듈·스크립트 | 합쳐지면 AWS 자격 증명 없는 정적 검사. 실제 배포 시험과 구분 |
 | `back/` | main·확인한 개인 원격 브랜치에서 골격만 있음 | 전체 플랫폼 통합은 미검증. 코드가 생기면 검사 계약을 추가해야 함 |
 

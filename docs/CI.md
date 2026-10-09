@@ -21,7 +21,7 @@
 | `CI coverage` | 항상 | 파일 계약과 검사 판정 회귀 테스트 | 플랫폼 동작 |
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
-| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 SSO/API/분석/승인/배포 흐름 |
+| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
 현재 main에는 샘플 프런트만 있다. [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4), [#6](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/6), [#7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7)의 파일 계약을 읽어 조건부 검사를 준비했다. 각 PR이 main을 동기화하면 PR 검사에서, 합쳐지면 main push에서 활성화된다. 열린 PR 코드를 CI가 별도로 가져오거나 자동으로 합치지 않는다.
@@ -46,7 +46,7 @@ python3 -m http.server 8080 --bind 127.0.0.1 --directory sample-front
 node scripts/ci/test_sample_front.mjs --url http://127.0.0.1:8080/ --mode mock
 ```
 
-샘플 백엔드가 합쳐졌고 Docker Compose v2를 쓸 수 있으면 아래 명령으로 실제 통합 검사를 실행한다. 로컬 8000·3307 포트가 비어 있어야 한다. 기존 Compose 파일의 MySQL 8.4와 Dockerfile을 그대로 사용한다. 임의 이름의 CI 전용 프로젝트·테스트 계정·볼륨을 만들고 종료 시 그 프로젝트만 `down --volumes`로 정리한다. 실서비스를 검사 대상으로 지정하지 않는다.
+샘플 백엔드가 합쳐졌고 Docker Compose v2를 쓸 수 있으면 아래 명령으로 실제 통합 검사를 실행한다. 로컬 8000·3307 포트가 비어 있어야 한다. 기존 Compose 파일의 MySQL 8.4와 Dockerfile을 그대로 사용하며 DB 준비→`init-db` 정상 종료→앱 시작 순서를 따른다. 임의 이름의 CI 전용 프로젝트·테스트 계정·볼륨을 만들고 종료 시 그 프로젝트만 `down --volumes`로 정리한다. 실서비스를 검사 대상으로 지정하지 않는다.
 
 ```bash
 bash scripts/ci/run_sample_stack.sh

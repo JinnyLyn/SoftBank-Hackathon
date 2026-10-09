@@ -10,7 +10,7 @@ import subprocess
 
 CONTRACTS = {
     "sample_front": ("sample-front", ("index.html", "login.html", "signup.html", "app.js", "mock-api.js", "style.css")),
-    "sample_back": ("sample-back", ("Dockerfile", "docker-compose.yml", "requirements.txt", "app/main.py")),
+    "sample_back": ("sample-back", ("Dockerfile", "docker-compose.yml", "requirements.txt", "app/main.py", "app/initialize_database.py", "app/schema.sql")),
     "front": ("front", ("package.json", "package-lock.json", "src/App.tsx")),
     "infra": ("infra", ("bootstrap/versions.tf", "foundation/versions.tf", "deployments/_template/versions.tf", "modules/ecs-web-app/main.tf", "scripts/deploy.sh")),
 }
