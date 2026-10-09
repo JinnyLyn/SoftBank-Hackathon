@@ -1,11 +1,44 @@
 """검사 대상의 누락과 선행 작업 실패가 성공으로 바뀌지 않는지 확인한다."""
 
 import copy
+import io
 from pathlib import Path
 import tempfile
 import unittest
 
 from components import CONTRACTS, inspect, report
+from test_platform_back import failure_diagnostics
+
+
+class FailureDiagnosticsTests(unittest.TestCase):
+    def test_reports_traceback_location_and_type_without_values(self):
+        log = io.BytesIO(b'Traceback (most recent call last):\n'
+                        b'  File "/private/backend/app/main.py", line 42, in startup\n'
+                        b'    raise RuntimeError("fake-secret-sentinel")\n'
+                        b'RuntimeError: mysql://user:fake-password@host/db\n'
+                        b'ANTHROPIC_API_KEY=fake-key-sentinel\n')
+        result = failure_diagnostics(log)
+        self.assertIn("main.py:42", result)
+        self.assertIn("RuntimeError", result)
+        for secret in ("fake-secret-sentinel", "fake-password", "fake-key-sentinel", "/private", "mysql://"):
+            self.assertNotIn(secret, result)
+
+    def test_limits_input_tail_and_diagnostic_lines(self):
+        log = io.BytesIO(b'ValueError: old\n' + b'x' * 20_000 + b'\n' + b'RuntimeError: new\n' * 100)
+        result = failure_diagnostics(log)
+        self.assertNotIn("ValueError", result)
+        self.assertEqual(result.count("RuntimeError"), 12)
+
+    def test_redacts_unstructured_errors_and_control_characters(self):
+        log = io.BytesIO(b'ERROR: fake-secret-sentinel\n'
+                        b'  File "/app/\x1b[31mmain.py", line 2\n')
+        result = failure_diagnostics(log)
+        self.assertIn("Uvicorn ERROR", result)
+        self.assertNotIn("fake-secret-sentinel", result)
+        self.assertNotIn("\x1b", result)
+
+    def test_handles_empty_log(self):
+        self.assertIn("traceback 없음", failure_diagnostics(io.BytesIO()))
 
 
 class CoverageTests(unittest.TestCase):

@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import subprocess
 import sys
@@ -76,6 +77,24 @@ def child_environment(directory):
     return env
 
 
+def failure_diagnostics(log):
+    # Traceback locations/types are useful without printing source lines or values.
+    log.seek(0, os.SEEK_END)
+    log.seek(max(0, log.tell() - 16_384))
+    entries = []
+    for line in log.read().decode("utf-8", errors="replace").splitlines():
+        frame = re.match(r'^\s*File "([^"\r\n]+)", line ([0-9]{1,8})(?:, in .*)?$', line)
+        error = re.match(r'^([A-Za-z_][A-Za-z0-9_.]{0,100}(?:Error|Exception)|SystemExit|KeyboardInterrupt)(?::|$)', line)
+        if frame:
+            filename = re.sub(r"[^A-Za-z0-9_.-]", "?", Path(frame[1]).name)[:100]
+            entries.append(f"  {filename}:{frame[2]}")
+        elif error:
+            entries.append(f"  {error[1]} (메시지 생략)")
+        elif line.startswith("ERROR:"):
+            entries.append("  Uvicorn ERROR (메시지 생략)")
+    return "백엔드 실패 진단:\n" + ("\n".join(entries[-12:]) or "  traceback 없음 (원문 로그 미출력)")
+
+
 def check(root):
     require((root / "app" / "main.py").is_file(), f"백엔드 진입점이 없습니다: {root / 'app/main.py'}")
     with socket.socket() as listener:
@@ -84,13 +103,14 @@ def check(root):
     client = Client(port)
     with tempfile.TemporaryDirectory(prefix="platform-back-smoke-") as temporary:
         directory = Path(temporary)
-        with (directory / "server.log").open("w+", encoding="utf-8") as log:
+        with (directory / "server.log").open("w+b") as log:
             process = subprocess.Popen(
                 [sys.executable, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1",
                  "--port", str(port), "--no-access-log"],
                 cwd=root, env=child_environment(directory), stdin=subprocess.DEVNULL,
                 stdout=log, stderr=subprocess.STDOUT,
             )
+            failed = True
             try:
                 deadline = time.monotonic() + STARTUP_TIMEOUT
                 while True:
@@ -115,6 +135,7 @@ def check(root):
                 client.json("/api/worker/deployments/claim", status=401, method="POST")
                 client.json("/api/plans", status=422, method="POST", payload={})
                 require(process.poll() is None, "검사 중 백엔드가 종료되었습니다")
+                failed = False
             finally:
                 if process.poll() is None:
                     process.terminate()
@@ -123,6 +144,8 @@ def check(root):
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=5)
+                if failed:
+                    print(failure_diagnostics(log), file=sys.stderr)
     print("PASS: 플랫폼 백엔드 시작·OpenAPI·health·DB 미설정 503·작업자 인증 401·입력 검증 422")
     print("검사 제외: 실제 DB·프런트 연동·LLM·AWS 배포")
 
