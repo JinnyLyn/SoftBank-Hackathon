@@ -20,7 +20,7 @@ CODEOWNERS는 main의 파일을 사용한다. 초기 설정 PR이 합쳐지기 �
 
 ## 필수 CI
 
-이 변경에 포함된 GitHub Actions는 Git 훅의 허용·차단 동작을 검증한다. 앱 테스트나 AWS 배포가 구현됐다는 뜻은 아니다.
+기존 `Team Git Guard`는 Git 훅의 허용·차단 동작을 검증한다. 이 두 필수 검사의 성공만으로 앱 동작을 확인한 것은 아니다.
 
 - `Git guard (ubuntu-latest)`
 - `Git guard (windows-latest)`
@@ -29,7 +29,9 @@ CODEOWNERS는 main의 파일을 사용한다. 초기 설정 PR이 합쳐지기 �
 
 Actions 권한은 `contents: read`이고 저장소 인증 정보는 checkout에 남기지 않는다. 외부 Action 버전은 전체 commit SHA로 고정한다. AWS 키·LLM 키를 사용하는 작업은 없다.
 
-앱별 실행·테스트 명령이 생기면 해당 CI를 추가하고 정상 실행 후 필수 검사로 등록한다. 실제 배포 권한·승인·rollback 방식은 별도 합의한다.
+추가한 `Application CI`는 main 대상 PR과 main push에서 구성요소별 검사를 실행한다. 마지막 고정 check는 `Available app checks`다. MOCK 브라우저, 실제 샘플 DB/API/브라우저, 플랫폼 프런트 빌드, Terraform 정적 검사를 코드 유무에 따라 수행하고 전체 플랫폼 미검증을 요약에 남긴다. 자세한 범위는 [CI.md](CI.md)를 참고한다.
+
+`Available app checks`의 필수 check 등록은 아직 하지 않았다. 최초 원격 실행 성공과 범위를 확인한 후 `paved-main-ci`에 추가할 수 있다. 이번 작업은 워크플로·PR을 추가하며 기존 서버 ruleset을 변경하지 않는다. 조건부 개별 job은 미구현 상태에서 skip되므로 필수 check로 각각 등록하지 않는다. 실제 배포 권한·승인·rollback 방식은 별도 합의한다.
 
 ## 각 팀원이 한 번 실행
 
