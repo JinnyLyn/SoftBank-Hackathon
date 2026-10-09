@@ -12,6 +12,7 @@ CONTRACTS = {
     "sample_front": ("sample-front", ("index.html", "login.html", "signup.html", "app.js", "mock-api.js", "style.css")),
     "sample_back": ("sample-back", ("Dockerfile", "docker-compose.yml", "requirements.txt", "app/main.py", "app/initialize_database.py", "app/schema.sql")),
     "front": ("front", ("package.json", "package-lock.json", "src/App.tsx")),
+    "back": ("back", (".python-version", "requirements.txt", "app/main.py")),
     "infra": ("infra", ("bootstrap/versions.tf", "foundation/versions.tf", "deployments/_template/versions.tf", "modules/ecs-web-app/main.tf", "scripts/deploy.sh")),
 }
 IGNORED_DIRS = {"node_modules", ".venv", "__pycache__", ".terraform", "dist", "screenshots"}
@@ -41,8 +42,6 @@ def inspect(root, previously_present=()):
             missing = [name for name in required if not (component / name).is_file()]
             if missing:
                 raise ValueError(f"{directory}: 검사 계약 파일 누락: {', '.join(missing)}. docs/CI.md를 함께 갱신하세요.")
-    if has_implementation(root / "back"):
-        raise ValueError("back/ 구현이 추가됐습니다. 플랫폼 백엔드의 실제 실행·통합 검사를 CI에 연결해야 합니다. docs/CI.md 참고.")
     return present
 
 
@@ -69,6 +68,7 @@ def report(needs):
         "sample_front": "Chrome 사용자 흐름 · MOCK (실제 API/DB 아님)",
         "sample_back": "Docker 빌드 + MySQL 8.4 + 실제 API/브라우저 + DB 중단 감지",
         "front": "잠긴 의존성 설치 + TypeScript/Vite 빌드 (MOCK/실제 API 설정)",
+        "back": "Python 의존성·문법 + 앱 기동·OpenAPI·입력/인증 오류 응답 (DB 연결·마이그레이션·프런트 연동은 미검증)",
         "infra": "Terraform fmt/init/validate + 셸 문법 (AWS plan/apply 아님)",
     }
     for key, scope in scopes.items():
@@ -81,7 +81,7 @@ def report(needs):
         lines.append(f"| {key} | {label} | {scope} |")
     lines += [
         "", f"**구현된 구성요소 검사: {'실패' if failed else '통과'}**",
-        "", "**전체 플랫폼 통합: 미검증.** 플랫폼 백엔드·LLM·승인·실제 배포 연결은 아직 없습니다.",
+        "", "**전체 플랫폼 통합: 미검증.** 소스 입력부터 LLM·승인·배포까지의 전체 흐름과 실제 AWS 연동은 이 CI의 성공 조건이 아닙니다.",
         "이 결과는 전체 앱 정상이나 AWS 배포 성공을 뜻하지 않습니다. 검사 범위와 확장 방법은 docs/CI.md를 참고하세요.",
     ]
     if inventory.get("result") != "success":
