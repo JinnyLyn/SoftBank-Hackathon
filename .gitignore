@@ -25,3 +25,6 @@ __pycache__/
 .ruff_cache/
 node_modules/
 CLAUDE.local.md
+
+# 환경마다 다른 Terraform state 백엔드 설정(deploy.sh가 만든다)
+backend_override.tf

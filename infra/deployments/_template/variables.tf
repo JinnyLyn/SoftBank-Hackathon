@@ -11,6 +11,10 @@ variable "platform" {
     image            = string
     cpu_architecture = optional(string, "X86_64")
     listener_port    = number
+    # 이 배포 전용 DB 접속 정보 파라미터. 비우면 공유 DB URL을 쓴다 (deploy.sh가 앱별 DB를 만들면 채운다)
+    database_url_parameter_arn = optional(string, "")
+    # 실패한 배포를 얼마나 빨리 확정할지 조절한다. 느리게 뜨는 앱은 늘린다
+    health_check_grace_seconds = optional(number, 90)
     foundation = object({
       alb_arn      = string
       alb_dns_name = string
@@ -18,12 +22,15 @@ variable "platform" {
         from = number
         to   = number
       })
+      alb_security_group_id      = string
       assign_public_ip           = bool
+      certificate_arn            = optional(string, "")
       cluster_name               = string
       database_url_parameter_arn = string
+      db_security_group_id       = string
       ecr_repository_url         = string
       execution_role_arn         = string
-      task_security_group_id     = string
+      listener_protocol          = optional(string, "HTTP")
       task_subnet_ids            = list(string)
       vpc_id                     = string
     })

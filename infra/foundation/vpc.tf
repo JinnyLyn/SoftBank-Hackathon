@@ -12,8 +12,8 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  # ALB와 RDS 서브넷 그룹은 최소 2개 AZ가 필요하다. 3개 AZ에 퍼블릭·프라이빗 서브넷을 각 1개씩 둔다
-  azs = slice(data.aws_availability_zones.available.names, 0, 3)
+  # ALB와 RDS 서브넷 그룹은 최소 2개 AZ가 필요하다. az_count(기본 3)개 AZ에 퍼블릭·프라이빗 서브넷을 각 1개씩 둔다
+  azs = slice(data.aws_availability_zones.available.names, 0, min(var.az_count, length(data.aws_availability_zones.available.names)))
 
   # 앱 태스크 위치: NAT 인스턴스를 켜면 프라이빗, 끄면 퍼블릭 + 퍼블릭 IP
   task_subnet_ids  = var.enable_nat_instance ? aws_subnet.private[*].id : aws_subnet.public[*].id

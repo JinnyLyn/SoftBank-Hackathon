@@ -10,9 +10,13 @@ variable "project" {
 }
 
 variable "region" {
-  description = "배포 리전"
+  description = "배포 리전. 계정에 지정된 리전을 반드시 직접 지정한다. 기본값을 두면 변수를 빼먹었을 때 엉뚱한 리전에 만들어진다"
   type        = string
-  default     = "ap-northeast-2"
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]$", var.region))
+    error_message = "region은 sa-east-1 같은 AWS 리전 이름이어야 합니다."
+  }
 }
 
 variable "vpc_cidr" {
@@ -40,6 +44,13 @@ variable "nat_instance_type" {
   validation {
     condition     = can(regex("^[a-z]+[0-9]+g[a-z]*\\.[a-z0-9]+$", var.nat_instance_type))
     error_message = "nat_instance_type은 Graviton(arm64) 인스턴스 타입이어야 합니다. 예: t4g.small"
+  }
+
+  # nano(0.5GB)와 micro(1GB)는 부팅할 때 iptables-services 설치가 메모리 부족으로 종료되어 NAT가 동작하지 않는다.
+  # 이때 인스턴스 상태 검사는 정상으로 나와서 겉으로는 알 수 없다. small(2GB) 이상만 허용한다
+  validation {
+    condition     = !can(regex("[.](nano|micro)$", var.nat_instance_type))
+    error_message = "nat_instance_type은 small(메모리 2GB) 이상이어야 합니다. nano·micro는 NAT 초기화가 메모리 부족으로 실패합니다."
   }
 }
 
@@ -108,6 +119,68 @@ variable "ecr_keep_images" {
 
 variable "protect_from_destroy" {
   description = "true면 RDS 삭제 보호를 켜고 ECR 강제 삭제를 막는다. 행사 종료 후 정리할 때만 false로 바꾼다"
+  type        = bool
+  default     = true
+}
+
+variable "certificate_arn" {
+  description = "ALB HTTPS 리스너에 쓸 ACM 인증서 ARN. 비우면 HTTP만 연다(개발·시험용). 실제 서비스는 반드시 지정한다. 지정하면 80번은 443으로 넘기고 배포별 리스너도 HTTPS가 된다"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.certificate_arn == "" || can(regex("^arn:aws[a-z-]*:acm:[a-z0-9-]+:[0-9]{12}:certificate/[a-f0-9-]+$", var.certificate_arn))
+    error_message = "certificate_arn은 ACM 인증서 ARN(arn:aws:acm:리전:계정:certificate/...)이어야 합니다."
+  }
+}
+
+variable "az_count" {
+  description = "사용할 가용 영역 수. 서브넷과 NAT 인스턴스(고가용성일 때)가 이 수만큼 만들어진다. ALB와 RDS 서브넷 그룹은 최소 2개가 필요하다"
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = contains([2, 3], var.az_count)
+    error_message = "az_count는 2 또는 3이어야 합니다."
+  }
+}
+
+variable "nat_high_availability" {
+  description = "true면 가용 영역마다 NAT 인스턴스를 하나씩(AZ 하나가 멈춰도 다른 AZ는 외부 통신 유지). false면 NAT 인스턴스 1대로 모든 AZ가 같이 쓴다(비용 절감, 그 AZ가 멈추면 전체 외부 통신 중단)"
+  type        = bool
+  default     = true
+}
+
+variable "nat_ami_id" {
+  description = "NAT 인스턴스 AMI를 고정하려면 지정한다(예: ami-0123456789abcdef0). 비우면 Amazon Linux 2023 arm64 최신 AMI를 쓴다. 어느 쪽이든 만든 뒤 AMI가 바뀌어도 인스턴스를 교체하지 않는다"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.nat_ami_id == "" || can(regex("^ami-[0-9a-f]{8,17}$", var.nat_ami_id))
+    error_message = "nat_ami_id는 ami-로 시작하는 AMI ID이어야 합니다."
+  }
+}
+
+variable "db_backup_retention_days" {
+  description = "RDS 자동 백업 보관 기간(일). 장애나 실수로 지웠을 때 이 기간 안의 시점으로 복구할 수 있다"
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35
+    error_message = "db_backup_retention_days는 1~35여야 합니다."
+  }
+}
+
+variable "db_multi_az" {
+  description = "true면 RDS를 다른 가용 영역에 대기 복제본을 두는 다중 AZ로 만든다(비용 약 2배, 장애 시 자동 전환)"
+  type        = bool
+  default     = false
+}
+
+variable "final_snapshot" {
+  description = "true면 RDS를 지울 때 최종 스냅샷을 남긴다. 시험용으로 지우고 다시 만들 때만 false로 한다"
   type        = bool
   default     = true
 }

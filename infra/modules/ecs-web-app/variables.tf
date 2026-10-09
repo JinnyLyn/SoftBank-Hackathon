@@ -79,15 +79,45 @@ variable "foundation" {
       from = number
       to   = number
     })
+    alb_security_group_id      = string
     assign_public_ip           = bool
+    certificate_arn            = optional(string, "")
     cluster_name               = string
     database_url_parameter_arn = string
+    db_security_group_id       = string
     ecr_repository_url         = string
     execution_role_arn         = string
-    task_security_group_id     = string
+    listener_protocol          = optional(string, "HTTP")
     task_subnet_ids            = list(string)
     vpc_id                     = string
   })
+
+  validation {
+    condition     = contains(["HTTP", "HTTPS"], var.foundation.listener_protocol)
+    error_message = "foundation.listener_protocol은 HTTP 또는 HTTPS여야 합니다."
+  }
+}
+
+variable "database_url_parameter_arn" {
+  description = "이 배포 전용 DB 접속 정보가 든 SSM 파라미터 ARN. 비우면 foundation의 공유 DB URL(관리자 계정)을 쓴다. deploy.sh가 앱별 DB와 계정을 만들고 이 값을 채운다"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.database_url_parameter_arn == "" || can(regex("^arn:aws[a-z-]*:ssm:[a-z0-9-]+:[0-9]{12}:parameter/.+$", var.database_url_parameter_arn))
+    error_message = "database_url_parameter_arn은 SSM 파라미터 ARN이어야 합니다."
+  }
+}
+
+variable "health_check_grace_seconds" {
+  description = "새 태스크가 뜬 뒤 헬스체크 실패를 무시하는 시간(초). 느리게 기동하는 앱(JVM 등)은 늘려서 오탐 실패를 막는 용도다. 줄여도 실패한 배포가 빨리 확정되지는 않는다. 서킷 브레이커는 태스크가 3번 실패해야 배포를 FAILED로 만드는데, 실측으로 유예 90초에서 527초, 30초에서 500초가 걸렸다(태스크 기동, 대상 등록, 헬스체크 실패, 교체 시간이 지배적)"
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = var.health_check_grace_seconds >= 0 && var.health_check_grace_seconds <= 600
+    error_message = "health_check_grace_seconds는 0~600이어야 합니다."
+  }
 }
 
 ###############################################################################

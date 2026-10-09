@@ -10,6 +10,11 @@ resource "random_password" "db" {
   special = false
 }
 
+# 최종 스냅샷 이름이 지웠다 다시 만들 때 겹치지 않도록 한 번 정한 접미사
+resource "random_id" "final_snapshot" {
+  byte_length = 4
+}
+
 # RDS가 사용할 서브넷 묶음. 최소 2개 AZ가 필요하다
 resource "aws_db_subnet_group" "this" {
   name       = "${var.project}-db"
@@ -36,11 +41,13 @@ resource "aws_db_instance" "this" {
   db_subnet_group_name   = aws_db_subnet_group.this.name
   vpc_security_group_ids = [aws_security_group.db.id]
   publicly_accessible    = false
-  multi_az               = false
+  multi_az               = var.db_multi_az
 
-  backup_retention_period    = 1
+  backup_retention_period    = var.db_backup_retention_days
+  copy_tags_to_snapshot      = true
   auto_minor_version_upgrade = true
   apply_immediately          = true
-  skip_final_snapshot        = true
+  skip_final_snapshot        = !var.final_snapshot
+  final_snapshot_identifier  = var.final_snapshot ? "${var.project}-mysql-final-${random_id.final_snapshot.hex}" : null
   deletion_protection        = var.protect_from_destroy
 }

@@ -8,6 +8,9 @@ module "app" {
   listener_port    = var.platform.listener_port
   foundation       = var.platform.foundation
 
+  database_url_parameter_arn = var.platform.database_url_parameter_arn
+  health_check_grace_seconds = var.platform.health_check_grace_seconds
+
   # LLM 입력 (승인된 값)
   container_port    = var.app.container_port
   health_check_path = var.app.health_check_path

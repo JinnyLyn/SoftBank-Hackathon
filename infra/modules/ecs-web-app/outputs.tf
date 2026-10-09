@@ -2,7 +2,7 @@
 
 output "url" {
   description = "외부 접속 URL"
-  value       = "http://${var.foundation.alb_dns_name}:${var.listener_port}"
+  value       = "${lower(var.foundation.listener_protocol)}://${var.foundation.alb_dns_name}:${var.listener_port}"
 }
 
 output "cluster_name" {
@@ -33,4 +33,9 @@ output "task_definition_arn" {
 output "image" {
   description = "현재 배포된 이미지. 다음 배포의 롤백 대상으로 배포 이력에 기록한다"
   value       = var.image
+}
+
+output "task_security_group_id" {
+  description = "이 배포 전용 앱 태스크 보안 그룹"
+  value       = aws_security_group.task.id
 }

@@ -53,9 +53,17 @@ resource "aws_ecs_service" "app" {
 
   deployment_minimum_healthy_percent = 100
   deployment_maximum_percent         = 200
-  # JVM 앱은 0.25 vCPU에서 기동에 30초 이상 걸릴 수 있어 유예를 넉넉히 둔다.
+
+  # 새 태스크가 계속 뜨자마자 죽으면 ECS는 기본적으로 끝없이 재시도하고 배포가 IN_PROGRESS로 남는다.
+  # 서킷 브레이커를 켜면 반복 실패 시 배포가 FAILED가 된다. 이전 정상 버전으로의 자동 복구(rollback)는
+  # 허용 범위가 팀에서 확정되기 전이라 켜지 않는다 (AGENTS.md 6장). 복구는 deploy.sh rollback으로 사람이 한다
+  deployment_circuit_breaker {
+    enable   = true
+    rollback = false
+  }
+  # JVM 앱은 0.25 vCPU에서 기동에 30초 이상 걸릴 수 있어 기본 유예를 넉넉히(90초) 둔다. 변수로 조절한다.
   # 실패 판정 시간은 플랫폼 10단계 타임아웃이 정한다
-  health_check_grace_period_seconds = 90
+  health_check_grace_period_seconds = var.health_check_grace_seconds
 
   enable_ecs_managed_tags = true
   propagate_tags          = "SERVICE"
@@ -65,7 +73,7 @@ resource "aws_ecs_service" "app" {
 
   network_configuration {
     subnets          = var.foundation.task_subnet_ids
-    security_groups  = [var.foundation.task_security_group_id]
+    security_groups  = [aws_security_group.task.id]
     assign_public_ip = var.foundation.assign_public_ip
   }
 
@@ -80,7 +88,7 @@ resource "aws_ecs_service" "app" {
     ignore_changes = [desired_count]
 
     precondition {
-      condition     = !var.use_database || var.foundation.database_url_parameter_arn != ""
+      condition     = !var.use_database || local.database_param_arn != ""
       error_message = "use_database=true인데 DATABASE_URL 파라미터가 없습니다."
     }
   }

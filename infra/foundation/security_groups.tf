@@ -1,8 +1,11 @@
 # 보안 그룹: 리소스마다 붙이는 방화벽이다. 어디서 오는 어떤 포트의 통신을 허용할지 정한다.
 # 이 프로젝트는 3계층으로 연결한다: 인터넷 → ALB → 앱 태스크 → RDS
-# 각 계층은 바로 앞 계층의 보안 그룹에서 오는 통신만 허용하므로, DB는 인터넷에서도 ALB에서도 직접 접근할 수 없다.
 #
-# 관련 파일: alb.tf, ec2_nat.tf, rds.tf (각 리소스가 이 보안 그룹을 붙인다)
+# 앱 태스크의 보안 그룹은 여기 없다. 배포마다 modules/ecs-web-app이 앱 전용 보안 그룹을 만들고,
+# ALB와 DB 보안 그룹에는 그 앱의 포트·접속만 허용하는 규칙을 하나씩 추가한다.
+# 그래서 앱끼리 서로 접근할 수 없고, DB를 쓰지 않는 앱은 DB에 닿을 수 없다.
+#
+# 관련 파일: alb.tf, ec2_nat.tf, rds.tf, db_provisioner.tf
 
 # --- ALB: 인터넷에서 오는 요청을 받는다 ---
 resource "aws_security_group" "alb" {
@@ -24,6 +27,17 @@ resource "aws_vpc_security_group_ingress_rule" "alb_http" {
   to_port           = 80
 }
 
+resource "aws_vpc_security_group_ingress_rule" "alb_https" {
+  count = local.https_enabled ? 1 : 0
+
+  security_group_id = aws_security_group.alb.id
+  description       = "HTTPS default listener"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+}
+
 resource "aws_vpc_security_group_ingress_rule" "alb_app_ports" {
   security_group_id = aws_security_group.alb.id
   description       = "Per-deployment listener ports"
@@ -33,45 +47,7 @@ resource "aws_vpc_security_group_ingress_rule" "alb_app_ports" {
   to_port           = var.listener_port_range.to
 }
 
-resource "aws_vpc_security_group_egress_rule" "alb_to_tasks" {
-  security_group_id            = aws_security_group.alb.id
-  description                  = "Forward to app tasks"
-  referenced_security_group_id = aws_security_group.tasks.id
-  ip_protocol                  = "tcp"
-  from_port                    = 1
-  to_port                      = 65535
-}
-
-# --- 앱 태스크: ALB가 보낸 요청만 받는다 ---
-resource "aws_security_group" "tasks" {
-  name        = "${var.project}-tasks"
-  description = "ECS app tasks"
-  vpc_id      = aws_vpc.this.id
-
-  tags = {
-    Name = "${var.project}-tasks"
-  }
-}
-
-# 앱 포트는 배포마다 다르므로 ALB 보안 그룹에서 오는 TCP만 전부 허용한다
-resource "aws_vpc_security_group_ingress_rule" "tasks_from_alb" {
-  security_group_id            = aws_security_group.tasks.id
-  description                  = "From ALB only"
-  referenced_security_group_id = aws_security_group.alb.id
-  ip_protocol                  = "tcp"
-  from_port                    = 1
-  to_port                      = 65535
-}
-
-# ECR 이미지 pull, CloudWatch Logs, SSM 조회에 필요
-resource "aws_vpc_security_group_egress_rule" "tasks_all" {
-  security_group_id = aws_security_group.tasks.id
-  description       = "Outbound for ECR, logs, SSM"
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1"
-}
-
-# --- NAT 인스턴스: 앱 태스크에서 오는 트래픽만 받아 인터넷으로 중계한다 ---
+# --- NAT 인스턴스: 프라이빗 서브넷에서 오는 트래픽만 받아 인터넷으로 중계한다 ---
 resource "aws_security_group" "nat" {
   count = var.enable_nat_instance ? 1 : 0
 
@@ -84,13 +60,14 @@ resource "aws_security_group" "nat" {
   }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "nat_from_tasks" {
-  count = var.enable_nat_instance ? 1 : 0
+# 앱 태스크 보안 그룹이 배포마다 생기므로 보안 그룹 참조 대신 프라이빗 서브넷 대역으로 허용한다
+resource "aws_vpc_security_group_ingress_rule" "nat_from_private" {
+  count = var.enable_nat_instance ? length(aws_subnet.private) : 0
 
-  security_group_id            = aws_security_group.nat[0].id
-  description                  = "From app tasks"
-  referenced_security_group_id = aws_security_group.tasks.id
-  ip_protocol                  = "-1"
+  security_group_id = aws_security_group.nat[0].id
+  description       = "From private subnet ${count.index}"
+  cidr_ipv4         = aws_subnet.private[count.index].cidr_block
+  ip_protocol       = "-1"
 }
 
 resource "aws_vpc_security_group_egress_rule" "nat_all" {
@@ -102,7 +79,7 @@ resource "aws_vpc_security_group_egress_rule" "nat_all" {
   ip_protocol       = "-1"
 }
 
-# --- RDS: 앱 태스크에서 오는 MySQL(3306) 접속만 허용한다 ---
+# --- RDS: 접속 허용은 배포 모듈이 앱 보안 그룹 단위로 추가한다 ---
 resource "aws_security_group" "db" {
   name        = "${var.project}-db"
   description = "RDS MySQL"
@@ -113,10 +90,28 @@ resource "aws_security_group" "db" {
   }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "db_from_tasks" {
+# 앱별 DB와 계정을 만드는 1회성 작업(db_provisioner.tf)이 쓰는 보안 그룹
+resource "aws_security_group" "db_provisioner" {
+  name        = "${var.project}-db-provisioner"
+  description = "One-off task that creates per-app databases"
+  vpc_id      = aws_vpc.this.id
+
+  tags = {
+    Name = "${var.project}-db-provisioner"
+  }
+}
+
+resource "aws_vpc_security_group_egress_rule" "db_provisioner_all" {
+  security_group_id = aws_security_group.db_provisioner.id
+  description       = "Outbound for ECR image pull and DB access"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "-1"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "db_from_provisioner" {
   security_group_id            = aws_security_group.db.id
-  description                  = "MySQL from app tasks"
-  referenced_security_group_id = aws_security_group.tasks.id
+  description                  = "MySQL from DB provisioner task"
+  referenced_security_group_id = aws_security_group.db_provisioner.id
   ip_protocol                  = "tcp"
   from_port                    = 3306
   to_port                      = 3306

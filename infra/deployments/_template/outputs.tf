@@ -21,3 +21,7 @@ output "log_group_name" {
 output "image" {
   value = module.app.image
 }
+
+output "task_security_group_id" {
+  value = module.app.task_security_group_id
+}
