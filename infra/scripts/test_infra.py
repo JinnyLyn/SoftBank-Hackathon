@@ -558,6 +558,49 @@ def part_d():
     say("ok" if ok else "fail", "D 시도 기록: 성공과 실패(사유 포함)가 한 줄씩 남고 사유의 | 와 줄바꿈이 줄 형식을 깨지 않는다", str(lines)[:120])
 
 
+    # ---- 롤백 대상을 이미지가 아니라 배포 항목(이미지 + 앱 설정)으로 고르는지 (Codex 재리뷰 지적) ----
+    def entry_case(name, history, snaps, applied, want):
+        """history: [(image, stamp, app_config)], applied: (image, app_config) 또는 None(보관본 없음)"""
+        # 폴더 이름은 ASCII로 한다. 설명 문장(한글·화살표)을 쓰면 Windows에서 Python이 경로를 열지 못한다
+        entry_case.n = getattr(entry_case, "n", 0) + 1
+        edir = WORK / f"entry_{entry_case.n}"
+        (edir / "history").mkdir(parents=True, exist_ok=True)
+        lines = []
+        for n, (image, stamp, cfg) in enumerate(history):
+            if stamp:
+                (edir / "history" / f"{stamp}.app.json").write_text(json.dumps({"app": cfg}), encoding="utf-8")
+            lines.append(f"2026-01-0{n + 1}T00:00:00Z|{image}|{stamp}")
+        # 줄 끝을 \n으로 고정한다. Windows에서 write_text는 \r\n으로 써서 마지막 칸(스냅샷 이름)에 \r이 붙는다.
+        # deploy.sh는 bash printf로 쓰므로 실제 이력에는 \r이 없다
+        (edir / "history.log").write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+        if applied:
+            (edir / "applied.app.json").write_text(json.dumps({"app": applied[1]}), encoding="utf-8")
+            (edir / "applied.platform.json").write_text(json.dumps({"platform": {"image": applied[0]}}), encoding="utf-8")
+        rc, out, err = sh(f'tf() {{ echo "IMG:r9"; }}; previous_entry {P(edir)}')
+        got = out.strip()
+        say("ok" if got == want else "fail", "D 롤백 대상(배포 항목 기준): " + name, f"기대 {want!r} 실제 {got!r} {err[:60]}")
+
+    c1 = {"container_port": 8000, "health_check_path": "/health", "environment": {"A": "1"}}
+    c2 = {"container_port": 8000, "health_check_path": "/health2", "environment": {"A": "2"}}
+    c3 = {"container_port": 9000, "health_check_path": "/health", "environment": {"A": "1"}}
+    entry_case("이미지는 그대로(r1)이고 설정만 바꾼 업데이트 뒤 → 직전 설정의 항목(옛 코드는 대상을 못 찾음)",
+               [("IMG:r1", "s1", c1), ("IMG:r1", "s2", c2)], None, ("IMG:r1", c2), "IMG:r1|s1")
+    entry_case("설정만 바꾼 업데이트가 여러 번(c1→c2→c3) → 직전(c2) 항목",
+               [("IMG:r1", "s1", c1), ("IMG:r1", "s2", c2), ("IMG:r1", "s3", c3)], None, ("IMG:r1", c3), "IMG:r1|s2")
+    entry_case("마지막으로 apply한 것이 실패한 설정 변경(이력에 없음) → 마지막 정상 항목",
+               [("IMG:r1", "s1", c1)], None, ("IMG:r1", c2), "IMG:r1|s1")
+    entry_case("이미지와 설정이 모두 같은 중복 항목은 건너뛴다",
+               [("IMG:r0", "s0", c3), ("IMG:r1", "s1", c1), ("IMG:r1", "s2", c1)], None, ("IMG:r1", c1), "IMG:r0|s0")
+    entry_case("이미지가 다르면 대상(이미지 r1→r2)", [("IMG:r1", "s1", c1), ("IMG:r2", "s2", c1)], None, ("IMG:r2", c1), "IMG:r1|s1")
+    entry_case("보관본(applied)이 없는 옛 배포는 이미지끼리 비교(현재 r9, 스냅샷 없는 옛 이력)",
+               [("IMG:r1", "", None), ("IMG:r9", "", None)], None, None, "IMG:r1|")
+
+    # 정지 태스크 조회가 실패하면 조용히 0으로 넘기지 않고 경고를 낸다
+    rc, out, err = sh('aws() { echo "InvalidParameterException: 거부됨" >&2; return 255; }; count_stopped_tasks sa-east-1 paved-clouds ecs-svc/CUR')
+    ok = out.strip() == "0" and "조회하지 못했습니다" in err and "InvalidParameterException" in err
+    say("ok" if ok else "fail", "D 정지 태스크 조회가 실패하면 0으로 대신하되 경고를 낸다(조용히 숨기지 않음)", err[:100])
+
+
 def part_e():
     print("\n=== E. 정적 검사 ===")
     code, out = tf(INFRA, "fmt", "-check", "-recursive")

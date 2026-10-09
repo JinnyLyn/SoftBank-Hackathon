@@ -460,11 +460,49 @@ record_healthy() {
 # 이력의 마지막 줄로 정하면 실패한 업데이트 뒤에 마지막 정상 이미지를 "현재"로 착각해 롤백 대상에서 빼 버린다
 current_image() { tf "$1" output -raw image 2>/dev/null; }
 
-# 현재 배포된 것과 다른 가장 최근의 정상 이미지. 실패한 업데이트 뒤에는 마지막 정상 이미지가 된다
-previous_image() {
-  local d="$1" cur; cur="$(current_image "$d")"
-  cut -d'|' -f2 "$d/history.log" 2>/dev/null | tac | awk -v cur="$cur" '$0 != cur { print; exit }'
+# 마지막으로 apply한 입력을 보관한다(apply_saved가 terraform apply 직후에 부른다). "지금 배포된 것"의 설정 기준이 된다.
+# 입력 파일(app.auto.tfvars.json)은 --plan-only로 바꿔 놓고 적용하지 않은 값일 수 있어서 기준으로 삼을 수 없다
+save_applied() {
+  cp "$1/app.auto.tfvars.json" "$1/applied.app.json"
+  cp "$1/platform.auto.tfvars.json" "$1/applied.platform.json"
 }
+
+image_in_file() { grep -o '"image": *"[^"]*"' "$1" | head -1 | sed -E 's/.*: *"//; s/"$//'; }
+
+# 배포 항목의 지문: 이미지와 앱 설정이 같으면 같은 값. 이미지는 그대로 두고 포트·헬스체크·환경 변수만 바꾼 업데이트도 구분한다
+fingerprint() {  # fingerprint <app json 파일> <이미지>
+  "$(pick_python)" -c "import json,sys,hashlib;a=json.load(open(sys.argv[1],encoding='utf-8')).get('app',{});print(hashlib.sha256((sys.argv[2]+json.dumps(a,sort_keys=True)).encode()).hexdigest()[:16])" "$1" "$2"
+}
+
+# 롤백 대상 항목("이미지|스냅샷 이름")을 출력한다: 지금 배포된 것과 (이미지, 앱 설정)이 다른 가장 최근의 정상 항목.
+# 이미지만 비교하면 앱 설정만 바꾼 업데이트(이미지가 같은 항목이 여러 개)에서 대상을 못 찾거나 엉뚱한 옛 이미지를 고른다.
+# "지금 배포된 것"은 이력의 마지막 줄이 아니라 마지막으로 apply한 입력이다(실패한 업데이트는 이력에 없지만 배포돼 있다).
+# 보관본이 없는 옛 배포는 Terraform 상태의 이미지로 이미지끼리만 비교한다
+previous_entry() {
+  local d="$1" mode cur ts image stamp efp
+  if [ -f "$d/applied.app.json" ] && [ -f "$d/applied.platform.json" ]; then
+    mode=config; cur="$(fingerprint "$d/applied.app.json" "$(image_in_file "$d/applied.platform.json")")"
+  else
+    mode=image; cur="$(current_image "$d")"
+  fi
+  tac "$d/history.log" 2>/dev/null | while IFS='|' read -r ts image stamp; do
+    if [ "$mode" = config ]; then
+      if [ -n "$stamp" ] && [ -f "$d/history/$stamp.app.json" ]; then
+        efp="$(fingerprint "$d/history/$stamp.app.json" "$image")"
+      else
+        efp="legacy:$image"
+      fi
+      [ "$efp" != "$cur" ] || continue
+    else
+      [ "$image" != "$cur" ] || continue
+    fi
+    printf '%s|%s\n' "$image" "$stamp"
+    break
+  done
+}
+
+# 롤백 대상 이미지(previous_entry의 앞부분)
+previous_image() { previous_entry "$1" | cut -d'|' -f1; }
 
 # 그 이미지가 마지막으로 정상이었던 때의 스냅샷 이름(없으면 빈 값: 스냅샷 도입 전 이력)
 snapshot_of_image() {
@@ -527,8 +565,15 @@ ensure_db_isolation() {
 # 최근 1시간 동안 목록에 남아 있어서, 업데이트를 몇 번 하면 정상 배포도 "반복 종료"로 오판한다
 count_stopped_tasks() {  # count_stopped_tasks <리전> <클러스터> <배포 ID>
   [ -n "${3:-}" ] && [ "$3" != "None" ] || { echo 0; return 0; }
-  aws ecs list-tasks --region "$1" --cluster "$2" --started-by "$3" --desired-status STOPPED \
-    --query 'length(taskArns)' --output text 2>/dev/null || echo 0
+  local out
+  # 조회가 실패하면 0으로 대신하되 조용히 넘어가지 않는다. 이 집계가 항상 0이면 "반복 종료" 판정이 영영 동작하지 않기 때문이다
+  if ! out="$(aws ecs list-tasks --region "$1" --cluster "$2" --started-by "$3" --desired-status STOPPED \
+      --query 'length(taskArns)' --output text 2>&1)"; then
+    log "경고: 정지된 태스크를 조회하지 못했습니다(이번 배포의 반복 종료 판정이 동작하지 않습니다): $(printf '%s' "$out" | head -c 160)"
+    echo 0
+    return 0
+  fi
+  echo "$out"
 }
 
 # plan 저장 → 승인 → 저장된 plan 그대로 apply → 헬스체크 대기
@@ -566,6 +611,7 @@ apply_saved() {
     record_attempt "$d" fail "$image" "terraform apply 실패"
     return 1
   fi
+  save_applied "$d"
   tf "$d" output -json > "$d/outputs.json"
   # 한 번 적용한 계획은 다시 쓸 수 없다. 남겨 두면 오해를 부르니 지운다
   rm -f "$d/tfplan"
@@ -713,11 +759,15 @@ cmd_rollback() {
       *) die "알 수 없는 옵션: $1" ;;
     esac
   done
-  local d stamp; d="$(existing_dir "$id")"
-  [ -n "$to" ] || to="$(previous_image "$d")"
-  [ -n "$to" ] || die "되돌릴 이전 정상 이미지가 이력에 없습니다 ($d/history.log)"
+  local d stamp entry; d="$(existing_dir "$id")"
+  if [ -n "$to" ]; then
+    stamp="$(snapshot_of_image "$d" "$to")"
+  else
+    entry="$(previous_entry "$d")"
+    [ -n "$entry" ] || die "되돌릴 이전 정상 배포가 이력에 없습니다 ($d/history.log)"
+    to="${entry%%|*}"; stamp="${entry#*|}"
+  fi
   log "롤백 대상 이미지: $to"
-  stamp="$(snapshot_of_image "$d" "$to")"
   if [ -n "$stamp" ]; then
     # 이미지만 되돌리면, 그 사이 update --app으로 포트·헬스체크 경로·크기·환경 변수를 바꿨을 때 옛 이미지에 새 설정이 붙어 또 실패한다
     restore_snapshot "$d" "$stamp"
