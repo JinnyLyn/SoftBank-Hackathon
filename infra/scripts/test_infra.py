@@ -218,6 +218,12 @@ def part_a(d):
 def part_b(d):
     print("\n=== B. 배포 모듈 계획 내용 ===")
 
+    # 예시 파일이 낡으면(없어진 필드, 빠진 필수 필드) 복사해서 쓰는 사람이 plan 단계에서 막힌다
+    shutil.copy(d / "platform.auto.tfvars.json.example", d / "platform.auto.tfvars.json")
+    shutil.copy(d / "app.auto.tfvars.json.example", d / "app.auto.tfvars.json")
+    code, out = tf(d, "plan", "-input=false", "-refresh=false", "-lock=false", "-no-color")
+    expect("B 예시 입력 파일(.example)이 현재 계약으로 plan을 통과한다", "통과", code, out)
+
     def planned_with(pm=None, am=None):
         p, a = copy.deepcopy(BASE_P), copy.deepcopy(BASE_A)
         if pm:
@@ -459,6 +465,97 @@ def part_d():
         code = (f"aws() {{ printf '%s' '{text}'; }}; nat_check_one i-123 sa-east-1")
         rc, out, err = sh(code)
         say("ok" if out.strip() == want else "fail", f"D NAT 부팅 로그 판정 → {want}", out.strip()[:60])
+
+
+    # ---- 롤백·이력·DB 전환·정지 태스크 집계 시나리오 (Codex 리뷰 지적 1~5) ----
+    def P(path):
+        """bash 안에서 쓸 POSIX 경로 표현. 실제 실행과 같은 /c/... 형태로 시험한다"""
+        return f'"$(cygpath -u "{Path(path).as_posix()}" 2>/dev/null || echo "{Path(path).as_posix()}")"'
+
+    hist = WORK / "hist"
+    hist.mkdir(parents=True, exist_ok=True)
+
+    def prev(history_lines, current_image):
+        code = (f'd={P(hist)}; printf "%s\\n" {" ".join(repr(x) for x in history_lines)} > "$d/history.log"; '
+                f'tf() {{ echo "{current_image}"; }}; previous_image "$d"')
+        rc, out, err = sh(code)
+        return out.strip()
+
+    h1 = ["2026-01-01T00:00:00Z|IMG:r1|s1", "2026-01-02T00:00:00Z|IMG:r2|s2"]
+    say("ok" if prev(h1, "IMG:r2") == "IMG:r1" else "fail", "D 롤백 대상: 정상 업데이트(r1→r2) 뒤에는 r1")
+    got = prev(["2026-01-01T00:00:00Z|IMG:r1|s1"], "IMG:r2")
+    say("ok" if got == "IMG:r1" else "fail", "D 롤백 대상: 업데이트가 실패해 이력에 없는 r2가 배포된 상태에서도 마지막 정상 r1(옛 코드는 r1을 제외)", got)
+    got = prev(["2026-01-01T00:00:00Z|IMG:r0|s0", "2026-01-02T00:00:00Z|IMG:r1|s1"], "IMG:r2")
+    say("ok" if got == "IMG:r1" else "fail", "D 롤백 대상: 이력이 더 길어도 r1(더 옛날 r0로 건너뛰지 않음)", got)
+    got = prev(h1 + ["2026-01-03T00:00:00Z|IMG:r1|s3"], "IMG:r1")
+    say("ok" if got == "IMG:r2" else "fail", "D 롤백 대상: 롤백한 뒤(r1→r2→r1)에는 그 직전의 r2", got)
+
+    # 스냅샷: 정상일 때의 앱 설정과 이미지가 롤백에서 함께 복원되는지
+    sdir = WORK / "snap"
+    sdir.mkdir(parents=True, exist_ok=True)
+    app0 = {"app": {"container_port": 8000, "health_check_path": "/health", "task_size": "xsmall", "min_tasks": 1, "max_tasks": 1,
+                    "use_database": True, "environment": {"COOKIE_SECURE": "true"}}}
+    plat0 = {"platform": {"region": "sa-east-1", "deploy_id": "abcd1234", "image": "IMG:good", "cpu_architecture": "X86_64",
+                          "listener_port": 8001, "health_check_grace_seconds": 90, "foundation": {"alb_dns_name": "OLD"}}}
+    (sdir / "app.auto.tfvars.json").write_text(json.dumps(app0), encoding="utf-8")
+    (sdir / "platform.auto.tfvars.json").write_text(json.dumps(plat0), encoding="utf-8")
+    rc, out, err = sh(f'd={P(sdir)}; snapshot_healthy "$d"')
+    stamp = out.strip()
+    app1 = copy.deepcopy(app0); app1["app"].update(container_port=9999, health_check_path="/nope", task_size="medium", environment={"X": "1"})
+    plat1 = copy.deepcopy(plat0); plat1["platform"].update(image="IMG:bad", cpu_architecture="ARM64", health_check_grace_seconds=5)
+    plat1["platform"]["foundation"] = {"alb_dns_name": "NEW"}
+    (sdir / "app.auto.tfvars.json").write_text(json.dumps(app1), encoding="utf-8")
+    (sdir / "platform.auto.tfvars.json").write_text(json.dumps(plat1), encoding="utf-8")
+    rc, out, err = sh(f'd={P(sdir)}; restore_snapshot "$d" "{stamp}"')
+    app2 = json.loads((sdir / "app.auto.tfvars.json").read_text(encoding="utf-8"))
+    plat2 = json.loads((sdir / "platform.auto.tfvars.json").read_text(encoding="utf-8"))
+    say("ok" if app2 == app0 else "fail", "D 롤백 스냅샷: 앱 설정 전체(포트, 헬스체크 경로, 크기, 환경 변수)가 정상이던 때로 복원", str(app2)[:100])
+    ok = (plat2["platform"]["image"] == "IMG:good" and plat2["platform"]["cpu_architecture"] == "X86_64"
+          and plat2["platform"]["health_check_grace_seconds"] == 90)
+    say("ok" if ok else "fail", "D 롤백 스냅샷: 이미지·아키텍처·유예 시간도 복원")
+    say("ok" if plat2["platform"]["foundation"] == {"alb_dns_name": "NEW"} else "fail", "D 롤백 스냅샷: foundation 값은 지금 것을 유지(낡은 값으로 되돌리지 않음)")
+    rc, out, err = sh(f'd={P(sdir)}; printf "%s|%s|%s\\n" t IMG:good "{stamp}" > "$d/history.log"; snapshot_of_image "$d" IMG:good; snapshot_of_image "$d" IMG:none')
+    say("ok" if out.strip() == stamp else "fail", "D 이미지로 스냅샷을 찾는다(없는 이미지는 빈 값 = 옛 이력은 이미지만 복원하고 경고)", out.strip()[:60])
+
+    # 이번 배포가 시작한 태스크만 센다
+    alog = WORK / "aws-args.log"
+    mock_aws = ('aws() { echo "$@" >> ' + P(alog) + '; case "$*" in *"--started-by ecs-svc/CUR"*) echo 1;; '
+                '*"--service-name"*) echo 5;; *) echo 9;; esac; }')
+    rc, out, err = sh(f'{mock_aws}; count_stopped_tasks sa-east-1 paved-clouds ecs-svc/CUR; count_stopped_tasks sa-east-1 paved-clouds ""; count_stopped_tasks sa-east-1 paved-clouds None')
+    args = alog.read_text(encoding="utf-8") if alog.exists() else ""
+    ok = out.split() == ["1", "0", "0"] and "--started-by ecs-svc/CUR" in args and "--service-name" not in args
+    say("ok" if ok else "fail", "D 정지 태스크는 이번 배포(--started-by)만 센다. 서비스 전체를 세지 않는다. 배포 ID가 없으면 0", f"{out.split()} {args[:80]}")
+
+    # 업데이트로 DB를 켜면 앱 전용 DB로 전환 (공유 관리자 URL로 조용히 대체되지 않게)
+    def db_case(markers, app_use_db):
+        ddir = WORK / ("dbsw_" + "_".join(markers or ["none"]) + str(app_use_db))
+        ddir.mkdir(parents=True, exist_ok=True)
+        (ddir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "database_url_parameter_arn": "", "foundation": {}}}), encoding="utf-8")
+        appf = ddir / "newapp.json"
+        appf.write_text(json.dumps({"container_port": 8000, "use_database": app_use_db}), encoding="utf-8")
+        for m in markers:
+            (ddir / m).write_text("x", encoding="utf-8")
+        rc, out, err = sh(f'export_foundation() {{ :; }}; ensure_db_isolation {P(ddir)} abcd1234 {P(appf)}')
+        param = json.loads((ddir / "platform.auto.tfvars.json").read_text(encoding="utf-8"))["platform"]["database_url_parameter_arn"]
+        return (ddir / "db-isolated").exists(), param, err
+
+    iso, param, err = db_case([], True)
+    ok = iso and param.endswith("parameter/paved-clouds/apps/abcd1234/database-url")
+    say("ok" if ok else "fail", "D DB 없이 만든 배포를 update로 DB 사용으로 바꾸면 앱 전용 DB(app_abcd1234)로 전환", f"{iso} {param} {err[:60]}")
+    iso, param, err = db_case(["db-shared"], True)
+    say("ok" if (not iso and param == "") else "fail", "D 처음부터 --shared-db로 만든 배포는 그 선택을 유지(몰래 전환하지 않음)")
+    iso, param, err = db_case([], False)
+    say("ok" if (not iso and param == "") else "fail", "D DB를 쓰지 않으면 아무것도 바꾸지 않는다")
+    iso, param, err = db_case(["db-isolated"], True)
+    say("ok" if (iso and param == "") else "fail", "D 이미 앱 전용 DB면 그대로(파라미터를 다시 쓰지 않음)")
+
+    # 시도 기록: 실패도 사유와 함께 남는다
+    adir = WORK / "attempts"
+    adir.mkdir(parents=True, exist_ok=True)
+    rc, out, err = sh(f'd={P(adir)}; record_attempt "$d" ok IMG:r1 ""; record_attempt "$d" fail IMG:r2 "시간 초과 | 줄바꿈\nx"')
+    lines = (adir / "attempts.log").read_text(encoding="utf-8").splitlines() if (adir / "attempts.log").exists() else []
+    ok = len(lines) == 2 and lines[0].split("|")[1:3] == ["ok", "IMG:r1"] and lines[1].split("|")[1:3] == ["fail", "IMG:r2"] and lines[1].count("|") == 3
+    say("ok" if ok else "fail", "D 시도 기록: 성공과 실패(사유 포함)가 한 줄씩 남고 사유의 | 와 줄바꿈이 줄 형식을 깨지 않는다", str(lines)[:120])
 
 
 def part_e():

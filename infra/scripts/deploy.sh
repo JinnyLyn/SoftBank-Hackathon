@@ -27,7 +27,8 @@
 # 설계 규칙 (AGENTS.md 6장)
 #   - apply는 항상 승인된 저장 plan(tfplan)만 실행한다. 승인 후 새 plan을 만들지 않는다.
 #   - 롤백은 사람이 명령으로 실행한다. 자동 복구는 범위가 확정되기 전이라 만들지 않았다.
-#   - 이력(history.log)에는 헬스체크를 통과한 이미지만 남긴다.
+#   - 이력(history.log)에는 헬스체크를 통과한 배포만 남기고(롤백 대상), 모든 시도는 attempts.log에 성공·실패를 남긴다.
+#   - 롤백은 이미지와 그때의 앱 설정을 함께 되돌린다(스냅샷).
 #   - 이미지를 되돌려도 DB 스키마와 데이터는 되돌아가지 않는다.
 #   - 앱 전용 DB는 destroy로 지우지 않는다(데이터 보존). 지우려면 --drop-db 또는 drop-db를 명시한다.
 
@@ -428,18 +429,106 @@ db_drop() {
   log "앱 전용 DB와 접속 정보를 지웠습니다"
 }
 
-# --- 이력: 헬스체크를 통과한 이미지만 기록한다 -------------------------------------------
-record_healthy() {
-  local d="$1" image; image="$(tf "$d" output -raw image)"
-  printf '%s|%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$image" >> "$d/history.log"
+# --- 이력과 시도 기록 ----------------------------------------------------------------------------
+# history.log   헬스체크를 통과한 배포만. 한 줄 = 시각|이미지|스냅샷 이름. 롤백이 여기서 대상을 고른다.
+#               스냅샷(history/<이름>.app.json, .platform.json)에는 그때의 앱 설정과 이미지·아키텍처·유예 시간이 들어 있어서
+#               롤백이 이미지만이 아니라 설정도 함께 되돌린다 (AGENTS.md 6장: 정상 동작이 확인된 이미지와 배포 설정을 기록한다)
+# attempts.log  성공·실패를 가리지 않는 모든 시도. 한 줄 = 시각|결과(ok/fail)|이미지|사유.
+#               실패한 배포도 기록해서 status, diagnose, 감사에 쓴다 (AGENTS.md 5장 10단계)
+record_attempt() {  # record_attempt <디렉터리> <ok|fail> <이미지> [사유]
+  local d="$1" result="$2" image="$3" reason="${4:-}"
+  reason="${reason//|/ }"; reason="${reason//$'\n'/ }"
+  printf '%s|%s|%s|%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$result" "$image" "$reason" >> "$d/attempts.log"
 }
 
-current_image() { tail -n 1 "$1/history.log" 2>/dev/null | cut -d'|' -f2; }
+# 지금 정상으로 확인된 입력을 보관하고 스냅샷 이름을 출력한다
+snapshot_healthy() {
+  local d="$1" stamp; stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p "$d/history"
+  cp "$d/app.auto.tfvars.json" "$d/history/$stamp.app.json"
+  cp "$d/platform.auto.tfvars.json" "$d/history/$stamp.platform.json"
+  echo "$stamp"
+}
 
-# 현재와 다른 가장 최근의 정상 이미지
+record_healthy() {
+  local d="$1" image stamp; image="$(tf "$d" output -raw image)"
+  stamp="$(snapshot_healthy "$d")"
+  printf '%s|%s|%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$image" "$stamp" >> "$d/history.log"
+}
+
+# 지금 실제로 배포돼 있는 이미지(Terraform 상태 기준). 실패한 업데이트는 이력에 없지만 상태에는 있다.
+# 이력의 마지막 줄로 정하면 실패한 업데이트 뒤에 마지막 정상 이미지를 "현재"로 착각해 롤백 대상에서 빼 버린다
+current_image() { tf "$1" output -raw image 2>/dev/null; }
+
+# 현재 배포된 것과 다른 가장 최근의 정상 이미지. 실패한 업데이트 뒤에는 마지막 정상 이미지가 된다
 previous_image() {
   local d="$1" cur; cur="$(current_image "$d")"
   cut -d'|' -f2 "$d/history.log" 2>/dev/null | tac | awk -v cur="$cur" '$0 != cur { print; exit }'
+}
+
+# 그 이미지가 마지막으로 정상이었던 때의 스냅샷 이름(없으면 빈 값: 스냅샷 도입 전 이력)
+snapshot_of_image() {
+  local d="$1" image="$2"
+  awk -F'|' -v img="$image" '$2 == img && $3 != "" { s = $3 } END { print s }' "$d/history.log" 2>/dev/null
+}
+
+# 스냅샷의 설정으로 되돌린다: 앱 설정 전체와 이미지·아키텍처·유예 시간.
+# foundation 값은 지금 것을 유지한다(스냅샷 시점의 값은 낡았을 수 있다)
+restore_snapshot() {
+  local d="$1" stamp="$2" PY; PY="$(pick_python)"
+  [ -f "$d/history/$stamp.app.json" ] && [ -f "$d/history/$stamp.platform.json" ] || die "스냅샷이 없습니다: $stamp"
+  cp "$d/history/$stamp.app.json" "$d/app.auto.tfvars.json"
+  "$PY" - "$d/platform.auto.tfvars.json" "$d/history/$stamp.platform.json" <<'PYEOF'
+import json, sys
+cur_p, snap_p = sys.argv[1], sys.argv[2]
+cur = json.load(open(cur_p, encoding="utf-8"))
+snap = json.load(open(snap_p, encoding="utf-8"))
+for k in ("image", "cpu_architecture", "health_check_grace_seconds"):
+    if k in snap["platform"]:
+        cur["platform"][k] = snap["platform"][k]
+json.dump(cur, open(cur_p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PYEOF
+}
+
+# 이번에 시도하는 이미지(입력 파일 기준)
+input_image() { grep -o '"image": *"[^"]*"' "$1/platform.auto.tfvars.json" | head -1 | sed -E 's/.*: *"//; s/"$//'; }
+
+# 입력 파일(platform.auto.tfvars.json)의 최상위 platform 필드 하나를 바꾼다
+set_platform_field() {  # set_platform_field <디렉터리> <키> <값>
+  "$(pick_python)" - "$1/platform.auto.tfvars.json" "$2" "$3" <<'PYEOF'
+import json, sys
+p, k, v = sys.argv[1:4]
+d = json.load(open(p, encoding="utf-8"))
+d["platform"][k] = v
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PYEOF
+}
+
+# app 설정 파일이 DB를 쓰는지(true/false)
+app_uses_db() {
+  "$(pick_python)" -c "import json,sys;print(str(bool(json.load(open(sys.argv[1],encoding='utf-8')).get('use_database'))).lower())" "$1"
+}
+
+# 업데이트로 앱이 DB를 쓰기 시작하면 앱 전용 DB를 쓰도록 전환한다. 이걸 안 하면 모듈이 foundation의 공유 URL(DB 관리자 계정)로
+# 대체해서, 앱 전용 DB가 기본이라는 약속과 달리 조용히 모든 DB에 대한 관리자 권한이 붙는다.
+# 처음부터 --shared-db로 만든 배포(db-shared)는 그 선택을 존중한다. DB는 승인 후 apply 때 만든다
+ensure_db_isolation() {
+  local d="$1" id="$2" app="$3"
+  [ "$(app_uses_db "$app")" = "true" ] || return 0
+  [ ! -f "$d/db-isolated" ] || return 0
+  [ ! -f "$d/db-shared" ] || return 0
+  export_foundation
+  printf '%s\n' "$(db_name_of "$id")" > "$d/db-isolated"
+  set_platform_field "$d" database_url_parameter_arn "$(db_param_arn "$id")"
+  log "앱이 DB를 쓰기 시작해서 앱 전용 DB($(db_name_of "$id"))를 쓰도록 전환합니다(접속 정보는 승인 후 apply 때 만듭니다)"
+}
+
+# 이번 배포(PRIMARY)가 시작한 태스크 중 멈춘 것만 센다. 서비스 전체를 세면 이전 업데이트에서 교체된 태스크가
+# 최근 1시간 동안 목록에 남아 있어서, 업데이트를 몇 번 하면 정상 배포도 "반복 종료"로 오판한다
+count_stopped_tasks() {  # count_stopped_tasks <리전> <클러스터> <배포 ID>
+  [ -n "${3:-}" ] && [ "$3" != "None" ] || { echo 0; return 0; }
+  aws ecs list-tasks --region "$1" --cluster "$2" --started-by "$3" --desired-status STOPPED \
+    --query 'length(taskArns)' --output text 2>/dev/null || echo 0
 }
 
 # plan 저장 → 승인 → 저장된 plan 그대로 apply → 헬스체크 대기
@@ -458,23 +547,37 @@ plan_confirm_apply() {
   apply_saved "$d" "$id"
 }
 
-# 저장된 plan(tfplan)만 적용한다. 새 plan을 만들지 않는다
+# 저장된 plan(tfplan)만 적용한다. 새 plan을 만들지 않는다.
+# 성공이든 실패든 시도를 attempts.log에 남긴다. 정상 확인된 것만 history.log와 스냅샷에 남긴다
 apply_saved() {
-  local d="$1" id="$2"
+  local d="$1" id="$2" image
   [ -f "$d/tfplan" ] || die "저장된 계획이 없습니다. 먼저 --plan-only 로 계획을 만드세요"
+  image="$(input_image "$d")"
   # 앱 전용 DB는 승인된 뒤에만 만든다 (계획 단계에서는 접속 정보 ARN만 쓰고 아무것도 만들지 않는다)
   if [ -f "$d/db-isolated" ] && [ ! -f "$d/db-provisioned" ]; then
     export_foundation
-    db_provision "$id"
+    if ! ( db_provision "$id" ); then
+      record_attempt "$d" fail "$image" "앱 전용 DB 준비 실패"
+      return 1
+    fi
   fi
   log "apply (저장된 계획)"
-  tf "$d" apply -input=false -no-color tfplan | tail -n 15
+  if ! tf "$d" apply -input=false -no-color tfplan | tail -n 15; then
+    record_attempt "$d" fail "$image" "terraform apply 실패"
+    return 1
+  fi
   tf "$d" output -json > "$d/outputs.json"
   # 한 번 적용한 계획은 다시 쓸 수 없다. 남겨 두면 오해를 부르니 지운다
   rm -f "$d/tfplan"
 
-  wait_healthy "$id" || { log "헬스체크 실패. 원인: deploy.sh diagnose $id"; return 1; }
-  record_healthy "$d"
+  if wait_healthy "$id"; then
+    record_attempt "$d" ok "$image" ""
+    record_healthy "$d"
+  else
+    record_attempt "$d" fail "$image" "${WAIT_REASON:-헬스체크 실패}"
+    log "헬스체크 실패. 원인: deploy.sh diagnose $id"
+    return 1
+  fi
 }
 
 cmd_apply() {
@@ -540,6 +643,8 @@ cmd_up() {
   mkdir -p "$d"
   tar -C "$TEMPLATE" --exclude=.terraform -cf - . | tar -C "$d" -xf -
   [ -z "$param_arn" ] || printf '%s\n' "$(db_name_of "$id")" > "$d/db-isolated"
+  # --shared-db를 고른 배포는 나중에 update로 앱 전용 DB로 몰래 바뀌지 않게 기억해 둔다
+  if [ "$use_db" = "true" ] && [ "$shared_db" = "1" ]; then printf 'shared\n' > "$d/db-shared"; fi
 
   cat > "$d/platform.auto.tfvars.json" <<EOF
 {"platform": {
@@ -575,6 +680,7 @@ redeploy() {
   if [ -n "$app" ]; then
     [ -f "$app" ] || die "app 파일이 없습니다: $app"
     printf '{"app": %s}\n' "$(cat "$app")" > "$d/app.auto.tfvars.json"
+    ensure_db_isolation "$d" "$id" "$app"
   fi
   export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
   plan_confirm_apply "$d" "$id"
@@ -607,20 +713,32 @@ cmd_rollback() {
       *) die "알 수 없는 옵션: $1" ;;
     esac
   done
-  local d; d="$(existing_dir "$id")"
+  local d stamp; d="$(existing_dir "$id")"
   [ -n "$to" ] || to="$(previous_image "$d")"
   [ -n "$to" ] || die "되돌릴 이전 정상 이미지가 이력에 없습니다 ($d/history.log)"
   log "롤백 대상 이미지: $to"
-  log "주의: 이미지만 되돌립니다. DB 스키마와 데이터는 되돌아가지 않습니다"
-  redeploy "$id" "$to" ""
+  stamp="$(snapshot_of_image "$d" "$to")"
+  if [ -n "$stamp" ]; then
+    # 이미지만 되돌리면, 그 사이 update --app으로 포트·헬스체크 경로·크기·환경 변수를 바꿨을 때 옛 이미지에 새 설정이 붙어 또 실패한다
+    restore_snapshot "$d" "$stamp"
+    log "그 이미지가 정상이던 때의 앱 설정도 함께 되돌립니다(스냅샷 $stamp)"
+    log "주의: DB 스키마와 데이터는 되돌아가지 않습니다"
+    redeploy "$id" "" ""
+  else
+    log "경고: 이 이미지에는 정상이던 때의 설정 스냅샷이 없어 이미지만 되돌립니다(스냅샷 도입 전 이력). 지금 앱 설정이 그대로 쓰입니다"
+    log "주의: DB 스키마와 데이터는 되돌아가지 않습니다"
+    redeploy "$id" "$to" ""
+  fi
 }
 
 # 대상 그룹의 태스크가 healthy가 될 때까지 기다린다 (Terraform은 기다리지 않는다)
 #   - ECS 배포가 COMPLETED이고 대상이 healthy일 때만 통과한다. 대상만 보면 롤링 교체 중 옛 태스크 때문에 일찍 통과한다
 #   - 앱이 응답은 하는데 헬스체크 코드가 계속 틀리면(예: 경로 오류 404) 기다려도 소용없으니 실패로 확정한다(실측 apply 후 약 3분)
-#   - 태스크가 반복해서 죽거나 시간이 지나도 실패로 끝낸다. ECS 서킷 브레이커가 배포를 FAILED로 만드는 데는 더 걸린다
+#   - 이번 배포의 태스크가 반복해서 죽거나 시간이 지나도 실패로 끝낸다. ECS 서킷 브레이커가 배포를 FAILED로 만드는 데는 더 걸린다
+# 실패하면 WAIT_REASON에 사유를 남긴다(attempts.log에 기록된다)
 wait_healthy() {
-  local id="$1" d tg cluster svc start state stopped rollout reasons mismatch=0 rgn
+  local id="$1" d tg cluster svc start state stopped rollout depid reasons mismatch=0 rgn
+  WAIT_REASON=""
   d="$(deploy_dir "$id")"; rgn="$(region)"
   tg="$(tf "$d" output -raw target_group_arn)"
   cluster="$(tf "$d" output -raw cluster_name)"
@@ -635,8 +753,11 @@ wait_healthy() {
       --query 'TargetHealthDescriptions[].TargetHealth.Description' --output text 2>/dev/null || true)"
     rollout="$(aws ecs describe-services --region "$rgn" --cluster "$cluster" --services "$svc" \
       --query 'services[0].deployments[?status==`PRIMARY`]|[0].rolloutState' --output text 2>/dev/null || true)"
+    depid="$(aws ecs describe-services --region "$rgn" --cluster "$cluster" --services "$svc" \
+      --query 'services[0].deployments[?status==`PRIMARY`]|[0].id' --output text 2>/dev/null || true)"
     log "대상=${state:-등록 대기} 배포=${rollout:-?}"
     if [ "$rollout" = "FAILED" ]; then
+      WAIT_REASON="ECS 서킷 브레이커가 배포를 FAILED로 만들었습니다(태스크가 3번 실패)"
       log "ECS 배포가 실패했습니다 (서킷 브레이커)"
       return 1
     fi
@@ -654,18 +775,20 @@ wait_healthy() {
       mismatch=0
     fi
     if [ "$mismatch" -ge 4 ]; then
+      WAIT_REASON="헬스체크가 4xx를 ${mismatch}회 연속 돌려줍니다. health_check_path를 확인하세요 ($(printf '%s' "$reasons" | head -c 120))"
       log "앱이 응답하지만 헬스체크가 4xx 코드를 돌려줍니다(${mismatch}회 연속). health_check_path가 틀렸을 가능성이 큽니다"
       log "ECS 서킷 브레이커가 배포를 FAILED로 확정하기까지는 더 걸리고, 그동안 태스크 교체를 반복합니다"
       return 1
     fi
-    # 태스크가 계속 뜨자마자 죽으면 시간 초과를 기다리지 않고 바로 실패로 본다
-    stopped="$(aws ecs list-tasks --region "$rgn" --cluster "$cluster" --service-name "$svc" \
-      --desired-status STOPPED --query 'length(taskArns)' --output text 2>/dev/null || echo 0)"
+    # 이번 배포의 태스크가 계속 뜨자마자 죽으면 시간 초과를 기다리지 않고 바로 실패로 본다
+    stopped="$(count_stopped_tasks "$rgn" "$cluster" "$depid")"
     if [ "${stopped:-0}" -ge 3 ]; then
-      log "태스크가 반복해서 종료되었습니다(최근 ${stopped}개)"
+      WAIT_REASON="이번 배포의 태스크가 반복해서 종료되었습니다(${stopped}개)"
+      log "태스크가 반복해서 종료되었습니다(이번 배포에서 ${stopped}개)"
       return 1
     fi
     if [ $(( $(date +%s) - start )) -ge "$HEALTH_TIMEOUT" ]; then
+      WAIT_REASON="시간 초과(${HEALTH_TIMEOUT}초)"
       log "시간 초과"
       return 1
     fi
@@ -683,6 +806,10 @@ cmd_status() {
   echo "URL: $(tf "$d" output -raw url)"
   echo "현재 이미지: $(tf "$d" output -raw image)"
   echo "정상 이력: $(wc -l < "$d/history.log" 2>/dev/null || echo 0)건"
+  if [ -f "$d/attempts.log" ]; then
+    echo "최근 시도(시각|결과|이미지|사유):"
+    tail -n 5 "$d/attempts.log" | sed -E 's#\|[^|]*/#|#; s/^/  /'
+  fi
   if [ -f "$d/db-isolated" ]; then echo "DB: 앱 전용 $(cat "$d/db-isolated")"; else echo "DB: 공유 또는 미사용"; fi
   aws ecs describe-services --region "$(region)" --cluster "$cluster" --services "$svc" \
     --query 'services[0].{상태:status,원하는:desiredCount,실행중:runningCount,대기:pendingCount}' --output table
@@ -731,7 +858,7 @@ cmd_diagnose() {
 
   awsn logs tail "$lg" --region "$rgn" --since 30m --format short 2>/dev/null | tail -n 60 | mask > "$tmp/logs.txt" || true
 
-  ID="$id" IMAGE="$(tf "$d" output -raw image)" URL="$(tf "$d" output -raw url)" DIR="$tmp" HIST="$(tail -n 3 "$d/history.log" 2>/dev/null || true)" \
+  ID="$id" IMAGE="$(tf "$d" output -raw image)" URL="$(tf "$d" output -raw url)" DIR="$tmp" HIST="$(tail -n 3 "$d/history.log" 2>/dev/null || true)" ATT="$(tail -n 5 "$d/attempts.log" 2>/dev/null || true)" \
   "$PY" - <<'PYEOF'
 import json, os, re, sys
 d = os.environ["DIR"]
@@ -748,6 +875,7 @@ out = {
     "image": os.environ["IMAGE"],
     "url": os.environ["URL"],
     "lastHealthyImages": [l.split("|")[1] for l in os.environ["HIST"].splitlines() if "|" in l],
+    "recentAttempts": [dict(zip(("time", "result", "image", "reason"), l.split("|", 3))) for l in os.environ.get("ATT", "").splitlines() if "|" in l],
     "service": load("service.json"),
     "stoppedTasks": load("stopped.json"),
     "targets": load("targets.json"),
