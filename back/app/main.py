@@ -61,7 +61,7 @@ _SECRET_KEY = re.compile(
     r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)"
 )
 _SECRET_VALUE = re.compile(
-    r"(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key)\b(\s*[:=]\s*)([^\s,;]+)"
+    r"(?i)\b((?:[A-Z0-9]+[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-][A-Z0-9]+)*)(\s*[:=]\s*)([^\s,;]+)"
 )
 _CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
