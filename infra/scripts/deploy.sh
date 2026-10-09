@@ -453,6 +453,21 @@ random_password() {
   "$(pick_python)" -c "import secrets,string;print(''.join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))"
 }
 
+# 비밀 값을 SSM SecureString으로 저장한다. 값을 명령줄 인자로 넘기면 실행 중 프로세스 목록에 보이므로 임시 파일(file://)로 넘긴다.
+# 임시 파일은 서브셸의 EXIT·신호 trap으로 지운다. 저장 도중 Ctrl-C를 누르거나 프로세스가 종료돼도 비밀번호가 든 파일이 남지 않는다
+# (부모 셸의 trap과 섞이지 않게 서브셸 안에서 처리한다)
+put_secret_param() {  # put_secret_param <리전> <이름> <설명> <값>
+  (
+    local tmp; tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp:?}"' EXIT
+    trap 'exit 130' INT TERM HUP
+    umask 077
+    printf '%s' "$4" > "$tmp/value"
+    awsn ssm put-parameter --region "$1" --name "$2" --type SecureString --overwrite \
+      --description "$3" --value "file://$(file_uri_path "$tmp/value")" >/dev/null
+  )
+}
+
 # 앱 전용 DB·계정을 만들고 접속 정보를 SSM에 저장한다. apply 직전(승인 후)에만 실행한다
 db_provision() {
   local id="$1" d name pw host port url rgn
@@ -460,15 +475,8 @@ db_provision() {
   host="$(fjson db_host)"; port="$(fjson db_port)"; pw="$(random_password)"
   url="mysql://${name}:${pw}@${host}:${port}/${name}"
   log "앱 전용 DB 준비: $name"
-  # 비밀번호가 든 URL을 명령줄 인자로 넘기면 실행 중 프로세스 목록에 보인다. 임시 파일(file://)로 넘기고 바로 지운다
-  local tmp vf; tmp="$(mktemp -d)"; vf="$tmp/value"
-  ( umask 077; printf '%s' "$url" > "$vf" )
-  if ! awsn ssm put-parameter --region "$rgn" --name "$(db_param_name "$id")" --type SecureString --overwrite \
-      --description "Per-app DATABASE_URL for deployment $id" --value "file://$(file_uri_path "$vf")" >/dev/null; then
-    rm -rf "${tmp:?}"
-    die "접속 정보를 SSM에 저장하지 못했습니다"
-  fi
-  rm -rf "${tmp:?}"
+  put_secret_param "$rgn" "$(db_param_name "$id")" "Per-app DATABASE_URL for deployment $id" "$url" \
+    || die "접속 정보를 SSM에 저장하지 못했습니다"
   awsn ssm add-tags-to-resource --region "$rgn" --resource-type Parameter --resource-id "$(db_param_name "$id")" \
     --tags Key=Project,Value=paved-clouds Key=DeployId,Value="$id" Key=ManagedBy,Value=paved-clouds-platform >/dev/null 2>&1 || true
   unset pw url

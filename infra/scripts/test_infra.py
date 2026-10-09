@@ -783,6 +783,21 @@ def part_d():
     wait_case("이번 배포의 정지 태스크가 2개면 계속 기다린다", "initial", "None", "IN_PROGRESS", 1, "시간 초과", stopped="2")
 
 
+    # 비밀번호가 든 임시 파일: 정상·실패·강제 종료(Ctrl-C와 같은 신호) 어느 경우에도 남지 않는다. 값은 명령줄 인자에 없다
+    for label, body, want_rc_zero in [("정상 종료", "return 0", True), ("aws 실패", "return 1", False),
+                                      ("종료 신호(SIGTERM)", "kill -TERM $BASHPID; sleep 5", False)]:
+        slog = WORK / "secret-args.log"
+        slog.unlink(missing_ok=True)
+        code = ('awsn() { echo "$@" >> %s; for a in "$@"; do case "$a" in file://*) echo "${a#file://}" > %s.path;; esac; done; %s; }; '
+                'put_secret_param sa-east-1 /x/y desc "mysql://u:TopSecretPw9@h:3306/d"' % (P(slog), P(slog), body))
+        rc, out, err = sh(code)
+        pf = Path(slog.as_posix() + ".path")
+        tmpfile = Path(pf.read_text(encoding="utf-8").strip()) if pf.exists() else None
+        args = slog.read_text(encoding="utf-8") if slog.exists() else ""
+        ok = (rc == 0) == want_rc_zero and tmpfile is not None and not tmpfile.exists() and "TopSecretPw9" not in args and "file://" in args
+        say("ok" if ok else "fail", f"D 비밀 임시 파일은 {label}에도 남지 않고 값이 명령줄에 없다", f"rc={rc} 파일남음={tmpfile.exists() if tmpfile else '?'}")
+
+
 def part_e():
     print("\n=== E. 정적 검사 ===")
     code, out = tf(INFRA, "fmt", "-check", "-recursive")
