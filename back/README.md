@@ -21,7 +21,7 @@ docker compose run --rm api python -m app.cli migrate
 docker compose up -d --build api
 ```
 
-API 문서는 `http://127.0.0.1:8000/docs`, 생존 확인은 `/health`, DB 연결 준비 확인은 `/ready`입니다. AWS/RDS 배포 시 Compose의 개발 계정 대신 비밀 저장소에서 주입한 `DATABASE_URL`을 사용하고, 업로드 디렉터리는 영속 저장소로 연결해야 합니다.
+API 문서는 FastAPI가 제공하는 `http://127.0.0.1:8000/docs`와 `/openapi.json`에서 확인할 수 있습니다. 프런트 연동을 위한 요청·응답 계약과 흐름은 [`API.md`](API.md)를 참고하세요. 생존 확인은 `/health`, DB 연결 준비 확인은 `/ready`입니다. AWS/RDS 배포 시 Compose의 개발 계정 대신 비밀 저장소에서 주입한 `DATABASE_URL`을 사용하고, 업로드 디렉터리는 영속 저장소로 연결해야 합니다.
 
 로컬 작업자가 worker API를 사용할 때는 Compose를 실행하는 셸에 `WORKER_API_TOKEN`을 설정합니다. 값은 저장소에 기록하지 말고, worker에 같은 값을 `X-Worker-Token`으로 전달합니다. 별도 origin의 프런트를 연결하면 `CORS_ORIGINS`에 정확한 origin 목록을 쉼표로 구분해 설정합니다. 기본값은 CORS 비활성화입니다.
 
