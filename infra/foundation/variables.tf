@@ -30,10 +30,16 @@ variable "vpc_cidr" {
   }
 }
 
-variable "enable_nat_instance" {
-  description = "true면 앱 태스크를 프라이빗 서브넷 + NAT 인스턴스로 실행. false면 퍼블릭 서브넷 + 퍼블릭 IP로 실행(비용 절감)"
+variable "enable_db_lambda" {
+  description = "true(기본)면 앱별 DB 준비·확인을 VPC 안의 Lambda로 한다(몇 초). false면 이 Lambda를 만들지 않고 deploy.sh가 Fargate 작업으로 대신한다(약 70초 더 걸림). 끄면 deploy.sh의 db_provisioner_lambda_name 출력이 비어 자동으로 Fargate 경로를 쓴다"
   type        = bool
-  default     = false
+  default     = true
+}
+
+variable "enable_nat_instance" {
+  description = "true(기본)면 앱 태스크를 프라이빗 서브넷 + NAT 인스턴스(NAT Gateway 대신)로 실행. false면 퍼블릭 서브넷 + 퍼블릭 IP로 실행(비용 절감, 시험용)"
+  type        = bool
+  default     = true
 }
 
 variable "nat_instance_type" {
