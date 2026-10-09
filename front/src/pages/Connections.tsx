@@ -22,18 +22,16 @@ const emptyDraft = (provider: Provider, count: number): Draft => ({
 })
 
 // 백엔드가 준 콘솔 주소가 진짜 벤더 콘솔인지 확인한 뒤에만 링크로 보여 줌
-const CONSOLE_HOSTS = ['console.aws.amazon.com', 'console.cloud.google.com', 'portal.azure.com']
+const CONSOLE_HOSTS = ['console.aws.amazon.com']
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 interface Props {
   connections: Connection[] | null
-  /** 관리자만 추가, 수정, 삭제 가능 */
-  canEdit: boolean
   onChange: (list: Connection[]) => void
 }
 
-export default function Connections({ connections, canEdit, onChange }: Props) {
+export default function Connections({ connections, onChange }: Props) {
   const list = connections ?? []
   const [draft, setDraft] = useState<Draft>(() => emptyDraft('aws', 0))
   const [saving, setSaving] = useState(false)
@@ -112,19 +110,13 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
         <div>
           <h1>배포 대상</h1>
           <p>
-            어디든 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. 클라우드는 키 대신 권한 위임으로,
-            사내 서버는 설치 명령 한 줄로 연결합니다.
+            AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할
+            위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.
           </p>
         </div>
       </div>
 
-      {!canEdit && (
-        <p className="readonly-note">
-          배포 대상 추가와 수정은 관리자만 할 수 있습니다. 필요한 대상이 있으면 관리자에게 요청하세요.
-        </p>
-      )}
-
-      <div className={'conn-layout' + (canEdit ? '' : ' is-readonly')}>
+      <div className="conn-layout">
         <section className="panel">
           <header className="list-head">
             <h2>연결된 대상 {list.length}곳</h2>
@@ -144,11 +136,9 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
                   {c.status === 'pending' && c.provider === 'onprem' && (
                     <span className="conn-pending">
                       서버에서 설치 명령을 실행하면 자동으로 연결됩니다.{' '}
-                      {canEdit && (
-                        <button className="link-btn" onClick={() => setInstallFor(c.id)}>
-                          명령 보기
-                        </button>
-                      )}
+                      <button className="link-btn" onClick={() => setInstallFor(c.id)}>
+                        명령 보기
+                      </button>
                     </span>
                   )}
                   {c.status === 'pending' && c.provider !== 'onprem' && (
@@ -174,26 +164,22 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
                   <button className="btn btn-ghost btn-sm" onClick={() => check(c.id)} disabled={checking === c.id}>
                     {checking === c.id ? '확인 중…' : '다시 확인'}
                   </button>
-                  {canEdit && (
-                    <>
-                      <button
-                        className="btn btn-ghost btn-sm"
-                        onClick={() => setDraft({ id: c.id, provider: c.provider, name: c.name, fields: { ...c.fields } })}
-                      >
-                        수정
-                      </button>
-                      <button className="btn btn-ghost btn-sm danger" onClick={() => remove(c)}>
-                        삭제
-                      </button>
-                    </>
-                  )}
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    onClick={() => setDraft({ id: c.id, provider: c.provider, name: c.name, fields: { ...c.fields } })}
+                  >
+                    수정
+                  </button>
+                  <button className="btn btn-ghost btn-sm danger" onClick={() => remove(c)}>
+                    삭제
+                  </button>
                 </div>
               </li>
             ))}
           </ul>
         </section>
 
-        {canEdit && installConn && (
+        {installConn && (
           <section className="panel conn-form">
             <header className="list-head">
               <h2>'{installConn.name}' 서버 연결</h2>
@@ -216,7 +202,7 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
           </section>
         )}
 
-        {canEdit && !installConn && (
+        {!installConn && (
         <section className="panel conn-form">
           <header className="list-head">
             <h2>{draft.id ? `'${draft.name}' 수정` : '새 배포 대상'}</h2>

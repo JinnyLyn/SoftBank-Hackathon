@@ -1,16 +1,18 @@
 import CodeView from '../components/CodeView'
+import { IS_MOCK } from '../api'
 import type { DeployStatus } from '../types'
 
 interface Props {
   status: DeployStatus | null
   targetName: string
-  retrying: boolean
-  onRetry: () => void
+  fixing: boolean
+  /** 수정안 반영 → 검증·plan 재생성 → 코드 검토에서 다시 승인 */
+  onFix: () => void
   onRestart: () => void
   onHistory: () => void
 }
 
-export default function DeployStep({ status, targetName, retrying, onRetry, onRestart, onHistory }: Props) {
+export default function DeployStep({ status, targetName, fixing, onFix, onRestart, onHistory }: Props) {
   if (!status) return <p className="muted">배포를 시작하는 중…</p>
 
   return (
@@ -24,7 +26,7 @@ export default function DeployStep({ status, targetName, retrying, onRetry, onRe
       {status.state === 'success' && status.url && (
         <div className="done-card">
           <div>
-            <span className="done-label">배포 완료</span>
+            <span className="done-label">{IS_MOCK ? 'MOCK: 배포 완료 (예시, 실제로 배포되지 않음)' : '배포 완료'}</span>
             <a href={status.url} target="_blank" rel="noreferrer" className="mono">
               {status.url}
             </a>
@@ -61,8 +63,9 @@ export default function DeployStep({ status, targetName, retrying, onRetry, onRe
             ))}
           </div>
           <div className="diag-actions">
-            <button className="btn btn-primary" onClick={onRetry} disabled={retrying}>
-              {retrying ? '다시 배포하는 중…' : '수정 적용하고 다시 배포'}
+            <span className="hint">수정안을 반영해 검증과 plan을 다시 만든 뒤, 코드 검토에서 다시 승인받습니다.</span>
+            <button className="btn btn-primary" onClick={onFix} disabled={fixing}>
+              {fixing ? '수정안 반영하는 중…' : '수정안 반영하고 다시 검토'}
             </button>
           </div>
         </div>

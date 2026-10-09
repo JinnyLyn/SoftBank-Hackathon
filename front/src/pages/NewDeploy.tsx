@@ -3,11 +3,11 @@ import { api, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
-import ScaleStep from '../steps/ScaleStep'
+import ScaleStep, { budgetValid } from '../steps/ScaleStep'
 import AnalysisStep, { type CodeState } from '../steps/AnalysisStep'
 import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
-import { costText, tierTotal } from '../format'
+import { costText, tierTotal, usd } from '../format'
 import type {
   Analysis,
   Choice,
@@ -30,21 +30,24 @@ const STEPS = [
   { label: '배포', title: '배포', desc: '이미지를 빌드해 배포하고 헬스체크까지 확인합니다.' },
 ]
 
-const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '' }
+const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '', monthlyBudgetUsd: 30 }
 
-type Busy = null | 'analyze' | 'approve'
+// 상태 확인 간격과, 일시적인 오류를 몇 번까지 다시 시도할지
+const POLL_MS = 700
+const MAX_POLL_ERRORS = 3
+
+type Busy = null | 'analyze' | 'approve' | 'fix'
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
 
 interface Props {
   connections: Connection[]
-  userName: string
   onShowHistory: () => void
   onShowConnections: () => void
 }
 
-export default function NewDeploy({ connections, userName, onShowHistory, onShowConnections }: Props) {
+export default function NewDeploy({ connections, onShowHistory, onShowConnections }: Props) {
   const [step, setStep] = useState(0)
   const [source, setSourceState] = useState<Source | null>(null)
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
@@ -124,32 +127,43 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
           ? 'error'
           : 'idle'
 
-  const reached = approved ? 3 : bundle ? 2 : analysis && rec && choice ? 1 : 0
+  const reached = approved ? 3 : bundle ? 2 : analysis && rec ? 1 : 0
   const locked = approved
 
   const option = rec?.options.find((o) => o.connectionId === choice?.connectionId) ?? null
   const selectedTier = option?.tiers.find((t) => t.key === choice?.tier) ?? null
   const usable = connections.filter((c) => c.status === 'connected')
 
+  // 승인 후 상태 확인. 끝나거나(성공·실패) 화면을 떠나거나 새 배포가 시작되면 멈춤
   useEffect(() => {
     if (!runId || !analysis) return
     let stopped = false
+    let timer: number | undefined
+    let errors = 0
     const tick = async () => {
       try {
         const s = await api.status(analysis.projectId)
         if (stopped) return
+        errors = 0
         setDeploy(s)
-        if (s.state === 'running') setTimeout(tick, 700)
+        if (s.state === 'running') timer = window.setTimeout(tick, POLL_MS)
         else setBusy(null)
       } catch (e) {
         if (stopped) return
-        setError(errMsg(e))
+        errors += 1
+        if (errors < MAX_POLL_ERRORS) {
+          // 일시적인 네트워크 오류는 점점 늦춰 가며 다시 확인
+          timer = window.setTimeout(tick, POLL_MS * 2 ** errors)
+          return
+        }
+        setError(`배포 상태를 가져오지 못했습니다. ${errMsg(e)}`)
         setBusy(null)
       }
     }
     tick()
     return () => {
       stopped = true
+      window.clearTimeout(timer)
     }
   }, [runId])
 
@@ -177,11 +191,10 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
         setAnalysis(a)
         setRec(r)
         setBundles(r.bundles ?? {})
-        if (r.options.length) {
-          setChoiceState(r.recommended)
-          // 백엔드가 추천 조합 코드를 안 보냈으면 바로 요청
-          if (!r.bundles?.[keyOf(r.recommended)]) prefetch(a.projectId, r.recommended)
-        }
+        // 예산 안에 맞는 구성이 없으면 recommended가 null → 화면에 이유만 보여 줌
+        setChoiceState(r.recommended)
+        // 백엔드가 추천 조합 코드를 안 보냈으면 바로 요청
+        if (r.recommended && !r.bundles?.[keyOf(r.recommended)]) prefetch(a.projectId, r.recommended)
       }
       setStep(1)
     })
@@ -196,11 +209,17 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
       setRunId((n) => n + 1)
     })
 
-  const retry = () =>
-    run('approve', async () => {
+  // 실패 진단의 수정안 반영 → 검증·plan 재생성 → 코드 검토로 돌아가 다시 승인
+  // 승인한 내용이 바뀌었으므로 이전 승인은 버림
+  const applyFix = () =>
+    run('fix', async () => {
       if (!analysis || !choice) return
-      await api.approve(analysis.projectId, choice)
-      setRunId((n) => n + 1)
+      const fixed = await api.applyFix(analysis.projectId, choice)
+      setBundles((m) => ({ ...m, [keyOf(choice)]: fixed }))
+      setApproved(false)
+      setConfirmed(false)
+      setDeploy(null)
+      setStep(2)
     })
 
   const restart = () => {
@@ -215,7 +234,7 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
 
   const railItems: RailItem[] = STEPS.map((s, i) => {
     let sub: string | undefined
-    if (i === 0 && source) sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명`
+    if (i === 0 && source) sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명 · ${budgetValid(scale.monthlyBudgetUsd) ? usd(scale.monthlyBudgetUsd) : '예산 미입력'}`
     if (i === 1 && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
     if (i === 2 && bundle) sub = `${bundle.plan.add}개 추가`
     if (i === 2 && !bundle && codeState === 'loading') sub = '코드 준비 중'
@@ -236,11 +255,12 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
     next = {
       label: busy === 'analyze' ? '분석하고 코드 준비 중…' : analysis ? '다음' : '분석 시작',
       onClick: analyze,
-      disabled: !source || (!analysis && usable.length === 0),
+      disabled: !source || !budgetValid(scale.monthlyBudgetUsd) || (!analysis && usable.length === 0),
     }
   if (step === 1 && !locked) {
     if (codeState === 'error' && analysis && choice)
       next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
+    else if (!choice) next = { label: '코드 검토', onClick: () => {}, disabled: true }
     else
       next = {
         label: codeState === 'loading' ? '코드 준비 중…' : '코드 검토',
@@ -264,7 +284,8 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
             <small className="with-mark">
               <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
             </small>
-            {rec && (rec.recommended.connectionId !== option.connectionId || rec.recommended.tier !== selectedTier.key) && (
+            <small className="muted">월 예산 {usd(scale.monthlyBudgetUsd)} 안</small>
+            {rec && (rec.recommended?.connectionId !== option.connectionId || rec.recommended?.tier !== selectedTier.key) && (
               <small className="muted">AI 추천과 다른 선택</small>
             )}
           </div>
@@ -305,11 +326,12 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
               </section>
             </div>
           )}
-          {step === 1 && analysis && rec && choice && (
+          {step === 1 && analysis && rec && (
             <AnalysisStep
               analysis={analysis}
               rec={rec}
               choice={choice}
+              budget={scale.monthlyBudgetUsd}
               codeState={codeState}
               codeError={key ? codeErrors[key] : undefined}
               locked={locked || busy !== null}
@@ -322,7 +344,6 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
               bundle={bundle}
               tier={selectedTier}
               target={option}
-              approver={userName}
               confirmed={confirmed}
               locked={locked}
               onConfirm={setConfirmed}
@@ -332,8 +353,8 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
             <DeployStep
               status={deploy}
               targetName={option?.name ?? ''}
-              retrying={busy === 'approve'}
-              onRetry={retry}
+              fixing={busy === 'fix'}
+              onFix={applyFix}
               onRestart={restart}
               onHistory={onShowHistory}
             />

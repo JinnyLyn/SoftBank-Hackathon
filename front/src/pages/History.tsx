@@ -68,7 +68,7 @@ export default function History() {
                     <span className="with-mark">
                       <ProviderMark provider={r.provider} /> {r.target} · {r.tier} 구성
                     </span>
-                    <small>승인 {r.approvedBy}{r.note ? ` · ${r.note}` : ''}</small>
+                    {r.note && <small>{r.note}</small>}
                   </span>
                   <span className="t-time mono">{r.createdAt}</span>
                   <span className={'t-status rs-' + r.status}>{STATUS_TEXT[r.status]}</span>

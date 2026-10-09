@@ -7,40 +7,22 @@ import type {
   DeployStatus,
   Recommendation,
   ScaleInput,
-  Session,
   Source,
-  SsoDiscovery,
   TerraformBundle,
 } from '../types'
 import * as mock from './mock'
-import { isSafeRedirect, req, send, setCsrfToken } from './http'
+import { req, send } from './http'
 
 export { sourceName } from './mock'
-export { ApiError, onUnauthorized } from './http'
+export { ApiError } from './http'
 
 const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false'
 
-/** 리다이렉트를 허용할 IdP 호스트. 백엔드가 같은 출처 주소를 주면 비워 둬도 됨 */
-const IDP_HOSTS = (import.meta.env.VITE_IDP_HOSTS ?? '').split(',').filter(Boolean)
+/** 화면에 MOCK 표시를 띄울지. 모의 결과를 실제 배포로 오해하지 않게 */
+export const IS_MOCK = USE_MOCK
 
 // 백엔드 엔드포인트는 아직 가안. 확정되면 여기만 고치면 됨
 const real = {
-  /** 세션 쿠키가 살아 있으면 사용자 정보, 아니면 null */
-  async session(): Promise<Session | null> {
-    const res = await fetch('/api/auth/session', { credentials: 'same-origin' })
-    if (res.status === 401) return null
-    if (!res.ok) throw new Error(`${res.status}`)
-    return res.json()
-  },
-  discover: (email: string) => req<SsoDiscovery>('/auth/sso/discover', send('POST', { email })),
-  /** IdP 로그인 화면으로 이동. 돌아오면 세션 쿠키가 심어져 있음 */
-  startSso(_email: string, d: SsoDiscovery): Promise<Session> {
-    if (!isSafeRedirect(d.redirectUrl, IDP_HOSTS)) return Promise.reject(new Error('허용되지 않은 로그인 주소입니다.'))
-    window.location.assign(d.redirectUrl)
-    return new Promise(() => {})
-  },
-  logout: () => req<void>('/auth/logout', { method: 'POST' }),
-
   listConnections: () => req<Connection[]>('/connections'),
   saveConnection: (input: ConnectionInput) =>
     input.id
@@ -59,6 +41,7 @@ const real = {
     form.append('expected_users', scale.expectedUsers)
     form.append('traffic_pattern', scale.pattern)
     form.append('purpose', scale.purpose)
+    form.append('monthly_budget_usd', String(scale.monthlyBudgetUsd))
     return req<Analysis>('/projects', { method: 'POST', body: form })
   },
   recommend: (projectId: string, scale: ScaleInput) =>
@@ -66,13 +49,12 @@ const real = {
   generate: (projectId: string, choice: Choice) =>
     req<TerraformBundle>(`/projects/${projectId}/code`, send('POST', choice)),
   approve: (projectId: string, choice: Choice) => req<void>(`/projects/${projectId}/deploy`, send('POST', choice)),
+  /** 실패 진단의 수정안을 반영하고 검증·plan을 다시 만듦. 결과는 다시 승인받아야 배포됨 */
+  applyFix: (projectId: string, choice: Choice) =>
+    req<TerraformBundle>(`/projects/${projectId}/fix`, send('POST', choice)),
   status: (projectId: string) => req<DeployStatus>(`/projects/${projectId}/status`),
   history: () => req<DeployRecord[]>('/deployments'),
 }
 
-const mockApi: typeof real = { ...mock, startSso: mock.mockCompleteSso }
+export const api: typeof real = USE_MOCK ? mock : real
 
-export const api: typeof real = USE_MOCK ? mockApi : real
-
-/** 로그인 직후, 세션 확인 직후 호출 */
-export const applySession = (s: Session) => setCsrfToken(s.csrfToken)

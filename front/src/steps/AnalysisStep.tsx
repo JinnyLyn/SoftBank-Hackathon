@@ -15,7 +15,9 @@ const CODE_TEXT: Record<CodeState, string> = {
 interface Props {
   analysis: Analysis
   rec: Recommendation
-  choice: Choice
+  choice: Choice | null
+  /** 월 예산 한도. 넘는 칸은 고를 수 없음 */
+  budget: number
   codeState: CodeState
   codeError?: string
   locked: boolean
@@ -24,10 +26,10 @@ interface Props {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
-export default function AnalysisStep({ analysis, rec, choice, codeState, codeError, locked, onChoice }: Props) {
-  const option = rec.options.find((o) => o.connectionId === choice.connectionId)
-  const selected = option?.tiers.find((t) => t.key === choice.tier)
-  const isRec = (id: string, t: TierKey) => rec.recommended.connectionId === id && rec.recommended.tier === t
+export default function AnalysisStep({ analysis, rec, choice, budget, codeState, codeError, locked, onChoice }: Props) {
+  const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
+  const selected = option?.tiers.find((t) => t.key === choice?.tier)
+  const isRec = (id: string, t: TierKey) => rec.recommended?.connectionId === id && rec.recommended?.tier === t
 
   // 열(구성 크기)마다 가장 싼 대상
   const cheapest = Object.fromEntries(
@@ -71,7 +73,7 @@ export default function AnalysisStep({ analysis, rec, choice, codeState, codeErr
 
       <section>
         <h3 className="sub-title">어디에, 어떤 크기로</h3>
-        <p className="rec-reason">{rec.reason}</p>
+        <p className={'rec-reason' + (rec.recommended ? '' : ' is-blocked')}>{rec.reason}</p>
 
         {rec.options.length === 0 ? (
           <p className="muted">비교할 배포 대상이 없습니다. 배포 대상 탭에서 하나 이상 연결해 주세요.</p>
@@ -100,20 +102,23 @@ export default function AnalysisStep({ analysis, rec, choice, codeState, codeErr
                       </span>
                     </th>
                     {o.tiers.map((t) => {
-                      const on = choice.connectionId === o.connectionId && choice.tier === t.key
+                      const on = choice?.connectionId === o.connectionId && choice?.tier === t.key
+                      const over = tierTotal(t) > budget
                       return (
                         <td key={t.key}>
                           <button
-                            className={'cell' + (on ? ' is-on' : '')}
-                            disabled={locked}
+                            className={'cell' + (on ? ' is-on' : '') + (over ? ' is-over' : '')}
+                            disabled={locked || over}
+                            title={over ? `월 예산 $${budget}을 넘습니다` : undefined}
                             aria-pressed={on}
                             onClick={() => onChoice({ connectionId: o.connectionId, tier: t.key })}
                           >
                             <span className="cell-tags">
                               {isRec(o.connectionId, t.key) && <span className="badge">AI 추천</span>}
-                              {cheapest[t.key] === o.connectionId && rec.options.length > 1 && (
+                              {cheapest[t.key] === o.connectionId && rec.options.length > 1 && !over && (
                                 <span className="tag-low">최저</span>
                               )}
+                              {over && <span className="tag-over">예산 초과</span>}
                             </span>
                             <strong>{costText(tierTotal(t))}</strong>
                             <small>{t.headline}</small>

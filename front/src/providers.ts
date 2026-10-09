@@ -22,14 +22,6 @@ export interface ProviderMeta {
   fields: FieldDef[]
 }
 
-const budget: FieldDef = {
-  key: 'budget',
-  label: '월 예산 한도 (USD)',
-  placeholder: '30',
-  hint: '추천 구성이 한도를 넘으면 승인 전에 알려 드립니다.',
-  optional: true,
-}
-
 export const PROVIDERS: Record<Provider, ProviderMeta> = {
   aws: {
     label: 'AWS',
@@ -41,40 +33,7 @@ export const PROVIDERS: Record<Provider, ProviderMeta> = {
       '그 화면에서 "스택 생성"만 누르면 Paved Clouds용 역할이 외부 ID {externalId} 로 만들어집니다',
       '스택 생성이 끝나면 "다시 확인"을 눌러 연결을 마칩니다. 계정 ID는 자동으로 읽습니다.',
     ],
-    fields: [budget],
-  },
-  gcp: {
-    label: 'Google Cloud',
-    mark: 'GCP',
-    kind: 'cloud',
-    summary: 'Workload Identity 연동',
-    howto: [
-      'IAM → 서비스 계정 만들기, 역할: Cloud Run 관리자, Cloud SQL 관리자, Compute 관리자',
-      'Workload Identity 풀에 공급자 추가, 대상(audience)은 {externalId}',
-      '프로젝트 ID와 서비스 계정 이메일 입력',
-    ],
-    fields: [
-      { key: 'projectId', label: '프로젝트 ID', placeholder: 'my-project-1234' },
-      { key: 'serviceAccount', label: '서비스 계정 이메일', placeholder: 'paved@my-project-1234.iam.gserviceaccount.com', wide: true },
-      budget,
-    ],
-  },
-  azure: {
-    label: 'Azure',
-    mark: 'AZ',
-    kind: 'cloud',
-    summary: '페더레이션 자격 증명',
-    howto: [
-      'Entra ID → 앱 등록 → 페더레이션 자격 증명 추가, 주체 식별자는 {externalId}',
-      '구독의 액세스 제어(IAM)에서 이 앱에 기여자 역할 할당',
-      '구독, 테넌트, 클라이언트 ID 입력',
-    ],
-    fields: [
-      { key: 'subscriptionId', label: '구독 ID', placeholder: '00000000-0000-0000-0000-000000000000', wide: true },
-      { key: 'tenantId', label: '테넌트 ID', placeholder: '00000000-…' },
-      { key: 'clientId', label: '클라이언트 ID', placeholder: '00000000-…' },
-      budget,
-    ],
+    fields: [],
   },
   onprem: {
     label: '온프레미스',
@@ -87,7 +46,7 @@ export const PROVIDERS: Record<Provider, ProviderMeta> = {
   },
 }
 
-export const PROVIDER_ORDER: Provider[] = ['aws', 'gcp', 'azure', 'onprem']
+export const PROVIDER_ORDER: Provider[] = ['aws', 'onprem']
 
 export const EXTERNAL_ID = 'pc-7f3a91'
 

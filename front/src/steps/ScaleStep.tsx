@@ -14,6 +14,10 @@ const PATTERNS: { value: TrafficPattern; label: string }[] = [
   { value: 'unknown', label: '아직 모름' },
 ]
 
+const BUDGETS = [10, 30, 50, 100]
+
+export const budgetValid = (n: number) => Number.isFinite(n) && n >= 1
+
 interface Props {
   scale: ScaleInput
   locked: boolean
@@ -61,6 +65,46 @@ export default function ScaleStep({ scale, locked, connections, onChange, onShow
           ))}
         </div>
       </fieldset>
+
+      <div className="field">
+        <label htmlFor="budget">월 예산 한도 (USD)</label>
+        <div className="budget-row">
+          <div className="budget-input">
+            <span aria-hidden>$</span>
+            <input
+              id="budget"
+              type="number"
+              min={1}
+              step={1}
+              inputMode="numeric"
+              className="input mono"
+              disabled={locked}
+              value={Number.isFinite(scale.monthlyBudgetUsd) ? scale.monthlyBudgetUsd : ''}
+              onChange={(e) =>
+                onChange({ ...scale, monthlyBudgetUsd: e.target.value === '' ? NaN : Number(e.target.value) })
+              }
+            />
+          </div>
+          <div className="switch">
+            {BUDGETS.map((b) => (
+              <button
+                key={b}
+                type="button"
+                disabled={locked}
+                className={scale.monthlyBudgetUsd === b ? 'is-on' : ''}
+                onClick={() => onChange({ ...scale, monthlyBudgetUsd: b })}
+              >
+                ${b}
+              </button>
+            ))}
+          </div>
+        </div>
+        <p className={budgetValid(scale.monthlyBudgetUsd) ? 'hint' : 'conn-error'}>
+          {budgetValid(scale.monthlyBudgetUsd)
+            ? '이 금액을 넘는 구성은 추천하지 않고 고를 수도 없습니다. 사내 서버는 추가 비용 0으로 계산합니다.'
+            : '1 이상의 금액을 넣어 주세요.'}
+        </p>
+      </div>
 
       <div className="field">
         <label htmlFor="purpose">어떤 서비스인가요? (선택)</label>

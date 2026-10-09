@@ -46,70 +46,6 @@ export const CATALOG: Record<Provider, CatalogTier[]> = {
       ],
     },
   ],
-  gcp: [
-    {
-      ...BASE.lean,
-      headline: '가상 서버 한 대 (Compute Engine)',
-      tradeoff: '서버가 멈추면 복구될 때까지 서비스도 멈춥니다',
-      resources: [
-        { addr: 'google_compute_instance.app', service: 'Compute Engine', spec: 'e2-small', monthlyUsd: 15.86, why: '2 vCPU(공유), 2GB로 시연 규모를 감당합니다.' },
-        { addr: 'google_compute_disk.data', service: 'Persistent Disk', spec: 'pd-balanced 20GB', monthlyUsd: 2.6, why: 'SQLite 파일을 디스크에 둡니다.' },
-        { addr: 'google_compute_address.app', service: '고정 외부 IP', spec: '1개', monthlyUsd: 3.65, why: '재시작해도 주소가 유지됩니다.' },
-      ],
-    },
-    {
-      ...BASE.balanced,
-      headline: '서버리스 컨테이너 + 관리형 DB',
-      tradeoff: '요청이 없다가 처음 들어오면 1~2초 늦을 수 있습니다',
-      resources: [
-        { addr: 'google_cloud_run_v2_service.app', service: 'Cloud Run', spec: '1 vCPU, 512MiB, 0~3개', monthlyUsd: 6.2, why: '요청이 없을 때는 0개로 줄어 비용이 거의 안 듭니다.' },
-        { addr: 'google_sql_database_instance.main', service: 'Cloud SQL PostgreSQL', spec: 'db-f1-micro, 10GB', monthlyUsd: 11.42, why: 'SQLite 대신 씁니다.' },
-        { addr: 'google_logging_project_bucket_config.app', service: 'Cloud Logging', spec: '30일 보관', monthlyUsd: 0, why: '무료 한도 안에서 충분합니다.' },
-      ],
-    },
-    {
-      ...BASE.roomy,
-      headline: '항상 켜진 컨테이너 + 이중화 DB',
-      tradeoff: '지금 규모에서는 사양이 많이 남습니다',
-      resources: [
-        { addr: 'google_cloud_run_v2_service.app', service: 'Cloud Run', spec: '1 vCPU, 1GiB, 1~10개', monthlyUsd: 46.8, why: '최소 1개를 켜 두어 첫 요청 지연이 없습니다.' },
-        { addr: 'google_sql_database_instance.main', service: 'Cloud SQL PostgreSQL', spec: '1 vCPU, 3.75GB, HA', monthlyUsd: 104.9, why: '영역 장애 시 자동으로 넘어갑니다.' },
-        { addr: 'google_monitoring_alert_policy.app', service: 'Cloud Monitoring', spec: '경보 3개', monthlyUsd: 0, why: '지연, 5xx, DB 연결 경보를 겁니다.' },
-      ],
-    },
-  ],
-  azure: [
-    {
-      ...BASE.lean,
-      headline: '가상 서버 한 대 (VM)',
-      tradeoff: '서버가 멈추면 복구될 때까지 서비스도 멈춥니다',
-      resources: [
-        { addr: 'azurerm_linux_virtual_machine.app', service: 'Virtual Machine', spec: 'B1ms', monthlyUsd: 17.52, why: '1 vCPU, 2GB 버스터블로 시연 규모에 맞습니다.' },
-        { addr: 'azurerm_managed_disk.data', service: 'Managed Disk', spec: 'Standard SSD 32GB', monthlyUsd: 2.4, why: 'SQLite 파일을 디스크에 둡니다.' },
-        { addr: 'azurerm_public_ip.app', service: 'Public IP', spec: '고정 1개', monthlyUsd: 3.65, why: '재시작해도 주소가 유지됩니다.' },
-      ],
-    },
-    {
-      ...BASE.balanced,
-      headline: '컨테이너 앱 + 관리형 DB',
-      tradeoff: '요청이 없다가 처음 들어오면 조금 늦을 수 있습니다',
-      resources: [
-        { addr: 'azurerm_container_app.app', service: 'Container Apps', spec: '0.5 vCPU, 1GiB, 0~3개', monthlyUsd: 8.1, why: '쓰는 만큼만 비용이 나갑니다.' },
-        { addr: 'azurerm_postgresql_flexible_server.main', service: 'PostgreSQL Flexible', spec: 'B1ms, 32GB', monthlyUsd: 20.9, why: 'SQLite 대신 씁니다.' },
-        { addr: 'azurerm_log_analytics_workspace.app', service: 'Log Analytics', spec: '30일 보관', monthlyUsd: 2.3, why: '배포 실패 시 AI가 원인을 볼 로그입니다.' },
-      ],
-    },
-    {
-      ...BASE.roomy,
-      headline: '항상 켜진 컨테이너 + 이중화 DB',
-      tradeoff: '지금 규모에서는 사양이 많이 남습니다',
-      resources: [
-        { addr: 'azurerm_container_app.app', service: 'Container Apps', spec: '1 vCPU, 2GiB, 2~6개', monthlyUsd: 52.6, why: '최소 2개로 한 개가 죽어도 버팁니다.' },
-        { addr: 'azurerm_postgresql_flexible_server.main', service: 'PostgreSQL Flexible', spec: 'B2s, 영역 중복 HA', monthlyUsd: 71.5, why: '영역 장애 시 자동으로 넘어갑니다.' },
-        { addr: 'azurerm_application_insights.app', service: 'Application Insights', spec: '경보 3개', monthlyUsd: 3.1, why: '지연, 5xx, DB 연결 경보를 겁니다.' },
-      ],
-    },
-  ],
   onprem: [
     {
       ...BASE.lean,
@@ -152,8 +88,6 @@ export const findTier = (p: Provider, t: TierKey) => CATALOG[p].find((x) => x.ke
 
 const HEAD: Record<Exclude<Provider, 'onprem'>, string> = {
   aws: `provider "aws" {\n  region = var.region\n}`,
-  gcp: `provider "google" {\n  project = var.project_id\n  region  = var.region\n}`,
-  azure: `provider "azurerm" {\n  features {}\n  subscription_id = var.subscription_id\n}`,
 }
 
 function tfMain(p: Exclude<Provider, 'onprem'>, tier: CatalogTier) {
@@ -165,7 +99,7 @@ function tfMain(p: Exclude<Provider, 'onprem'>, tier: CatalogTier) {
 }
 
 const TF_VARS = (p: Exclude<Provider, 'onprem'>) => {
-  const region = { aws: 'ap-northeast-2', gcp: 'asia-northeast3', azure: 'koreacentral' }[p]
+  const region = { aws: 'ap-northeast-2' }[p]
   return `variable "app_name" {\n  type    = string\n  default = "sample-app"\n}\n\nvariable "region" {\n  type    = string\n  default = "${region}"\n}\n\nvariable "image" {\n  type        = string\n  description = "빌드 후 레지스트리에 올린 이미지 주소"\n}`
 }
 
@@ -221,8 +155,6 @@ export function buildPlan(p: Provider, tier: CatalogTier) {
 
 const REGISTRY: Record<Provider, string> = {
   aws: '1234.dkr.ecr.ap-northeast-2.amazonaws.com/sample-app:v1',
-  gcp: 'asia-northeast3-docker.pkg.dev/paved-demo/apps/sample-app:v1',
-  azure: 'pavedclouds.azurecr.io/sample-app:v1',
   onprem: 'registry.local:5000/sample-app:v1',
 }
 
@@ -256,10 +188,5 @@ export function logScript(p: Provider, tier: CatalogTier, host?: string): [numbe
 
 export function publicUrl(p: Provider, tier: TierKey, host?: string) {
   if (p === 'onprem') return tier === 'lean' ? `http://${host ?? '192.168.0.24'}:8080` : `https://${host ?? '192.168.0.24'}`
-  if (tier === 'lean') return { aws: 'http://3.38.112.47', gcp: 'http://34.64.120.9', azure: 'http://20.194.33.12' }[p]
-  return {
-    aws: 'https://sample-app-alb-1203.ap-northeast-2.elb.amazonaws.com',
-    gcp: 'https://sample-app-3kq2v7-du.a.run.app',
-    azure: 'https://sample-app.koreacentral.azurecontainerapps.io',
-  }[p]
+  return tier === 'lean' ? 'http://3.38.112.47' : 'https://sample-app-alb-1203.ap-northeast-2.elb.amazonaws.com'
 }

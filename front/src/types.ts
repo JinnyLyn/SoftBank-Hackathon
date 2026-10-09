@@ -1,4 +1,4 @@
-export type Provider = 'aws' | 'gcp' | 'azure' | 'onprem'
+export type Provider = 'aws' | 'onprem'
 
 export interface Connection {
   id: string
@@ -38,6 +38,8 @@ export interface ScaleInput {
   expectedUsers: ExpectedUsers
   pattern: TrafficPattern
   purpose: string
+  /** 월 예산 한도(USD). 이 금액을 넘는 구성은 추천하지도, 고르게 하지도 않음 */
+  monthlyBudgetUsd: number
 }
 
 export interface Finding {
@@ -91,7 +93,8 @@ export interface Choice {
 }
 
 export interface Recommendation {
-  recommended: Choice
+  /** 예산 안에 맞는 구성이 하나도 없으면 null. reason에 이유를 씀 */
+  recommended: Choice | null
   reason: string
   options: TargetOption[]
   assumptions: string[]
@@ -102,9 +105,17 @@ export interface Recommendation {
   bundles?: Record<string, TerraformBundle>
 }
 
+export interface Patch {
+  file: string
+  before: string[]
+  after: string[]
+}
+
 export interface TerraformBundle {
   /** 온프레미스는 Terraform 대신 docker compose 사용 */
   tool: 'terraform' | 'compose'
+  /** 실패 진단 수정안을 반영해 다시 만든 경우, 이번에 바뀐 내용 (재승인 화면에 표시) */
+  patches?: Patch[]
   files: { name: string; content: string }[]
   plan: { add: number; change: number; destroy: number; text: string }
 }
@@ -117,7 +128,7 @@ export interface DeployStatus {
   diagnosis?: {
     cause: string
     fix: string
-    patch: { file: string; before: string[]; after: string[] }
+    patch: Patch
   }
 }
 
@@ -132,31 +143,6 @@ export interface DeployRecord {
   status: 'success' | 'failed' | 'running'
   note?: string
   url?: string
-  /** 승인한 사람 (감사 기록) */
-  approvedBy: string
   createdAt: string
 }
 
-export interface User {
-  id: string
-  name: string
-  email: string
-  org: string
-  role: 'admin' | 'member'
-}
-
-/** 이메일 도메인으로 찾은 회사 IdP */
-export interface SsoDiscovery {
-  org: string
-  /** 화면 표시용 IdP 이름 (Okta, Entra ID 등) */
-  idp: string
-  protocol: 'oidc' | 'saml'
-  /** 백엔드가 만든 IdP 로그인 주소. 여기로 이동하면 끝나고 / 로 돌아옴 */
-  redirectUrl: string
-}
-
-export interface Session {
-  user: User
-  /** 상태를 바꾸는 요청에 X-CSRF-Token 헤더로 실어 보냄 */
-  csrfToken: string
-}

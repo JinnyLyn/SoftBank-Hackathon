@@ -9,13 +9,12 @@ interface Props {
   bundle: TerraformBundle
   tier: Tier
   target: { name: string; provider: Provider }
-  approver: string
   confirmed: boolean
   locked: boolean
   onConfirm: (v: boolean) => void
 }
 
-export default function ReviewStep({ bundle, tier, target, approver, confirmed, locked, onConfirm }: Props) {
+export default function ReviewStep({ bundle, tier, target, confirmed, locked, onConfirm }: Props) {
   const [tab, setTab] = useState('plan')
   const file = bundle.files.find((f) => f.name === tab)
   const { plan } = bundle
@@ -34,6 +33,23 @@ export default function ReviewStep({ bundle, tier, target, approver, confirmed, 
 
   return (
     <div className="stack">
+      {bundle.patches && bundle.patches.length > 0 && (
+        <div className="refix">
+          <strong>실패 진단의 수정안을 반영해 다시 만든 계획입니다. 바뀐 내용을 확인하고 다시 승인해 주세요.</strong>
+          {bundle.patches.map((p) => (
+            <div key={p.file} className="diff">
+              <div className="diff-file mono">{p.file}</div>
+              {p.before.map((l) => (
+                <div key={'b' + l} className="diff-del mono">- {l}</div>
+              ))}
+              {p.after.map((l) => (
+                <div key={'a' + l} className="diff-add mono">+ {l}</div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="summary-strip">
         <div>
           <span>추가</span>
@@ -86,8 +102,7 @@ export default function ReviewStep({ bundle, tier, target, approver, confirmed, 
           <small>
             {isServer
               ? '승인하면 SSH로 서버에 접속해 docker compose up 을 실행합니다.'
-              : `승인하면 ${target.name}에 실제로 리소스가 생기고 비용이 나가기 시작합니다.`}{' '}
-            승인 기록: {approver}
+              : `승인하면 ${target.name}에 실제로 리소스가 생기고 비용이 나가기 시작합니다.`}
           </small>
         </span>
       </label>

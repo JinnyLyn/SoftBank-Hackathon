@@ -5,16 +5,13 @@ import type {
   ConnectionInput,
   DeployRecord,
   DeployStatus,
+  Provider,
   Recommendation,
   ScaleInput,
-  Session,
   Source,
-  SsoDiscovery,
   TerraformBundle,
   TierKey,
-  User,
 } from '../types'
-import { ApiError, emitUnauthorized } from './http'
 import { buildFiles, buildPlan, CATALOG, findTier, logScript, publicUrl } from './catalog'
 import { PROVIDERS } from '../providers'
 import { now } from '../format'
@@ -31,94 +28,6 @@ export const sourceName = (s: Source) =>
     ? s.file.name.replace(/\.zip$/i, '')
     : s.url.replace(/\/+$/, '').replace(/\.git$/, '').split('/').pop() || 'app'
 
-// ---------- 인증 (SSO) ----------
-// 실제로는 백엔드가 IdP와 OIDC/SAML로 주고받고 HttpOnly 쿠키를 심음.
-// mock은 데모용으로 탭 세션 저장소에 로그인 여부만 기억
-
-const SESSION_KEY = 'pc-mock-session'
-const PERSONAL_DOMAINS = ['gmail.com', 'naver.com', 'daum.net', 'hanmail.net', 'kakao.com', 'outlook.com', 'yahoo.com']
-const IDPS: [string, SsoDiscovery['protocol']][] = [
-  ['Microsoft Entra ID', 'oidc'],
-  ['Okta', 'oidc'],
-  ['Google Workspace', 'oidc'],
-  ['Keycloak', 'saml'],
-]
-
-let currentUser: User | null = null
-
-function readSession(): User | null {
-  if (currentUser) return currentUser
-  try {
-    const raw = sessionStorage.getItem(SESSION_KEY)
-    currentUser = raw ? (JSON.parse(raw) as User) : null
-  } catch {
-    currentUser = null
-  }
-  return currentUser
-}
-
-function requireUser(): User {
-  const u = readSession()
-  if (!u) {
-    emitUnauthorized()
-    throw new ApiError(401, '로그인이 만료되었습니다.')
-  }
-  return u
-}
-
-function requireAdmin() {
-  if (requireUser().role !== 'admin') throw new ApiError(403, '배포 대상은 관리자만 바꿀 수 있습니다.')
-}
-
-export async function session(): Promise<Session | null> {
-  await wait(250)
-  const user = readSession()
-  return user ? { user, csrfToken: 'mock-' + user.id } : null
-}
-
-export async function discover(email: string): Promise<SsoDiscovery> {
-  await wait(500)
-  const domain = email.split('@')[1]?.toLowerCase() ?? ''
-  if (PERSONAL_DOMAINS.includes(domain)) throw new ApiError(400, '개인 메일은 쓸 수 없습니다. 회사 이메일을 입력해 주세요.')
-  const [idp, protocol] = IDPS[[...domain].reduce((n, c) => n + c.charCodeAt(0), 0) % IDPS.length]
-  return {
-    org: domain.split('.')[0].toUpperCase(),
-    idp,
-    protocol,
-    redirectUrl: `/api/auth/sso/start?domain=${encodeURIComponent(domain)}`,
-  }
-}
-
-/** mock 전용: IdP 왕복을 흉내 내고 로그인 처리. 이메일에 +member 가 있으면 일반 사용자 */
-export async function mockCompleteSso(email: string, d: SsoDiscovery): Promise<Session> {
-  await wait(1200)
-  const local = email.split('@')[0]
-  const user: User = {
-    id: 'u_' + local.replace(/\W/g, ''),
-    name: local.replace(/\+.*/, ''),
-    email,
-    org: d.org,
-    role: local.includes('+member') ? 'member' : 'admin',
-  }
-  currentUser = user
-  try {
-    sessionStorage.setItem(SESSION_KEY, JSON.stringify(user))
-  } catch {
-    // 저장소를 못 쓰면 새로고침 때 다시 로그인
-  }
-  return { user, csrfToken: 'mock-' + user.id }
-}
-
-export async function logout(): Promise<void> {
-  await wait(150)
-  currentUser = null
-  try {
-    sessionStorage.removeItem(SESSION_KEY)
-  } catch {
-    // 무시
-  }
-}
-
 // ---------- 연결 ----------
 
 let connections: Connection[] = [
@@ -129,7 +38,7 @@ let connections: Connection[] = [
     status: 'connected',
     detail: '계정 123456789012',
     checkedAt: '2026-10-07 13:40',
-    fields: { budget: '30' },
+    fields: {},
   },
   {
     id: 'c2',
@@ -140,31 +49,10 @@ let connections: Connection[] = [
     checkedAt: '2026-10-07 13:42',
     fields: { host: '192.168.0.24', port: '22', user: 'deploy', path: '/srv/apps' },
   },
-  {
-    id: 'c3',
-    provider: 'gcp',
-    name: '학교 GCP 크레딧',
-    status: 'error',
-    detail: '프로젝트 paved-demo-4412',
-    error: '서비스 계정에 Cloud Run 관리자 권한이 없습니다.',
-    checkedAt: '2026-10-07 13:45',
-    fields: { projectId: 'paved-demo-4412', serviceAccount: 'paved@paved-demo-4412.iam.gserviceaccount.com', budget: '50' },
-  },
 ]
 
-function describe(input: ConnectionInput): string {
-  const f = input.fields
-  switch (input.provider) {
-    case 'aws':
-      return '스택 생성 대기 중'
-    case 'gcp':
-      return `프로젝트 ${f.projectId}`
-    case 'azure':
-      return `구독 ${(f.subscriptionId ?? '').slice(0, 8)}…`
-    case 'onprem':
-      return '서버에서 설치 명령 실행 대기'
-  }
-}
+const describe = (input: ConnectionInput) =>
+  input.provider === 'aws' ? '스택 생성 대기 중' : '서버에서 설치 명령 실행 대기'
 
 // 온프레미스: 설치 명령을 낸 시각. mock은 6초 뒤 서버가 보고한 것으로 처리
 const installIssuedAt = new Map<string, number>()
@@ -189,7 +77,6 @@ export async function listConnections(): Promise<Connection[]> {
 }
 
 export async function saveConnection(input: ConnectionInput): Promise<Connection> {
-  requireAdmin()
   await wait(900)
   const prev = connections.find((c) => c.id === input.id)
   // 이미 연결된 걸 수정(이름 변경 등)할 때는 연결 상태 그대로
@@ -240,7 +127,6 @@ export async function checkConnection(id: string): Promise<Connection> {
 }
 
 export async function deleteConnection(id: string): Promise<void> {
-  requireAdmin()
   await wait(200)
   connections = connections.filter((c) => c.id !== id)
 }
@@ -293,24 +179,42 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
     })),
   }))
 
-  const tier: TierKey = scale.expectedUsers === '~100' ? 'lean' : scale.expectedUsers === '~1,000' ? 'balanced' : 'roomy'
-  // 큰 규모는 서버 한 대(온프레미스)에 몰지 않음. 나머지 중 가장 싼 곳
-  const candidates = options.filter((o) => tier !== 'roomy' || o.provider !== 'onprem')
-  const best = [...candidates].sort(
-    (a, b) => total(findTier(a.provider, tier).resources) - total(findTier(b.provider, tier).resources),
-  )[0]
+  const budget = scale.monthlyBudgetUsd
+  const wanted: TierKey = scale.expectedUsers === '~100' ? 'lean' : scale.expectedUsers === '~1,000' ? 'balanced' : 'roomy'
+  const cost = (p: Provider, t: TierKey) => total(findTier(p, t).resources)
 
+  // 규모에 맞는 크기부터 예산 안에서 가장 싼 곳을 찾고, 없으면 한 단계씩 작은 크기로 다시 추천
+  // 큰 규모는 서버 한 대(온프레미스)에 몰지 않음
+  const order: TierKey[] = ['lean', 'balanced', 'roomy']
+  let best: (typeof options)[number] | undefined
+  let tier: TierKey = wanted
+  for (const t of order.slice(0, order.indexOf(wanted) + 1).reverse()) {
+    best = options
+      .filter((o) => (t !== 'roomy' || o.provider !== 'onprem') && cost(o.provider, t) <= budget)
+      .sort((a, b) => cost(a.provider, t) - cost(b.provider, t))[0]
+    tier = t
+    if (best) break
+  }
+
+  const label = (t: TierKey) => findTier('aws', t).label
   const where = best ? `${best.name}(${PROVIDERS[best.provider].label})` : ''
-  const reason = !best
-    ? '연결된 배포 대상이 없습니다.'
-    : best.provider === 'onprem'
-      ? `이미 연결된 ${where}에 올리면 추가 비용 없이 운영할 수 있습니다. 사용자가 늘면 클라우드로 옮기세요.`
-      : `월 사용자 ${scale.expectedUsers}명이면 '${findTier(best.provider, tier).label}' 구성이 맞습니다. 연결된 대상 중 가장 싼 곳은 ${where}입니다.`
+  let reason: string
+  if (options.length === 0) reason = '연결된 배포 대상이 없습니다.'
+  else if (!best) {
+    const cheapest = Math.min(...options.map((o) => cost(o.provider, 'lean')))
+    reason = `월 예산 $${budget} 안에 맞는 구성이 없습니다. 가장 싼 구성도 월 $${cheapest.toFixed(2)}입니다. 예산을 늘리거나 사내 서버를 배포 대상으로 추가해 주세요.`
+  } else {
+    const downgraded = tier !== wanted ? ` 규모로는 '${label(wanted)}'이 맞지만 예산 $${budget}을 넘어서 '${label(tier)}'으로 낮췄습니다.` : ''
+    reason =
+      best.provider === 'onprem'
+        ? `이미 연결된 ${where}에 올리면 추가 비용 없이 운영할 수 있습니다.${downgraded}`
+        : `예산 $${budget} 안에서 '${label(tier)}' 구성이 가장 싼 곳은 ${where}입니다.${downgraded}`
+  }
 
-  const recommended = { connectionId: best?.connectionId ?? '', tier }
+  const recommended = best ? { connectionId: best.connectionId, tier } : null
   // 추천 조합 코드는 추천과 같이 만들어 보냄 → 코드 검토가 바로 뜸
   const bundles: Recommendation['bundles'] = {}
-  if (best) bundles[`${best.connectionId}:${tier}`] = buildBundle(recommended)
+  if (recommended) bundles[`${recommended.connectionId}:${tier}`] = buildBundle(recommended)
 
   return {
     recommended,
@@ -318,7 +222,7 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
     bundles,
     options,
     assumptions: [
-      `월 사용자 ${scale.expectedUsers}명, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
+      `월 사용자 ${scale.expectedUsers}명, 월 예산 $${budget}, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
       '클라우드는 서울 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
       '온프레미스는 전기, 회선 비용을 넣지 않음',
     ],
@@ -344,12 +248,22 @@ function buildBundle(choice: Choice): TerraformBundle {
 }
 
 export async function approve(_projectId: string, choice: Choice): Promise<void> {
-  requireUser()
   await wait(300)
-  // 실패 후 다시 승인하면 AI 수정안이 반영된 것으로 보고 성공시킴
-  if (deployStartedAt) failScenario = false
   deployStartedAt = Date.now()
   deployChoice = choice
+}
+
+export async function applyFix(_projectId: string, choice: Choice): Promise<TerraformBundle> {
+  await wait(1500)
+  // mock: 수정안(Dockerfile --host 0.0.0.0)이 반영돼 다음 배포는 성공
+  failScenario = false
+  return { ...buildBundle(choice), patches: [HOST_PATCH] }
+}
+
+const HOST_PATCH = {
+  file: 'Dockerfile',
+  before: ['CMD ["uvicorn", "app.main:app", "--port", "8000"]'],
+  after: ['CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'],
 }
 
 export async function status(_projectId: string): Promise<DeployStatus> {
@@ -369,11 +283,7 @@ export async function status(_projectId: string): Promise<DeployStatus> {
       diagnosis: {
         cause: '앱이 127.0.0.1에서만 요청을 받고 있어서 컨테이너 바깥에서 접속할 수 없습니다.',
         fix: 'Dockerfile의 실행 명령에 --host 0.0.0.0 을 넣고 같은 계획으로 다시 배포합니다. 인프라는 바뀌지 않습니다.',
-        patch: {
-          file: 'Dockerfile',
-          before: ['CMD ["uvicorn", "app.main:app", "--port", "8000"]'],
-          after: ['CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'],
-        },
+        patch: HOST_PATCH,
       },
     }
   }
@@ -387,11 +297,10 @@ export async function status(_projectId: string): Promise<DeployStatus> {
 export async function history(): Promise<DeployRecord[]> {
   await wait(200)
   return [
-    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.ap-northeast-2.elb.amazonaws.com', approvedBy: 'jinny', createdAt: '2026-10-07 14:12' },
-    { id: 'd5', app: 'club-attendance', version: 'v2', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'failed', note: '헬스체크 실패 → 포트 수정 후 v3', approvedBy: 'totoro', createdAt: '2026-10-07 13:58' },
-    { id: 'd4', app: 'club-attendance', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', approvedBy: 'jinny', createdAt: '2026-10-05 18:03' },
-    { id: 'd3', app: 'todo-api', version: 'v2', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', url: 'http://192.168.0.24:8080', approvedBy: 'minsu', createdAt: '2026-10-04 11:30' },
-    { id: 'd2', app: 'todo-api', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'failed', note: 'requirements.txt 누락', approvedBy: 'minsu', createdAt: '2026-10-04 11:02' },
-    { id: 'd1', app: 'portfolio', version: 'v1', tier: '권장', provider: 'gcp', target: '학교 GCP 크레딧', monthlyUsd: 17.62, status: 'success', url: 'https://portfolio-8xk2-du.a.run.app', approvedBy: 'jinny', createdAt: '2026-09-28 20:15' },
+    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.ap-northeast-2.elb.amazonaws.com', createdAt: '2026-10-07 14:12' },
+    { id: 'd5', app: 'club-attendance', version: 'v2', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'failed', note: '헬스체크 실패 → 포트 수정 후 v3', createdAt: '2026-10-07 13:58' },
+    { id: 'd4', app: 'club-attendance', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', createdAt: '2026-10-05 18:03' },
+    { id: 'd3', app: 'todo-api', version: 'v2', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', url: 'http://192.168.0.24:8080', createdAt: '2026-10-04 11:30' },
+    { id: 'd2', app: 'todo-api', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'failed', note: 'requirements.txt 누락', createdAt: '2026-10-04 11:02' },
   ]
 }
