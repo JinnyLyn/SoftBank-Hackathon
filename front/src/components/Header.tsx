@@ -29,7 +29,7 @@ interface Props {
 }
 
 export default function Header({ page, onChange, connections, user, onLogout }: Props) {
-  const broken = connections.filter((c) => c.status === 'error').length
+  const broken = connections.filter((c) => c.status !== 'connected').length
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 

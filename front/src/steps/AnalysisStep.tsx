@@ -3,17 +3,28 @@ import { PROVIDERS } from '../providers'
 import { costText, tierTotal, usd } from '../format'
 import type { Analysis, Choice, Recommendation, TierKey } from '../types'
 
+export type CodeState = 'idle' | 'loading' | 'ready' | 'error'
+
+const CODE_TEXT: Record<CodeState, string> = {
+  idle: '',
+  loading: '배포 코드 만드는 중',
+  ready: '배포 코드 준비됨',
+  error: '배포 코드 생성 실패',
+}
+
 interface Props {
   analysis: Analysis
   rec: Recommendation
   choice: Choice
+  codeState: CodeState
+  codeError?: string
   locked: boolean
   onChoice: (c: Choice) => void
 }
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
-export default function AnalysisStep({ analysis, rec, choice, locked, onChoice }: Props) {
+export default function AnalysisStep({ analysis, rec, choice, codeState, codeError, locked, onChoice }: Props) {
   const option = rec.options.find((o) => o.connectionId === choice.connectionId)
   const selected = option?.tiers.find((t) => t.key === choice.tier)
   const isRec = (id: string, t: TierKey) => rec.recommended.connectionId === id && rec.recommended.tier === t
@@ -121,6 +132,11 @@ export default function AnalysisStep({ analysis, rec, choice, locked, onChoice }
           <div className="tier-detail">
             <h4>
               <ProviderMark provider={option.provider} /> {option.name} · {selected.label} — {selected.headline}
+              {codeState !== 'idle' && (
+                <span className={'code-state is-' + codeState} title={codeError}>
+                  {CODE_TEXT[codeState]}
+                </span>
+              )}
             </h4>
             <table className="table">
               <thead>

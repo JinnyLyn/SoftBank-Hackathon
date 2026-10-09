@@ -1,6 +1,7 @@
 # Paved Clouds front
 
-소스(zip 또는 GitHub public 저장소) → 사용 규모 입력 → AI 분석과 구성 추천 → 코드 검토·승인 → 배포.
+소스(zip 또는 GitHub public 저장소)와 사용 규모를 한 화면에서 받음 → 분석·구성 추천·추천 조합 코드까지 미리 생성 → 코드 검토·승인 → 배포.
+코드 검토 단계에서는 AI를 돌리지 않고 앞에서 만든 결과를 바로 보여 줌. 추천과 다른 칸을 고르면 고르는 순간 뒤에서 그 조합 코드를 만듦.
 
 배포 대상은 벤더 중립. AWS, Google Cloud, Azure, 온프레미스(SSH + Docker)를 등록해 두면
 분석할 때 연결된 모든 대상 × 구성 크기(작게 시작 / 권장 / 여유 있게)의 비용을 한 표로 비교하고 AI가 하나를 추천함.
@@ -28,8 +29,10 @@ npm run build
 | --- | --- |
 | 배포 대상 목록 / 추가 / 수정 / 삭제 | `GET /api/connections`, `POST /api/connections`, `PUT /api/connections/:id`, `DELETE /api/connections/:id` |
 | 연결 다시 확인 | `POST /api/connections/:id/check` → `Connection` |
+| (AWS) 연결 방식 | 저장하면 `status: "pending"` + `setupUrl`(CloudFormation 빠른 생성 주소)을 돌려줌. 사용자가 콘솔에서 스택을 만들면 `check` 에서 `connected` 와 계정 ID로 바뀜. Role ARN, 리전 입력 없음 |
+| (온프레미스) 연결 방식 | 이름만 받아 저장하면 `status: "pending"` + `installCommand`(일회용 토큰이 든 설치 명령 한 줄) + `expiresAt`(10분)을 돌려줌. 사용자가 서버에서 실행하면 스크립트가 Docker 설치, `deploy` 사용자 생성, 공개 키 등록 후 서버 사양을 보고함 → 화면이 3초마다 `check` 해서 `connected` 로 바뀜. 만료되면 같은 id로 다시 저장해 새 명령 발급. 스크립트 내용은 `src/providers.ts` 의 `INSTALL_SCRIPT_PREVIEW` |
 | 분석 | `POST /api/projects` (multipart: `file` 또는 `repo_url`+`branch`, `expected_users`, `traffic_pattern`, `purpose`) → `Analysis` |
-| 구성 추천 | `POST /api/projects/:id/recommend` → `Recommendation` (연결된 대상별 `options`, 추천 `{connectionId, tier}`) |
+| 구성 추천 | `POST /api/projects/:id/recommend` → `Recommendation` (연결된 대상별 `options`, 추천 `{connectionId, tier}`, 미리 만든 코드 `bundles["connectionId:tier"]` — 최소한 추천 조합은 포함) |
 | 코드 생성 | `POST /api/projects/:id/code` (`{ connectionId, tier }`) → `TerraformBundle` (클라우드는 terraform, 온프레미스는 compose) |
 | 승인 | `POST /api/projects/:id/deploy` (`{ connectionId, tier }`) |
 | 진행 상태 | `GET /api/projects/:id/status` → `DeployStatus` (로그, URL, 실패 시 진단) — 0.7초 간격 폴링 |

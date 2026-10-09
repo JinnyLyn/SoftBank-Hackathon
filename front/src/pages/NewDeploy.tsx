@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
 import ScaleStep from '../steps/ScaleStep'
-import AnalysisStep from '../steps/AnalysisStep'
+import AnalysisStep, { type CodeState } from '../steps/AnalysisStep'
 import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
 import { costText, tierTotal } from '../format'
@@ -20,18 +20,22 @@ import type {
 } from '../types'
 
 const STEPS = [
-  { label: '소스', title: '소스 가져오기', desc: 'zip 파일을 올리거나 GitHub public 저장소 주소를 넣으세요.' },
-  { label: '사용 규모', title: '사용 규모', desc: '대략적인 값이면 됩니다. 서버 크기와 비용을 고르는 데만 씁니다.' },
+  {
+    label: '소스와 규모',
+    title: '소스와 사용 규모',
+    desc: '코드와 대략적인 사용 규모를 한 번에 받습니다. 분석, 구성 추천, 배포 코드까지 여기서 미리 만들어 둡니다.',
+  },
   { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과, 연결된 배포 대상별 구성과 비용을 나란히 비교합니다.' },
-  { label: '코드 검토', title: '코드 검토', desc: 'AI가 만든 코드와 변경 계획입니다. 승인하기 전에는 아무것도 만들지 않습니다.' },
+  { label: '코드 검토', title: '코드 검토', desc: '미리 만들어 둔 코드와 변경 계획입니다. 승인하기 전에는 아무것도 만들지 않습니다.' },
   { label: '배포', title: '배포', desc: '이미지를 빌드해 배포하고 헬스체크까지 확인합니다.' },
 ]
 
 const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '' }
 
-type Busy = null | 'analyze' | 'generate' | 'approve'
+type Busy = null | 'analyze' | 'approve'
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
+const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
 
 interface Props {
   connections: Connection[]
@@ -47,38 +51,80 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [rec, setRec] = useState<Recommendation | null>(null)
   const [choice, setChoiceState] = useState<Choice | null>(null)
-  const [bundle, setBundle] = useState<TerraformBundle | null>(null)
+  // 조합별로 만들어 둔 코드. 다른 칸을 눌렀다 돌아와도 다시 만들지 않음
+  const [bundles, setBundles] = useState<Record<string, TerraformBundle>>({})
+  const [codeErrors, setCodeErrors] = useState<Record<string, string>>({})
+  const [inflight, setInflight] = useState<Set<string>>(new Set())
   const [confirmed, setConfirmed] = useState(false)
   const [approved, setApproved] = useState(false)
   const [deploy, setDeploy] = useState<DeployStatus | null>(null)
   const [runId, setRunId] = useState(0)
   const [busy, setBusy] = useState<Busy>(null)
   const [error, setError] = useState<string | null>(null)
+  // 분석을 새로 하면 이전 분석의 늦게 도착한 코드 응답은 버림
+  const projectRef = useRef<string | null>(null)
 
-  // 앞 단계 입력이 바뀌면 뒤 단계 결과는 버림
-  const clearFrom = (level: 'analysis' | 'bundle') => {
-    if (level === 'analysis') {
-      setAnalysis(null)
-      setRec(null)
-      setChoiceState(null)
-    }
-    setBundle(null)
+  const resetResults = () => {
+    projectRef.current = null
+    setAnalysis(null)
+    setRec(null)
+    setChoiceState(null)
+    setBundles({})
+    setCodeErrors({})
+    setInflight(new Set())
     setConfirmed(false)
   }
   const setSource = (s: Source | null) => {
     setSourceState(s)
-    clearFrom('analysis')
+    resetResults()
   }
   const setScale = (s: ScaleInput) => {
     setScaleState(s)
-    if (analysis) clearFrom('analysis')
-  }
-  const setChoice = (c: Choice) => {
-    setChoiceState(c)
-    clearFrom('bundle')
+    if (analysis) resetResults()
   }
 
-  const reached = approved ? 4 : bundle ? 3 : analysis && rec && choice ? 2 : source ? 1 : 0
+  const prefetch = (projectId: string, c: Choice) => {
+    const key = keyOf(c)
+    if (bundles[key] || inflight.has(key)) return
+    setInflight((s) => new Set(s).add(key))
+    setCodeErrors(({ [key]: _, ...rest }) => rest)
+    api
+      .generate(projectId, c)
+      .then((b) => {
+        if (projectRef.current === projectId) setBundles((m) => ({ ...m, [key]: b }))
+      })
+      .catch((e) => {
+        if (projectRef.current === projectId) setCodeErrors((m) => ({ ...m, [key]: errMsg(e) }))
+      })
+      .finally(() =>
+        setInflight((s) => {
+          const n = new Set(s)
+          n.delete(key)
+          return n
+        }),
+      )
+  }
+
+  const setChoice = (c: Choice) => {
+    setChoiceState(c)
+    setConfirmed(false)
+    // 고르는 순간 뒤에서 코드 생성 시작 → 코드 검토로 넘어갈 때는 대부분 준비돼 있음
+    if (analysis) prefetch(analysis.projectId, c)
+  }
+
+  const key = choice ? keyOf(choice) : null
+  const bundle = key ? bundles[key] ?? null : null
+  const codeState: CodeState = !key
+    ? 'idle'
+    : bundle
+      ? 'ready'
+      : inflight.has(key)
+        ? 'loading'
+        : codeErrors[key]
+          ? 'error'
+          : 'idle'
+
+  const reached = approved ? 3 : bundle ? 2 : analysis && rec && choice ? 1 : 0
   const locked = approved
 
   const option = rec?.options.find((o) => o.connectionId === choice?.connectionId) ?? null
@@ -120,24 +166,24 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
     }
   }
 
+  // 분석 → 추천(+추천 조합 코드)을 한 번에
   const analyze = () =>
     run('analyze', async () => {
       if (!source) return
       if (!analysis || !rec) {
         const a = await api.analyze(source, scale)
         const r = await api.recommend(a.projectId, scale)
+        projectRef.current = a.projectId
         setAnalysis(a)
         setRec(r)
-        setChoiceState(r.options.length ? r.recommended : null)
+        setBundles(r.bundles ?? {})
+        if (r.options.length) {
+          setChoiceState(r.recommended)
+          // 백엔드가 추천 조합 코드를 안 보냈으면 바로 요청
+          if (!r.bundles?.[keyOf(r.recommended)]) prefetch(a.projectId, r.recommended)
+        }
       }
-      setStep(2)
-    })
-
-  const generate = () =>
-    run('generate', async () => {
-      if (!analysis || !choice) return
-      if (!bundle) setBundle(await api.generate(analysis.projectId, choice))
-      setStep(3)
+      setStep(1)
     })
 
   const approve = () =>
@@ -146,7 +192,7 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
       await api.approve(analysis.projectId, choice)
       setApproved(true)
       setDeploy(null)
-      setStep(4)
+      setStep(3)
       setRunId((n) => n + 1)
     })
 
@@ -161,7 +207,7 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
     setStep(0)
     setSourceState(null)
     setScaleState(DEFAULT_SCALE)
-    clearFrom('analysis')
+    resetResults()
     setApproved(false)
     setDeploy(null)
     setError(null)
@@ -169,16 +215,16 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
 
   const railItems: RailItem[] = STEPS.map((s, i) => {
     let sub: string | undefined
-    if (i === 0 && source) sub = sourceName(source)
-    if (i === 1 && source) sub = `월 ${scale.expectedUsers}명`
-    if (i === 2 && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
-    if (i === 3 && bundle) sub = `${bundle.plan.add}개 추가`
-    if (i === 4 && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
+    if (i === 0 && source) sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명`
+    if (i === 1 && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
+    if (i === 2 && bundle) sub = `${bundle.plan.add}개 추가`
+    if (i === 2 && !bundle && codeState === 'loading') sub = '코드 준비 중'
+    if (i === 3 && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
 
     let state: RailItem['state'] = 'todo'
-    if (i === 4 && deploy?.state === 'failed') state = 'failed'
+    if (i === 3 && deploy?.state === 'failed') state = 'failed'
     else if (i === step) state = 'current'
-    else if (i < reached || (i === 4 && deploy?.state === 'success')) state = 'done'
+    else if (i < reached || (i === 3 && deploy?.state === 'success')) state = 'done'
 
     return { label: s.label, sub, state, enabled: i <= reached && busy === null }
   })
@@ -186,23 +232,26 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
   const meta = STEPS[step]
 
   let next: { label: string; onClick: () => void; disabled?: boolean } | null = null
-  if (step === 0) next = { label: '다음', onClick: () => setStep(1), disabled: !source }
-  if (step === 1)
+  if (step === 0)
     next = {
-      label: busy === 'analyze' ? '코드 읽는 중…' : analysis ? '다음' : '분석하고 구성 추천받기',
+      label: busy === 'analyze' ? '분석하고 코드 준비 중…' : analysis ? '다음' : '분석 시작',
       onClick: analyze,
-      disabled: !analysis && usable.length === 0,
+      disabled: !source || (!analysis && usable.length === 0),
     }
+  if (step === 1 && !locked) {
+    if (codeState === 'error' && analysis && choice)
+      next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
+    else
+      next = {
+        label: codeState === 'loading' ? '코드 준비 중…' : '코드 검토',
+        onClick: () => setStep(2),
+        disabled: codeState !== 'ready',
+      }
+  }
+  if (step === 1 && locked) next = { label: '다음', onClick: () => setStep(2) }
   if (step === 2 && !locked)
-    next = {
-      label: busy === 'generate' ? '코드 작성 중…' : bundle ? '다음' : '배포 코드 만들기',
-      onClick: generate,
-      disabled: !choice,
-    }
-  if (step === 2 && locked) next = { label: '다음', onClick: () => setStep(3) }
-  if (step === 3 && !locked)
     next = { label: busy === 'approve' ? '승인 처리 중…' : '승인하고 배포', onClick: approve, disabled: !confirmed }
-  if (step === 3 && locked) next = { label: '배포 화면으로', onClick: () => setStep(4) }
+  if (step === 2 && locked) next = { label: '배포 화면으로', onClick: () => setStep(3) }
 
   return (
     <div className="deploy-layout">
@@ -238,21 +287,38 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
         )}
 
         <div className="panel-body">
-          {step === 0 && <SourceStep source={source} locked={locked} onSource={setSource} />}
-          {step === 1 && (
-            <ScaleStep
-              scale={scale}
-              locked={locked || busy === 'analyze'}
-              connections={connections}
-              onChange={setScale}
-              onShowConnections={onShowConnections}
+          {step === 0 && (
+            <div className="stack-lg">
+              <section>
+                <h3 className="sub-title">소스</h3>
+                <SourceStep source={source} locked={locked || busy === 'analyze'} onSource={setSource} />
+              </section>
+              <section>
+                <h3 className="sub-title">사용 규모</h3>
+                <ScaleStep
+                  scale={scale}
+                  locked={locked || busy === 'analyze'}
+                  connections={connections}
+                  onChange={setScale}
+                  onShowConnections={onShowConnections}
+                />
+              </section>
+            </div>
+          )}
+          {step === 1 && analysis && rec && choice && (
+            <AnalysisStep
+              analysis={analysis}
+              rec={rec}
+              choice={choice}
+              codeState={codeState}
+              codeError={key ? codeErrors[key] : undefined}
+              locked={locked || busy !== null}
+              onChoice={setChoice}
             />
           )}
-          {step === 2 && analysis && rec && choice && (
-            <AnalysisStep analysis={analysis} rec={rec} choice={choice} locked={locked || busy !== null} onChoice={setChoice} />
-          )}
-          {step === 3 && bundle && option && selectedTier && (
+          {step === 2 && bundle && option && selectedTier && (
             <ReviewStep
+              key={key}
               bundle={bundle}
               tier={selectedTier}
               target={option}
@@ -262,7 +328,7 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
               onConfirm={setConfirmed}
             />
           )}
-          {step === 4 && (
+          {step === 3 && (
             <DeployStep
               status={deploy}
               targetName={option?.name ?? ''}
@@ -274,7 +340,7 @@ export default function NewDeploy({ connections, userName, onShowHistory, onShow
           )}
         </div>
 
-        {step < 4 && (
+        {step < 3 && (
           <footer className="panel-foot">
             {step > 0 ? (
               <button className="btn btn-ghost" onClick={() => setStep(step - 1)} disabled={busy !== null}>

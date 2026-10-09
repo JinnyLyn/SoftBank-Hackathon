@@ -1,7 +1,9 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { api } from '../api'
+import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
-import { EXTERNAL_ID, PROVIDER_ORDER, PROVIDERS, PUBLIC_KEY } from '../providers'
+import InstallCommand from '../components/InstallCommand'
+import { EXTERNAL_ID, PROVIDER_ORDER, PROVIDERS } from '../providers'
 import type { Connection, Provider } from '../types'
 
 interface Draft {
@@ -19,6 +21,9 @@ const emptyDraft = (provider: Provider, count: number): Draft => ({
   ),
 })
 
+// 백엔드가 준 콘솔 주소가 진짜 벤더 콘솔인지 확인한 뒤에만 링크로 보여 줌
+const CONSOLE_HOSTS = ['console.aws.amazon.com', 'console.cloud.google.com', 'portal.azure.com']
+
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 interface Props {
@@ -34,7 +39,14 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
   const [saving, setSaving] = useState(false)
   const [checking, setChecking] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [copied, setCopied] = useState(false)
+  // 설치 명령 화면을 띄울 온프레미스 연결
+  const [installFor, setInstallFor] = useState<string | null>(null)
+  // 폴링 콜백이 오래된 목록을 덮어쓰지 않도록 항상 최신 목록을 봄
+  const listRef = useRef(list)
+  listRef.current = list
+  const replace = (c: Connection) => onChange(listRef.current.map((x) => (x.id === c.id ? c : x)))
+
+  const installConn = list.find((c) => c.id === installFor) ?? null
 
   const meta = PROVIDERS[draft.provider]
   const sameKind = list.filter((c) => c.provider === draft.provider).length
@@ -50,6 +62,7 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
       const saved = await api.saveConnection(draft)
       onChange(draft.id ? list.map((c) => (c.id === saved.id ? saved : c)) : [...list, saved])
       pickProvider(draft.provider)
+      if (saved.provider === 'onprem' && saved.status === 'pending') setInstallFor(saved.id)
     } catch (e) {
       setError(errMsg(e))
     } finally {
@@ -60,8 +73,7 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
   const check = async (id: string) => {
     setChecking(id)
     try {
-      const c = await api.checkConnection(id)
-      onChange(list.map((x) => (x.id === id ? c : x)))
+      replace(await api.checkConnection(id))
     } catch (e) {
       setError(errMsg(e))
     } finally {
@@ -80,13 +92,17 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
     }
   }
 
-  const copyKey = async () => {
+  const pollInstall = async (id: string) => {
+    const c = await api.checkConnection(id)
+    replace(c)
+    return c
+  }
+
+  const reissueInstall = async (c: Connection) => {
     try {
-      await navigator.clipboard.writeText(PUBLIC_KEY)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // 클립보드 권한이 없으면 사용자가 직접 복사
+      replace(await api.saveConnection({ id: c.id, provider: c.provider, name: c.name, fields: c.fields }))
+    } catch (e) {
+      setError(errMsg(e))
     }
   }
 
@@ -97,7 +113,7 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
           <h1>배포 대상</h1>
           <p>
             어디든 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. 클라우드는 키 대신 권한 위임으로,
-            서버는 SSH로 연결합니다.
+            사내 서버는 설치 명령 한 줄로 연결합니다.
           </p>
         </div>
       </div>
@@ -119,16 +135,38 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
           )}
           <ul className="conn-list">
             {list.map((c) => (
-              <li key={c.id} className={draft.id === c.id ? 'is-editing' : ''}>
+              <li key={c.id} className={draft.id === c.id || installFor === c.id ? 'is-editing' : ''}>
                 <ProviderMark provider={c.provider} />
                 <div className="conn-main">
                   <strong>{c.name}</strong>
                   <span className="mono small muted">{c.detail}</span>
                   {c.status === 'error' && <span className="conn-error">{c.error}</span>}
+                  {c.status === 'pending' && c.provider === 'onprem' && (
+                    <span className="conn-pending">
+                      서버에서 설치 명령을 실행하면 자동으로 연결됩니다.{' '}
+                      {canEdit && (
+                        <button className="link-btn" onClick={() => setInstallFor(c.id)}>
+                          명령 보기
+                        </button>
+                      )}
+                    </span>
+                  )}
+                  {c.status === 'pending' && c.provider !== 'onprem' && (
+                    <span className="conn-pending">
+                      {c.setupUrl && isSafeRedirect(c.setupUrl, CONSOLE_HOSTS) ? (
+                        <a href={c.setupUrl} target="_blank" rel="noreferrer noopener">
+                          콘솔에서 연결 스택 만들기
+                        </a>
+                      ) : (
+                        '콘솔 주소를 받지 못했습니다. 다시 저장해 주세요.'
+                      )}{' '}
+                      → 끝나면 "다시 확인"
+                    </span>
+                  )}
                 </div>
                 <div className="conn-side">
                   <span className={'conn-status is-' + c.status}>
-                    {c.status === 'connected' ? '연결됨' : '확인 필요'}
+                    {{ connected: '연결됨', pending: '연결 대기', error: '확인 필요' }[c.status]}
                   </span>
                   <span className="small muted">{c.checkedAt.slice(5)} 확인</span>
                 </div>
@@ -155,7 +193,30 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
           </ul>
         </section>
 
-        {canEdit && (
+        {canEdit && installConn && (
+          <section className="panel conn-form">
+            <header className="list-head">
+              <h2>'{installConn.name}' 서버 연결</h2>
+              <button className="link-btn" onClick={() => setInstallFor(null)}>
+                닫기
+              </button>
+            </header>
+            <div className="panel-body">
+              <InstallCommand
+                key={installConn.id}
+                conn={installConn}
+                onCheck={() => pollInstall(installConn.id)}
+                onReissue={() => reissueInstall(installConn)}
+                onClose={() => {
+                  setInstallFor(null)
+                  pickProvider('onprem')
+                }}
+              />
+            </div>
+          </section>
+        )}
+
+        {canEdit && !installConn && (
         <section className="panel conn-form">
           <header className="list-head">
             <h2>{draft.id ? `'${draft.name}' 수정` : '새 배포 대상'}</h2>
@@ -182,9 +243,10 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
               ))}
             </div>
 
+            {meta.howto.length > 0 && (
             <ol className="howto">
               {meta.howto.map((h) => {
-                const [text, extra] = h.split('\n')
+                const text = h
                 return (
                   <li key={h}>
                     {text.split('{externalId}').map((part, i) =>
@@ -195,18 +257,18 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
                         </span>
                       ),
                     )}
-                    {extra === '{publicKey}' && (
-                      <div className="key-box">
-                        <code>{PUBLIC_KEY}</code>
-                        <button className="link-btn" onClick={copyKey}>
-                          {copied ? '복사됨' : '복사'}
-                        </button>
-                      </div>
-                    )}
                   </li>
                 )
               })}
             </ol>
+            )}
+
+            {draft.provider === 'onprem' && !draft.id && (
+              <p className="install-intro">
+                이름만 정하고 <strong>설치 명령 만들기</strong>를 누르세요. 서버에서 실행할 명령 한 줄이 나옵니다. Docker가
+                없어도 알아서 설치합니다.
+              </p>
+            )}
 
             <div className="form-grid">
               <div className="field span-2">
@@ -256,7 +318,15 @@ export default function Connections({ connections, canEdit, onChange }: Props) {
           <footer className="panel-foot">
             <span className="hint">{sameKind > 0 && !draft.id ? `${meta.label} 대상이 이미 ${sameKind}곳 있습니다.` : ''}</span>
             <button className="btn btn-primary" onClick={save} disabled={!valid || saving}>
-              {saving ? '연결 확인 중…' : '연결 확인하고 저장'}
+              {saving
+                ? '저장 중…'
+                : draft.id
+                  ? '저장'
+                  : draft.provider === 'aws'
+                    ? '저장하고 콘솔 링크 받기'
+                    : draft.provider === 'onprem'
+                      ? '설치 명령 만들기'
+                      : '연결 확인하고 저장'}
             </button>
           </footer>
         </section>

@@ -4,10 +4,17 @@ export interface Connection {
   id: string
   provider: Provider
   name: string
-  status: 'connected' | 'error'
+  /** pending: 사용자가 벤더 콘솔에서 연결 작업을 마치길 기다리는 중 */
+  status: 'connected' | 'pending' | 'error'
   /** 목록에 보여 줄 한 줄 요약 (계정, 리전, 호스트 등) */
   detail: string
   error?: string
+  /** pending일 때 사용자가 열어야 할 벤더 콘솔 주소 (예: AWS CloudFormation 빠른 생성) */
+  setupUrl?: string
+  /** (온프레미스) pending일 때 서버에서 실행할 설치 명령. 일회용 토큰이 들어 있음 */
+  installCommand?: string
+  /** installCommand 만료 시각 (ISO) */
+  expiresAt?: string
   checkedAt: string
   /** 폼에 입력한 원본 값. 비밀 값은 서버가 돌려주지 않음 */
   fields: Record<string, string>
@@ -88,6 +95,11 @@ export interface Recommendation {
   reason: string
   options: TargetOption[]
   assumptions: string[]
+  /**
+   * 백엔드가 미리 만들어 둔 배포 코드. 키는 `${connectionId}:${tier}`.
+   * 최소한 추천 조합은 들어 있어야 코드 검토 화면이 바로 뜸
+   */
+  bundles?: Record<string, TerraformBundle>
 }
 
 export interface TerraformBundle {

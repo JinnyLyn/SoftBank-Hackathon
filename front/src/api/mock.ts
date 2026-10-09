@@ -127,9 +127,9 @@ let connections: Connection[] = [
     provider: 'aws',
     name: '개인 AWS',
     status: 'connected',
-    detail: '123456789012 · ap-northeast-2',
+    detail: '계정 123456789012',
     checkedAt: '2026-10-07 13:40',
-    fields: { roleArn: 'arn:aws:iam::123456789012:role/paved-clouds', region: 'ap-northeast-2', budget: '30' },
+    fields: { budget: '30' },
   },
   {
     id: 'c2',
@@ -145,10 +145,10 @@ let connections: Connection[] = [
     provider: 'gcp',
     name: '학교 GCP 크레딧',
     status: 'error',
-    detail: 'paved-demo-4412 · asia-northeast3',
+    detail: '프로젝트 paved-demo-4412',
     error: '서비스 계정에 Cloud Run 관리자 권한이 없습니다.',
     checkedAt: '2026-10-07 13:45',
-    fields: { projectId: 'paved-demo-4412', serviceAccount: 'paved@paved-demo-4412.iam.gserviceaccount.com', region: 'asia-northeast3', budget: '50' },
+    fields: { projectId: 'paved-demo-4412', serviceAccount: 'paved@paved-demo-4412.iam.gserviceaccount.com', budget: '50' },
   },
 ]
 
@@ -156,15 +156,32 @@ function describe(input: ConnectionInput): string {
   const f = input.fields
   switch (input.provider) {
     case 'aws':
-      return `${f.roleArn?.split(':')[4] || '계정 확인 중'} · ${f.region}`
+      return '스택 생성 대기 중'
     case 'gcp':
-      return `${f.projectId} · ${f.region}`
+      return `프로젝트 ${f.projectId}`
     case 'azure':
-      return `${(f.subscriptionId ?? '').slice(0, 8)}… · ${f.region}`
+      return `구독 ${(f.subscriptionId ?? '').slice(0, 8)}…`
     case 'onprem':
-      return `${f.user}@${f.host} · 4 vCPU / 8GB · Docker 27.1`
+      return '서버에서 설치 명령 실행 대기'
   }
 }
+
+// 온프레미스: 설치 명령을 낸 시각. mock은 6초 뒤 서버가 보고한 것으로 처리
+const installIssuedAt = new Map<string, number>()
+const INSTALL_TTL_MS = 10 * 60 * 1000
+
+function issueInstall(id: string) {
+  installIssuedAt.set(id, Date.now())
+  const token = 'pc_' + Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, '0')).join('')
+  return {
+    installCommand: `curl -fsSL https://pavedclouds.dev/install.sh | sudo sh -s -- --token ${token}`,
+    expiresAt: new Date(Date.now() + INSTALL_TTL_MS).toISOString(),
+  }
+}
+
+const AWS_STACK_URL =
+  'https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate' +
+  '?stackName=paved-clouds&templateURL=https://pavedclouds-public.s3.amazonaws.com/connect.yaml&param_ExternalId=pc-7f3a91'
 
 export async function listConnections(): Promise<Connection[]> {
   await wait(150)
@@ -174,12 +191,24 @@ export async function listConnections(): Promise<Connection[]> {
 export async function saveConnection(input: ConnectionInput): Promise<Connection> {
   requireAdmin()
   await wait(900)
+  const prev = connections.find((c) => c.id === input.id)
+  // 이미 연결된 걸 수정(이름 변경 등)할 때는 연결 상태 그대로
+  if (prev?.status === 'connected') {
+    const conn = { ...prev, name: input.name, fields: { ...prev.fields, ...input.fields } }
+    connections = connections.map((c) => (c.id === conn.id ? conn : c))
+    return conn
+  }
+  // AWS는 콘솔에서 스택 생성, 온프레미스는 서버에서 설치 명령 실행을 기다림
+  const waits = input.provider === 'aws' || input.provider === 'onprem'
+  const id = input.id ?? 'c' + Date.now()
   const conn: Connection = {
-    id: input.id ?? 'c' + Date.now(),
+    id,
     provider: input.provider,
     name: input.name,
-    status: 'connected',
+    status: waits ? 'pending' : 'connected',
     detail: describe(input),
+    setupUrl: input.provider === 'aws' ? AWS_STACK_URL : undefined,
+    ...(input.provider === 'onprem' ? issueInstall(id) : {}),
     checkedAt: now(),
     fields: input.fields,
   }
@@ -190,7 +219,22 @@ export async function saveConnection(input: ConnectionInput): Promise<Connection
 export async function checkConnection(id: string): Promise<Connection> {
   await wait(800)
   const c = connections.find((x) => x.id === id)!
-  const next = { ...c, checkedAt: now() }
+  let next: Connection = { ...c, checkedAt: now() }
+  if (c.status === 'pending' && c.provider === 'aws') {
+    // mock: 스택을 만들었다고 보고 연결 완료 처리
+    next = { ...next, status: 'connected', detail: '계정 ' + String(100000000000 + Math.floor(Math.random() * 9e11)), setupUrl: undefined }
+  }
+  if (c.status === 'pending' && c.provider === 'onprem' && Date.now() - (installIssuedAt.get(id) ?? Date.now()) > 6000) {
+    // mock: 설치 스크립트가 서버 사양을 보고했다고 처리
+    next = {
+      ...next,
+      status: 'connected',
+      detail: 'deploy@192.168.0.31 · 4 vCPU / 8GB · Docker 27.3',
+      installCommand: undefined,
+      expiresAt: undefined,
+      fields: { ...c.fields, host: '192.168.0.31', user: 'deploy', vcpu: '4', memoryGb: '8' },
+    }
+  }
   connections = connections.map((x) => (x.id === id ? next : x))
   return next
 }
@@ -263,13 +307,19 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
       ? `이미 연결된 ${where}에 올리면 추가 비용 없이 운영할 수 있습니다. 사용자가 늘면 클라우드로 옮기세요.`
       : `월 사용자 ${scale.expectedUsers}명이면 '${findTier(best.provider, tier).label}' 구성이 맞습니다. 연결된 대상 중 가장 싼 곳은 ${where}입니다.`
 
+  const recommended = { connectionId: best?.connectionId ?? '', tier }
+  // 추천 조합 코드는 추천과 같이 만들어 보냄 → 코드 검토가 바로 뜸
+  const bundles: Recommendation['bundles'] = {}
+  if (best) bundles[`${best.connectionId}:${tier}`] = buildBundle(recommended)
+
   return {
-    recommended: { connectionId: best?.connectionId ?? '', tier },
+    recommended,
     reason,
+    bundles,
     options,
     assumptions: [
       `월 사용자 ${scale.expectedUsers}명, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
-      '클라우드는 각 대상의 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
+      '클라우드는 서울 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
       '온프레미스는 전기, 회선 비용을 넣지 않음',
     ],
   }
@@ -278,7 +328,11 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
 // ---------- 코드 생성, 배포 ----------
 
 export async function generate(_projectId: string, choice: Choice): Promise<TerraformBundle> {
-  await wait(1100)
+  await wait(1600)
+  return buildBundle(choice)
+}
+
+function buildBundle(choice: Choice): TerraformBundle {
   const conn = connections.find((c) => c.id === choice.connectionId)!
   const tier = findTier(conn.provider, choice.tier)
   const n = tier.resources.length
