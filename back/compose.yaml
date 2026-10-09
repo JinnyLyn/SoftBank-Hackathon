@@ -1,0 +1,43 @@
+services:
+  api:
+    build: .
+    environment:
+      DATABASE_URL: mysql://paved:paved-dev-only@db:3306/paved_clouds
+      UPLOAD_DIR: /var/lib/paved-clouds/uploads
+      PLAN_ARTIFACT_DIR: /var/lib/paved-clouds/plans
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      AWS_CONNECTION_TEMPLATE_URL: ${AWS_CONNECTION_TEMPLATE_URL:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - uploads:/var/lib/paved-clouds/uploads
+      - plan_artifacts:/var/lib/paved-clouds/plans
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.4.11
+    environment:
+      MYSQL_DATABASE: paved_clouds
+      MYSQL_USER: paved
+      MYSQL_PASSWORD: paved-dev-only
+      MYSQL_ROOT_PASSWORD: root-dev-only
+    command: ["mysqld", "--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  mysql_data:
+  uploads:
+  plan_artifacts:
