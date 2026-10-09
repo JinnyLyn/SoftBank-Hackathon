@@ -52,12 +52,12 @@ async function modeCheck() {
   assert.deepEqual(errors, [], 'Browser errors');
 }
 async function board(loggedIn) {
-  await wait(`document.body.dataset.page === 'board' && document.querySelectorAll('#stats dd').length === 3 &&
+  await wait(`document.body?.dataset.page === 'board' && document.querySelectorAll('#stats dd').length === 3 &&
     ${loggedIn ? "!!document.querySelector('#title')" : "!!document.querySelector('#nav a[href=\"login.html\"]')"}`, 'board initialized');
   await modeCheck();
 }
 async function auth(page) {
-  await wait(`document.body.dataset.page === ${q(page)} && !!document.querySelector('#nav a')`, `${page} initialized`);
+  await wait(`document.body?.dataset.page === ${q(page)} && !!document.querySelector('#nav a')`, `${page} initialized`);
   await modeCheck();
 }
 async function click(selector) {
