@@ -143,7 +143,7 @@ export AWS_REGION=sa-east-1
 bash infra/scripts/deploy.sh make-id  "프로젝트 이름"        # 이름(한글 포함)에서 배포 ID를 만든다. 같은 이름은 같은 ID
 bash infra/scripts/deploy.sh image-ref a1b2c3d4          # plan에 쓸 이미지 주소(ECR 주소:태그)를 미리 정한다
 bash infra/scripts/deploy.sh up       --id a1b2c3d4 --image <ecr_url>:a1b2c3d4-r1 --app app.json --plan-only   # 포트는 자동 할당. --id 대신 --name "프로젝트 이름" 도 된다
-bash infra/scripts/deploy.sh build    --id a1b2c3d4 --source app.zip --dockerfile Dockerfile --tag a1b2c3d4-r1   # 승인 뒤: 이미지 빌드·푸시
+bash infra/scripts/deploy.sh build    --id a1b2c3d4 --source app.zip --dockerfile Dockerfile --tag a1b2c3d4-r1 [--arch ARM64]   # 승인 뒤: 이미지 빌드·푸시
 bash infra/scripts/deploy.sh apply    a1b2c3d4     # 위에서 만든 승인된 저장 계획만 적용한다
 bash infra/scripts/deploy.sh update   a1b2c3d4 --image <ecr_url>:a1b2c3d4-r2 [--app app.json] --plan-only
 bash infra/scripts/deploy.sh rollback a1b2c3d4 --plan-only   # 직전 정상 이미지로 되돌린다
@@ -154,7 +154,7 @@ bash infra/scripts/deploy.sh destroy  a1b2c3d4     # 앱 삭제. 앱 전용 DB�
 bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 지운다(되돌릴 수 없다)
 ```
 
-`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`), `--yes`, `--plan-only`.
+`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`. `build --arch`도 같은 값을 받아 계획과 같은 아키텍처로 빌드한다), `--yes`, `--plan-only`.
 
 - `app.json`은 `app.auto.tfvars.json`의 `app` 값만 담는다(예: `{"container_port": 8000, "health_check_path": "/health", "use_database": true, ...}`).
 - `--plan-only`는 계획을 `plan.json`으로 저장하고 멈춘다. 승인 후 `apply`가 **저장된 계획만** 실행한다. 승인 뒤에 새 계획을 만들지 않는다. `--plan-only` 없이 실행하면 계획을 보여 주고 `yes`를 입력받는다.

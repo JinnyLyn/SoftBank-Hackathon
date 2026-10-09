@@ -313,12 +313,62 @@ def discard_unapplied(cfg, deploy_id):
     shutil.rmtree(d, ignore_errors=True)
 
 
+def load_foundation(cfg):
+    """배포된 foundation의 출력(infra/deployments/foundation.json. deploy.sh가 호출될 때마다 갱신한다). 없거나 읽을 수 없으면 None."""
+    try:
+        d = json.loads((cfg.deployments_dir / "foundation.json").read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def upload_plan(api, plan_id, plan_file):
+    """plan 파일을 백엔드에 올린다. 연결 실패·5xx는 몇 번 다시 시도한다."""
+    for attempt in range(REPORT_RETRIES):
+        try:
+            return api.post_bytes(f"/api/worker/plans/{plan_id}/terraform-plan", Path(plan_file).read_bytes())
+        except ApiError as e:
+            if not (e.status == 0 or e.status >= 500) or attempt == REPORT_RETRIES - 1:
+                raise
+            time.sleep(REPORT_RETRY_DELAY)
+
+
+ACTIVE_PLAN_STATUSES = ("awaiting_approval", "approved", "consumed")   # superseded만 남은 프로젝트는 다시 계획한다
+
+
+def repair_plan_uploads(api, cfg, plans):
+    """백엔드에 등록됐지만 plan 파일이 올라가지 않은 계획(업로드 실패, worker 재시작)의 파일을 다시 올린다.
+    승인된 계획과 같은 파일만 올린다: 로컬 파일의 SHA-256이 등록된 값과 다르면 올리지 않는다.
+    Returns: 아직 올리지 못한 계획이 남아 있으면 True."""
+    pending = False
+    for plan in plans:
+        if plan.get("status") != "awaiting_approval" or plan.get("terraform_plan_ready") is not False:
+            continue
+        deploy_id = (plan.get("variables") or {}).get("deploy_id", "")
+        f = cfg.deployments_dir / deploy_id / "tfplan" if DEPLOY_ID_RE.match(deploy_id) else None
+        if not f or not f.is_file() or sha256_file(f) != plan.get("terraform_plan_sha256"):
+            log(f"계획 {plan.get('id')}: 로컬 plan 파일이 없거나 등록된 SHA-256과 달라 올리지 않습니다")
+            continue
+        try:
+            upload_plan(api, plan["id"], f)
+            log(f"계획 {plan['id']}: plan 파일을 다시 올렸습니다")
+        except ApiError as e:
+            log(f"계획 {plan['id']}: plan 파일 업로드가 다시 실패했습니다: {e}")
+            pending = True
+    return pending
+
+
 def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
-    """프로젝트 하나의 배포 계획을 만들어 백엔드에 등록하고 plan 파일을 올린다. 등록한 계획(PlanOut)을 돌려준다."""
+    """프로젝트 하나의 배포 계획을 만들어 백엔드에 등록하고 plan 파일을 올린다. 등록한 계획(PlanOut)을 돌려준다.
+    plan 파일 업로드가 끝내 실패하면 계획은 등록된 채 파일을 남기고, 돌려주는 계획에 _upload_pending=True 를 붙인다(다음 점검에서 다시 올린다)."""
     prices = prices or cost.load_prices()
+    src_sha = project.get("source_sha256")
+    if not isinstance(src_sha, str) or not SHA256_RE.match(src_sha):
+        raise PlanError("프로젝트의 source_sha256을 읽지 못했습니다(승인한 소스를 배포 직전에 확인하려면 필요합니다)")
     result = analysis.get("result", {})
     users, pattern, budget = scale_from_analysis(result)
-    rec = cost.recommend(users, pattern, budget, prices, arch)
+    foundation = load_foundation(cfg)
+    rec = cost.recommend(users, pattern, budget, prices, arch, foundation)
     if rec["recommended"] is None:
         raise PlanError(rec["reason"])
     tier = rec["recommended"]
@@ -335,12 +385,19 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     if rc != 0 or ":" not in image:
         raise PlanError(f"이미지 주소를 만들지 못했습니다: {err.strip()[-200:]}")
 
+    # 같은 프로젝트를 다시 계획하는 경우(이전 계획이 superseded) 적용한 적 없는 이전 폴더는 지우고 새로 만든다.
+    # 이미 적용된 배포의 폴더는 up이 거부하므로 미리 알린다(update 흐름이 필요하다)
+    if (cfg.deployments_dir / deploy_id).exists():
+        discard_unapplied(cfg, deploy_id)
+        if (cfg.deployments_dir / deploy_id).exists():
+            raise PlanError(f"배포 {deploy_id}는 이미 적용된 폴더가 있어 새로 계획할 수 없습니다(update로 바꾸세요)")
+
     tmp = Path(tempfile.mkdtemp(prefix="pc-app-"))
     try:
         app_file = tmp / "app.json"
         app_file.write_text(json.dumps(app, ensure_ascii=False), encoding="utf-8")
         log(f"계획 생성: 프로젝트 {project['id']} → 배포 ID {deploy_id}, 단계 {tier}")
-        rc, out = run_streaming(deploy(cfg, "up", "--id", deploy_id, "--image", image, "--app", posix(app_file), "--plan-only"),
+        rc, out = run_streaming(deploy(cfg, "up", "--id", deploy_id, "--image", image, "--app", posix(app_file), "--arch", arch, "--plan-only"),
                                 cfg.plan_timeout, cwd=str(INFRA), env=env)
         if rc != 0:
             raise PlanError("Terraform 계획을 만들지 못했습니다: " + redact(out)[-300:])
@@ -354,6 +411,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
 
     variables = {
         "deploy_id": deploy_id, "image": image, "dockerfile": dockerfile, "app": app,
+        # 승인된 소스(ZIP)의 SHA-256과 이미지 아키텍처: executor가 빌드 직전에 확인하고 같은 아키텍처로 빌드한다
+        "source_sha256": src_sha, "cpu_architecture": arch,
         "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
         "resources": est["resources"],
         "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "excluded": est["excluded"]},
@@ -361,7 +420,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     summary = "\n".join([
         f"{est['label']} 구성({tier}): {app['task_size']} 태스크 {app['min_tasks']}개(최대 {app['max_tasks']}개), 포트 {app['container_port']}, "
         f"헬스체크 {app['health_check_path']}, 앱 전용 DB {'사용' if app['use_database'] else '미사용'}",
-        f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS) ${est['shared_monthly']:.2f}",
+        f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
         f"기준: {est['region']}, {est['pricing_as_of']} 가격표. 제외: " + "; ".join(est["excluded"]),
         f"선택 이유: {rec['reason']}",
     ])
@@ -374,10 +433,16 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     }
     try:
         plan = api.post("/api/plans", body)
-        api.post_bytes(f"/api/worker/plans/{plan['id']}/terraform-plan", plan_file.read_bytes())
     except ApiError:
-        discard_unapplied(cfg, deploy_id)   # 같은 프로젝트를 다시 시도할 수 있게 한다
+        discard_unapplied(cfg, deploy_id)   # 아무것도 등록되지 않았으니 같은 프로젝트를 다시 시도할 수 있게 한다
         raise
+    try:
+        upload_plan(api, plan["id"], plan_file)
+    except ApiError as e:
+        # 계획은 이미 등록됐다. 로컬 plan 파일을 지우면 승인된 작업이 plan_mismatch로 영영 실패하므로 남기고 다시 올린다
+        log(f"plan 파일 업로드 실패(계획 {plan['id']}은 등록됨, 파일은 남겨 다시 올립니다): {e}")
+        plan["_upload_pending"] = True
+        return plan
     log(f"계획 등록 완료: {plan['id']} (월 ${est['total_monthly']:.2f}, sha {digest[:12]})")
     return plan
 
@@ -432,11 +497,24 @@ def execute_job(api, cfg, job):
         if not SHA256_RE.match(expected) or not plan_file.is_file() or sha256_file(plan_file) != expected:
             return fail_job(api, dep, "plan_mismatch",
                             "저장된 Terraform 계획이 승인된 계획과 다릅니다(파일이 없거나 SHA-256이 다릅니다). 적용하지 않았습니다")
+        # 승인한 소스와 지금 소스가 같은지 확인한다. plan 해시는 인프라 계획만 덮으므로, 승인 뒤에 소스 파일이 바뀌면
+        # 사용자가 검토하지 않은 코드가 배포된다(AGENTS.md 4장: 승인 이후 내용이 바뀌면 승인을 폐기한다)
+        src_expected = v.get("source_sha256", "")
+        src_path = job.get("source_path", "")
+        job_sha = job.get("source_sha256")
+        if (not isinstance(src_expected, str) or not SHA256_RE.match(src_expected) or (job_sha and job_sha != src_expected)
+                or not src_path or not Path(src_path).is_file() or sha256_file(src_path) != src_expected):
+            return fail_job(api, dep, "source_mismatch",
+                            "승인된 계획의 소스(ZIP)와 지금 소스가 다릅니다(파일이 없거나 SHA-256이 다릅니다). 빌드하지 않았습니다")
+        arch = v.get("cpu_architecture")
+        if arch not in ("X86_64", "ARM64"):
+            return fail_job(api, dep, "invalid_job", f"작업의 cpu_architecture가 올바르지 않습니다: {arch!r}")
         env = child_env(cfg)
 
-        log(f"이미지 빌드: {deploy_id}")
-        rc, out, err = run_capture(deploy(cfg, "build", "--id", deploy_id, "--source", posix(job.get("source_path", "")),
-                                          "--dockerfile", dockerfile, "--tag", tag), cfg.build_timeout, cwd=str(INFRA), env=env)
+        log(f"이미지 빌드: {deploy_id} ({arch})")
+        rc, out, err = run_capture(deploy(cfg, "build", "--id", deploy_id, "--source", posix(src_path),
+                                          "--dockerfile", dockerfile, "--tag", tag, "--arch", arch),
+                                   cfg.build_timeout, cwd=str(INFRA), env=env)
         built = out.strip().splitlines()[-1] if out.strip() else ""
         if rc != 0:
             return fail_job(api, dep, "build_failed", "이미지를 빌드하거나 올리지 못했습니다", {"log_tail": tail(err)})
@@ -490,6 +568,7 @@ def execute_job(api, cfg, job):
 class State:
     failures: dict = field(default_factory=dict)   # 프로젝트 id → (실패 횟수, 마지막 시각)
     done: set = field(default_factory=set)         # 이미 계획이 있는 프로젝트
+    repair: set = field(default_factory=set)       # plan 파일 업로드가 남은 프로젝트(점검마다 다시 올린다)
     retry_after: float = 120.0
     max_tries: int = 3
 
@@ -510,12 +589,18 @@ def list_projects(api, max_pages=10):
 def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
     for project in list_projects(api):
         pid = project["id"]
-        if pid in state.done:
+        if pid in state.done and pid not in state.repair:
             continue
         tries, last = state.failures.get(pid, (0, 0.0))
-        if tries >= state.max_tries or (tries and time.time() - last < state.retry_after):
+        if pid not in state.repair and (tries >= state.max_tries or (tries and time.time() - last < state.retry_after)):
             continue
-        if api.get(f"/api/projects/{pid}/plans"):
+        plans = api.get(f"/api/projects/{pid}/plans") or []
+        if repair_plan_uploads(api, cfg, plans):
+            state.repair.add(pid)
+        else:
+            state.repair.discard(pid)
+        # 진행 중이거나 끝난 계획(승인 대기·승인·배포됨)이 하나라도 있으면 건너뛴다. 모두 superseded(대체됨)이면 다시 계획한다
+        if any(p.get("status") in ACTIVE_PLAN_STATUSES for p in plans):
             state.done.add(pid)
             continue
         try:
@@ -525,8 +610,10 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
                 continue   # 분석 결과가 아직 없다. 분석 담당 모듈이 기록할 때까지 기다린다
             raise
         try:
-            plan_project(api, cfg, project, analysis, prices, arch)
+            plan = plan_project(api, cfg, project, analysis, prices, arch)
             state.done.add(pid)
+            if plan.get("_upload_pending"):
+                state.repair.add(pid)
         except (PlanError, ApiError, subprocess.TimeoutExpired, OSError) as e:
             state.failures[pid] = (tries + 1, time.time())
             log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {redact(str(e))[:300]}")

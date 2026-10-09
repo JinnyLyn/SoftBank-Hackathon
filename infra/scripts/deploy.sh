@@ -4,7 +4,7 @@
 # infra/README.md의 "배포 1건" 절차를 그대로 실행한다. 사람이 하던 명령을 순서대로 묶은 것이다.
 #
 # 사용법
-#   deploy.sh build    --id a1b2c3d4 --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그]   # 이미지를 빌드해 ECR에 올리고 주소를 출력
+#   deploy.sh build    --id a1b2c3d4 --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그] [--arch X86_64|ARM64]   # 이미지를 빌드해 ECR에 올리고 주소를 출력
 #   deploy.sh make-id  "프로젝트 이름"      # 이름(한글 포함)에서 배포 ID를 만든다
 #   deploy.sh image-ref a1b2c3d4           # 이 배포의 이미지 주소(ECR 주소:태그)를 미리 정해 출력한다(plan용, build --tag 와 짝)
 #   deploy.sh detect-arch                  # 이 PC의 docker 기준 X86_64 또는 ARM64를 출력한다
@@ -921,18 +921,22 @@ cmd_image_ref() {  # image-ref <id>
 # 승인된 배포에만 실행한다(AGENTS.md 7장: Docker 빌드·실행에는 배포 승인과 실행 범위를 적용한다).
 # 빌드에는 호스트의 AWS 키나 docker 소켓을 넘기지 않는다
 cmd_build() {
-  local id="" source="" dockerfile="Dockerfile" tag=""
+  local id="" source="" dockerfile="Dockerfile" tag="" arch=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
       --source) source="$2"; shift 2 ;;
       --dockerfile) dockerfile="$2"; shift 2 ;;
       --tag) tag="$2"; shift 2 ;;
+      --arch) arch="$2"; shift 2 ;;
       *) die "알 수 없는 옵션: $1" ;;
     esac
   done
-  [ -n "$id" ] && [ -n "$source" ] || die "사용법: build --id <id> --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그]"
+  [ -n "$id" ] && [ -n "$source" ] || die "사용법: build --id <id> --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그] [--arch X86_64|ARM64]"
   valid_id "$id"
+  # 아키텍처는 계획(up --arch)과 같아야 한다. 계획은 ECS 태스크의 CPU 아키텍처로 고정되는데 이미지가 다르면 태스크가 바로 죽는다.
+  # 생략하면 이 PC의 docker 아키텍처로 빌드한다(다른 아키텍처를 지정하면 docker가 에뮬레이션으로 빌드하므로 느리다)
+  [ -z "$arch" ] || [ "$arch" = "X86_64" ] || [ "$arch" = "ARM64" ] || die "--arch는 X86_64 또는 ARM64여야 합니다: $arch"
   # 태그를 미리 정하면 승인 전에 이미지 주소(ECR 주소:태그)를 알 수 있어 plan을 먼저 만들 수 있다
   [ -z "$tag" ] || [[ "$tag" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]] || die "--tag 형식이 올바르지 않습니다: $tag"
   case "$dockerfile" in /*|*..*) die "--dockerfile은 소스 안의 상대 경로여야 합니다: $dockerfile" ;; esac
@@ -952,7 +956,8 @@ cmd_build() {
     rm -rf "${work:?}"; die "소스를 찾을 수 없습니다: $source"
   fi
   [ -f "$ctx/$dockerfile" ] || { rm -rf "${work:?}"; die "Dockerfile을 찾지 못했습니다: $ctx/$dockerfile"; }
-  arch="$(detect_arch)"; platform="linux/amd64"; [ "$arch" = "ARM64" ] && platform="linux/arm64"
+  [ -n "$arch" ] || arch="$(detect_arch)"
+  platform="linux/amd64"; [ "$arch" = "ARM64" ] && platform="linux/arm64"
   [ -n "$tag" ] || tag="$id-r$(date +%s)"
   image="$ecr:$tag"
   log "이미지 빌드: $image ($platform)"

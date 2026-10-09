@@ -11,9 +11,9 @@
   "alb_hour": 0.034,
   "public_ipv4_hour": 0.005,
   "foundation_assumptions": {
-    "alb_azs": 2,
-    "nat_eips": 1,
-    "note": "기준 구성: 가용 영역 2개, NAT 인스턴스 1대(az_count=2, nat_high_availability=false). 다른 구성이면 공인 IPv4 개수가 달라진다"
+    "alb_azs": 3,
+    "nat_eips": 3,
+    "note": "foundation을 읽을 수 없을 때의 기본 가정: foundation 변수 기본값(az_count=3, nat_high_availability=true → NAT 인스턴스 3대). 배포된 foundation 출력(task_subnet_ids, assign_public_ip, nat_instance_count)이 있으면 그 값을 쓴다"
   },
   "rds": {
     "instance_class": "db.t4g.micro",

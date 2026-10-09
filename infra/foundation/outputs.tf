@@ -24,6 +24,7 @@ output "deploy_inputs" {
     ecr_repository_url                = aws_ecr_repository.apps.repository_url
     execution_role_arn                = aws_iam_role.task_execution.arn
     listener_protocol                 = local.https_enabled ? "HTTPS" : "HTTP"
+    nat_instance_count                = local.nat_count
     task_subnet_ids                   = local.task_subnet_ids
     vpc_id                            = aws_vpc.this.id
   }

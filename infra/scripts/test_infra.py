@@ -903,6 +903,22 @@ def part_d():
     left = Path(note).parent.exists() if note else None
     say("ok" if note and left is False else "fail", "D build: 종료 신호(SIGTERM)를 받아도 docker 로그인 토큰이 든 임시 폴더를 지운다", f"rc={rc} note={note[:50]} 남음={left}")
 
+    # build --arch: 계획(up --arch)과 같은 아키텍처로 빌드한다. 지정하지 않으면 이 PC의 docker 기준
+    dlog = WORK / "build_arch_docker.log"
+    for arch_arg, want in [("ARM64", "linux/arm64"), ("X86_64", "linux/amd64")]:
+        dlog.unlink(missing_ok=True)
+        code = (
+            'export_foundation() { :; }; need() { :; }; aws() { echo token; }; '
+            f'docker() {{ echo "$*" >> {P(dlog)}; }}; '
+            f'cmd_build --id abcd1234 --source {P(bsrc)} --tag t1 --arch {arch_arg} >/dev/null'
+        )
+        rc, out, err = sh(code)
+        logged = dlog.read_text(encoding="utf-8") if dlog.exists() else ""
+        say("ok" if rc == 0 and f"--platform {want}" in logged else "fail", f"D build --arch {arch_arg}: {want}로 빌드한다", f"rc={rc} {logged[:100]} {err[:80]}")
+    rc, out, err = sh('export_foundation() { :; }; need() { :; }; docker() { echo DOCKER_CALLED; }; '
+                      f'cmd_build --id abcd1234 --source {P(bsrc)} --arch MIPS')
+    say("ok" if rc != 0 and "--arch는 X86_64 또는 ARM64" in err and "DOCKER_CALLED" not in out else "fail", "D build --arch: X86_64·ARM64가 아니면 거부(docker 호출 없음)", err[:80])
+
     # status: 서비스 조회가 실패하면 빈 값을 정상처럼 찍지 않고 실패한다
     sdir2 = WORK / "status_fail"
     sdir2.mkdir(parents=True, exist_ok=True)

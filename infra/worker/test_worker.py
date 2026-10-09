@@ -68,6 +68,7 @@ class FakeBackend:
         self.plan_status = 201
         self.event_failures = 0   # 앞으로 몇 번의 이벤트 보고를 503으로 거절할지
         self.pages = None         # 목록 페이지(리스트의 리스트). 지정하면 cursor로 넘긴다
+        self.upload_failures = 0  # 앞으로 몇 번의 plan 파일 업로드를 503으로 거절할지
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -112,9 +113,18 @@ class FakeBackend:
                     outer.created_plans.append(obj)
                     if outer.plan_status != 201:
                         return self._send(outer.plan_status, {"error": "거부"})
-                    return self._send(201, {"id": "plan-1", "fingerprint": "f" * 64, **obj})
+                    created = {"id": "plan-1", "fingerprint": "f" * 64, "status": "awaiting_approval", "terraform_plan_ready": False, **obj}
+                    outer.plans.setdefault(obj["project_id"], []).append(created)
+                    return self._send(201, created)
                 if p.startswith("/api/worker/plans/") and p.endswith("/terraform-plan"):
+                    if outer.upload_failures > 0:
+                        outer.upload_failures -= 1
+                        return self._send(503, {"error": "일시 오류"})
                     outer.uploads.append((p.split("/")[4], body, self.headers.get("X-Worker-Token")))
+                    for plans in outer.plans.values():
+                        for pl in plans:
+                            if pl.get("id") == p.split("/")[4]:
+                                pl["terraform_plan_ready"] = True
                     return self._send(200, {"ok": True})
                 if p == "/api/worker/deployments/claim":
                     if self.headers.get("X-Worker-Token") != TOKEN:
@@ -171,7 +181,9 @@ GOOD_RESULT = {
     "dockerfile": "sample-back/Dockerfile",
     "scale": {"expected_users": "~1,000", "traffic_pattern": "steady", "monthly_budget_usd": 120},
 }
-PROJECT = {"id": "11111111-1111-1111-1111-111111111111", "name": "Launchpad"}
+SRC_BYTES = b"src-zip-bytes"
+SRC_SHA = hashlib.sha256(SRC_BYTES).hexdigest()
+PROJECT = {"id": "11111111-1111-1111-1111-111111111111", "name": "Launchpad", "source_sha256": SRC_SHA}
 
 
 class CostTests(unittest.TestCase):
@@ -179,14 +191,31 @@ class CostTests(unittest.TestCase):
         self.p = cost.load_prices()
 
     def test_estimate_matches_hand_calculation(self):
-        # lean: (0.25 vCPU x 0.0696 + 0.5 GB x 0.0076) x 730 = 15.476, 공용: ALB 24.82 + RDS 24.82 + 스토리지 4.38 + 공인 IPv4 3개 10.95 = 64.97
+        # lean: (0.25 vCPU x 0.0696 + 0.5 GB x 0.0076) x 730 = 15.476, 공용: ALB 24.82 + RDS 24.82 + 스토리지 4.38 + 공인 IPv4 6개 21.90 = 75.92(기본 가정: 3 AZ + NAT 3대)
         e = cost.estimate("lean", self.p)
         self.assertAlmostEqual(e["app_monthly"], 15.48, places=2)
-        self.assertAlmostEqual(e["shared_monthly"], 64.97, places=2)
-        self.assertAlmostEqual(e["total_monthly"], 80.45, places=2)
+        self.assertAlmostEqual(e["shared_monthly"], 75.92, places=2)
+        self.assertAlmostEqual(e["total_monthly"], 91.40, places=2)
         self.assertEqual(e["region"], "sa-east-1")
         self.assertTrue(e["excluded"])   # 제외 항목을 반드시 밝힌다
         self.assertIn("공인 IPv4 주소", [r["service"] for r in e["resources"]])   # 공인 IPv4 요금을 포함한다
+
+    def test_public_ipv4_count_follows_the_deployed_foundation(self):
+        # 기본 가정(foundation 기본값): 3 AZ + NAT 3대 = 6개
+        self.assertEqual(cost.ipv4_count(self.p)[0], 6)
+        # 배포된 foundation: 2 AZ, NAT 인스턴스 1대 = 3개 → lean 80.45
+        f = {"task_subnet_ids": ["a", "b"], "assign_public_ip": False, "nat_instance_count": 1}
+        self.assertEqual(cost.ipv4_count(self.p, f), (3, 2, 1))
+        self.assertAlmostEqual(cost.estimate("lean", self.p, foundation=f)["total_monthly"], 80.45, places=2)
+        # NAT 인스턴스가 없는 구성(assign_public_ip=true): ALB 주소만 2개
+        f2 = {"task_subnet_ids": ["a", "b"], "assign_public_ip": True}
+        self.assertEqual(cost.ipv4_count(self.p, f2), (2, 2, 0))
+        # NAT 대수 출력이 없는 옛 foundation: AZ 수는 읽고 NAT는 기본 가정
+        f3 = {"task_subnet_ids": ["a", "b"], "assign_public_ip": False}
+        self.assertEqual(cost.ipv4_count(self.p, f3), (5, 2, 3))
+        spec = cost.estimate("lean", self.p, foundation=f)["resources"][-1]["spec"]
+        self.assertIn("ALB 가용 영역 2개", spec)
+        self.assertIn("탄력적 IP 1개", spec)
 
     def test_balanced_and_roomy_cost_more_and_roomy_runs_two_tasks(self):
         lean, bal, roomy = (cost.estimate(t, self.p)["total_monthly"] for t in cost.ORDER)
@@ -213,17 +242,17 @@ class CostTests(unittest.TestCase):
         self.assertEqual(cost.recommend(None, None, None, self.p)["recommended"], "balanced")
 
     def test_budget_lowers_tier_and_reports_reason(self):
-        r = cost.recommend("~10,000", "steady", 100, self.p)   # roomy는 188.78 > 100, balanced 95.92 이하
+        r = cost.recommend("~10,000", "steady", 110, self.p)   # roomy는 199.73 > 110, balanced 106.87 이하
         self.assertEqual(r["recommended"], "balanced")
         self.assertIn("낮춤", r["reason"])
 
     def test_budget_below_cheapest_gives_no_recommendation_with_reason(self):
         r = cost.recommend("~100", "steady", 30, self.p)
         self.assertIsNone(r["recommended"])
-        self.assertIn("80.45", r["reason"])
+        self.assertIn("91.40", r["reason"])
 
     def test_budget_exactly_equal_is_allowed(self):
-        self.assertEqual(cost.recommend("~100", "steady", 80.45, self.p)["recommended"], "lean")
+        self.assertEqual(cost.recommend("~100", "steady", 91.40, self.p)["recommended"], "lean")
 
 
 class AppConfigTests(unittest.TestCase):
@@ -355,6 +384,8 @@ class PlannerTests(Base):
         self.assertEqual(v["tier"], "balanced")
         self.assertTrue(v["recommended"])
         self.assertEqual(v["app"]["task_size"], "small")
+        self.assertEqual(v["source_sha256"], SRC_SHA)          # 승인된 소스 지문이 계획 변수(fingerprint 대상)에 들어간다
+        self.assertEqual(v["cpu_architecture"], "X86_64")
         self.assertEqual(v["resources"][0]["service"], "ECS Fargate")
         self.assertEqual(body["cost_estimate"]["currency"], "USD")
         self.assertEqual(body["cost_estimate"]["period"], "month")
@@ -375,7 +406,64 @@ class PlannerTests(Base):
         self.assertEqual(len(up), 1)
         self.assertIn("--plan-only", up[0])
         self.assertIn("--id fake0001", up[0])
+        self.assertIn("--arch X86_64", up[0])
         self.assertFalse(any(c.startswith("build") or c.startswith("apply") for c in calls))   # 승인 전에는 빌드도 적용도 하지 않는다
+
+    def test_requested_architecture_is_passed_to_planning_and_recorded(self):
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(), arch="ARM64")
+        up = [c for c in self.calls() if c.startswith("up ")][0]
+        self.assertIn("--arch ARM64", up)
+        self.assertEqual(self.backend.created_plans[0]["variables"]["cpu_architecture"], "ARM64")
+
+    def test_project_without_source_sha256_is_a_plan_error_before_anything_runs(self):
+        for bad in [None, "", "xyz", "A" * 64]:
+            with self.subTest(bad=bad):
+                proj = {"id": PROJECT["id"], "name": "x", "source_sha256": bad}
+                with self.assertRaises(worker.PlanError):
+                    worker.plan_project(self.api, self.cfg, proj, self.analysis())
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.backend.created_plans, [])
+
+    def test_estimate_uses_the_deployed_foundation_file(self):
+        (self.tmp / "deployments" / "foundation.json").write_text(
+            json.dumps({"task_subnet_ids": ["a", "b"], "assign_public_ip": False, "nat_instance_count": 1}), encoding="utf-8")
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        body = self.backend.created_plans[0]
+        ipv4 = [r for r in body["variables"]["resources"] if r["service"] == "공인 IPv4 주소"][0]
+        self.assertIn("탄력적 IP 1개", ipv4["spec"])
+        self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), 95.92, places=2)   # balanced, 2 AZ + NAT 1대
+
+    def test_replan_discards_an_unapplied_previous_folder(self):
+        old = self.tmp / "deployments" / "fake0001"
+        old.mkdir()
+        (old / "tfplan").write_text("old-plan", encoding="utf-8")
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertEqual((old / "tfplan").read_text(encoding="utf-8").strip(), "plan-bytes-fake0001")   # 새 계획으로 교체됐다
+        self.assertEqual(len(self.backend.created_plans), 1)
+
+    def test_replan_refuses_a_folder_that_was_ever_applied(self):
+        old = self.tmp / "deployments" / "fake0001"
+        old.mkdir()
+        (old / "history.log").write_text("x", encoding="utf-8")
+        with self.assertRaises(worker.PlanError) as cm:
+            worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertIn("이미 적용된", str(cm.exception))
+        self.assertTrue(old.exists())
+        self.assertEqual(self.backend.created_plans, [])
+
+    def test_upload_failure_keeps_the_local_plan_and_marks_it_pending(self):
+        self.backend.upload_failures = worker.REPORT_RETRIES   # 재시도까지 모두 실패
+        plan = worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertTrue(plan.get("_upload_pending"))
+        self.assertTrue((self.tmp / "deployments" / "fake0001" / "tfplan").exists())   # 파일을 지우지 않는다
+        self.assertEqual(self.backend.uploads, [])
+        self.assertEqual(len(self.backend.created_plans), 1)
+
+    def test_transient_upload_errors_are_retried_inside_plan_project(self):
+        self.backend.upload_failures = 2
+        plan = worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertFalse(plan.get("_upload_pending"))
+        self.assertEqual(len(self.backend.uploads), 1)
 
     def test_secret_like_values_are_not_in_posted_body(self):
         worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
@@ -421,17 +509,20 @@ class PlannerTests(Base):
 class ExecutorTests(Base):
     IMAGE = "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps:fake0001-r1"
 
-    def make_job(self, tamper_sha=False, deploy_id="fake0001", image=None):
+    def make_job(self, tamper_sha=False, deploy_id="fake0001", image=None, arch="X86_64"):
         d = self.tmp / "deployments" / "fake0001"
         d.mkdir(parents=True, exist_ok=True)
         (d / "tfplan").write_bytes(b"approved-plan")
+        (self.tmp / "src.zip").write_bytes(SRC_BYTES)
         sha = hashlib.sha256(b"approved-plan").hexdigest()
         if tamper_sha:
             sha = "0" * 64
         os.environ["FAKE_BUILD_IMAGE"] = self.IMAGE
         return {"deployment_id": "dep-1", "status": "provisioning", "target": "aws", "plan_id": "plan-1", "project_id": PROJECT["id"],
-                "variables": {"deploy_id": deploy_id, "image": image or self.IMAGE, "dockerfile": "sample-back/Dockerfile"},
-                "terraform_plan_sha256": sha, "source_path": str(self.tmp / "src.zip"), "source_filename": "src.zip"}
+                "variables": {"deploy_id": deploy_id, "image": image or self.IMAGE, "dockerfile": "sample-back/Dockerfile",
+                              "source_sha256": SRC_SHA, "cpu_architecture": arch},
+                "terraform_plan_sha256": sha, "source_path": str(self.tmp / "src.zip"), "source_filename": "src.zip",
+                "source_sha256": SRC_SHA}
 
     def statuses(self):
         return [e[1]["status"] for e in self.backend.events]
@@ -446,10 +537,47 @@ class ExecutorTests(Base):
         build = self.calls()[0]
         self.assertIn("--tag fake0001-r1", build)
         self.assertIn("--dockerfile sample-back/Dockerfile", build)
+        self.assertIn("--arch X86_64", build)
 
     def test_deploying_is_reported_before_health_wait_ends_once(self):
         worker.execute_job(self.api, self.cfg, self.make_job())
         self.assertEqual(self.statuses().count("deploying"), 1)
+
+    def test_changed_source_after_approval_is_rejected_before_build(self):
+        job = self.make_job()
+        (self.tmp / "src.zip").write_bytes(b"edited after approval")   # 승인 뒤에 소스 파일이 바뀌었다
+        worker.execute_job(self.api, self.cfg, job)
+        self.assertEqual(self.statuses(), ["failed"])
+        self.assertEqual(self.backend.events[0][1]["event_type"], "source_mismatch")
+        self.assertEqual(self.calls(), [])   # 빌드도 적용도 하지 않는다
+
+    def test_missing_source_file_or_digest_is_rejected(self):
+        cases = {}
+        job = self.make_job()
+        job["variables"].pop("source_sha256")
+        cases["variables에 source_sha256 없음"] = job
+        job = self.make_job()
+        job["source_sha256"] = "0" * 64   # 백엔드가 가진 소스 지문이 승인된 계획의 것과 다르다
+        cases["작업의 source_sha256이 다름"] = job
+        job = self.make_job()
+        job["source_path"] = str(self.tmp / "missing.zip")
+        cases["소스 파일 없음"] = job
+        for name, j in cases.items():
+            with self.subTest(name=name):
+                self.backend.events.clear()
+                worker.execute_job(self.api, self.cfg, j)
+                self.assertEqual(self.statuses(), ["failed"])
+                self.assertEqual(self.backend.events[0][1]["event_type"], "source_mismatch")
+        self.assertEqual(self.calls(), [])
+
+    def test_planned_architecture_is_passed_to_build(self):
+        worker.execute_job(self.api, self.cfg, self.make_job(arch="ARM64"))
+        self.assertIn("--arch ARM64", self.calls()[0])
+
+    def test_invalid_architecture_in_job_fails_without_building(self):
+        worker.execute_job(self.api, self.cfg, self.make_job(arch="MIPS"))
+        self.assertEqual(self.backend.events[0][1]["event_type"], "invalid_job")
+        self.assertEqual(self.calls(), [])
 
     def test_plan_hash_mismatch_never_builds_or_applies(self):
         worker.execute_job(self.api, self.cfg, self.make_job(tamper_sha=True))
@@ -570,7 +698,7 @@ class LoopTests(Base):
         self.backend.pages = [old[:2], old[2:], [PROJECT]]
         self.assertEqual(len(worker.list_projects(self.api)), 5)
         for o in old:
-            self.backend.plans[o["id"]] = [{"id": "p"}]   # 오래된 프로젝트는 이미 계획이 있다
+            self.backend.plans[o["id"]] = [{"id": "p", "status": "approved", "terraform_plan_ready": True}]   # 오래된 프로젝트는 이미 계획이 있다
         self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
         worker.plan_pending(self.api, self.cfg, self.state)
         self.assertEqual(len(self.backend.created_plans), 1)
@@ -583,11 +711,46 @@ class LoopTests(Base):
         self.assertEqual(self.calls(), [])
 
     def test_project_with_existing_plan_is_skipped_and_remembered(self):
-        self.backend.plans[PROJECT["id"]] = [{"id": "p"}]
+        self.backend.plans[PROJECT["id"]] = [{"id": "p", "status": "awaiting_approval", "terraform_plan_ready": True}]
         self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
         worker.plan_pending(self.api, self.cfg, self.state)
         self.assertEqual(self.backend.created_plans, [])
         self.assertIn(PROJECT["id"], self.state.done)
+
+    def test_active_or_finished_plans_are_never_replanned(self):
+        self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
+        for status in ["awaiting_approval", "approved", "consumed"]:
+            with self.subTest(status=status):
+                self.state.done.clear()
+                self.backend.plans[PROJECT["id"]] = [{"id": "p", "status": status, "terraform_plan_ready": True}]
+                worker.plan_pending(self.api, self.cfg, self.state)
+        self.assertEqual(self.backend.created_plans, [])
+
+    def test_project_whose_plans_are_all_superseded_is_replanned(self):
+        self.backend.plans[PROJECT["id"]] = [{"id": "old1", "status": "superseded"}, {"id": "old2", "status": "superseded"}]
+        self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
+        worker.plan_pending(self.api, self.cfg, self.state)
+        self.assertEqual(len(self.backend.created_plans), 1)   # 거절·대체된 계획만 남은 프로젝트에 새 계획을 만든다
+
+    def test_failed_plan_upload_is_repaired_on_the_next_check(self):
+        self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
+        self.backend.upload_failures = worker.REPORT_RETRIES
+        worker.plan_pending(self.api, self.cfg, self.state)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        self.assertEqual(self.backend.uploads, [])
+        self.assertIn(PROJECT["id"], self.state.repair)
+        worker.plan_pending(self.api, self.cfg, self.state)   # 백엔드가 회복된 뒤
+        self.assertEqual(len(self.backend.uploads), 1)
+        self.assertNotIn(PROJECT["id"], self.state.repair)
+        self.assertEqual(len(self.backend.created_plans), 1)   # 새 계획을 또 만들지 않는다
+
+    def test_repair_does_not_upload_a_local_file_that_differs_from_the_registered_plan(self):
+        self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
+        self.backend.upload_failures = worker.REPORT_RETRIES
+        worker.plan_pending(self.api, self.cfg, self.state)
+        (self.tmp / "deployments" / "fake0001" / "tfplan").write_bytes(b"tampered")   # 등록된 SHA-256과 달라진다
+        worker.plan_pending(self.api, self.cfg, self.state)
+        self.assertEqual(self.backend.uploads, [])
 
     def test_plan_created_once_for_analyzed_project(self):
         self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}

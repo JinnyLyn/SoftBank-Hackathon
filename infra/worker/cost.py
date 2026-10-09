@@ -36,8 +36,27 @@ def _money(x):
     return round(float(x), 2)
 
 
-def estimate(tier, prices, arch="X86_64"):
-    """한 단계의 월 비용. 앱 추가 비용(Fargate)과 공용 고정 비용(ALB, RDS, 스토리지)을 나눠 담는다.
+def ipv4_count(prices, foundation=None):
+    """공인 IPv4 주소 개수: ALB가 가용 영역마다 1개 + NAT 인스턴스의 탄력적 IP(대수만큼).
+
+    배포된 foundation의 출력(deploy_inputs)을 주면 그 구성에서 센다. task_subnet_ids의 개수가 가용 영역 수이고,
+    assign_public_ip가 true면 NAT 인스턴스가 없으며, nat_instance_count 출력이 있으면 그 값을 쓴다.
+    foundation 정보가 없거나 NAT 대수를 알 수 없으면 prices.json의 foundation_assumptions(foundation 기본값과 같게 둔다)를 쓴다."""
+    assume = prices.get("foundation_assumptions", {})
+    azs, nats = assume.get("alb_azs", 3), assume.get("nat_eips", 3)
+    if foundation:
+        subnets = foundation.get("task_subnet_ids")
+        if isinstance(subnets, list) and subnets:
+            azs = len(subnets)
+        if foundation.get("assign_public_ip") is True:
+            nats = 0
+        elif isinstance(foundation.get("nat_instance_count"), int):
+            nats = foundation["nat_instance_count"]
+    return azs + nats, azs, nats
+
+
+def estimate(tier, prices, arch="X86_64", foundation=None):
+    """한 단계의 월 비용. 앱 추가 비용(Fargate)과 공용 고정 비용(ALB, RDS, 스토리지, 공인 IPv4)을 나눠 담는다.
 
     amount는 둘의 합이다. NAT 인스턴스·데이터 전송·로그 등은 prices.json 의 excluded 에 적힌 대로 제외한 값이다.
     """
@@ -57,9 +76,8 @@ def estimate(tier, prices, arch="X86_64"):
     rds_instance = rds["instance_hour"] * hours
     rds_storage = rds["storage_gb"] * rds["storage_gb_month"]
     # 공인 IPv4 주소는 사용 중이면 개당 시간당 요금이 붙는다(ALB 가용 영역마다 1개, NAT용 탄력적 IP)
-    assume = prices.get("foundation_assumptions", {})
-    ipv4_count = assume.get("alb_azs", 2) + assume.get("nat_eips", 1)
-    ipv4 = prices.get("public_ipv4_hour", 0.0) * ipv4_count * hours
+    n_ipv4, n_azs, n_nats = ipv4_count(prices, foundation)
+    ipv4 = prices.get("public_ipv4_hour", 0.0) * n_ipv4 * hours
     shared = alb + rds_instance + rds_storage + ipv4
     resources = [
         {"service": "ECS Fargate", "spec": f"{vcpu:g} vCPU / {gb:g} GB x {tasks}개 ({arch})", "monthlyUsd": _money(app_monthly),
@@ -68,7 +86,7 @@ def estimate(tier, prices, arch="X86_64"):
          "why": "모든 앱이 함께 쓰는 공용 진입점. 앱이 늘어도 늘지 않음"},
         {"service": "RDS MySQL", "spec": f"{rds['instance_class']}, {rds['storage_gb']} GB (공용)", "monthlyUsd": _money(rds_instance + rds_storage),
          "why": "앱마다 전용 DB와 계정을 두지만 DB 서버는 공용"},
-        {"service": "공인 IPv4 주소", "spec": f"{ipv4_count}개 (ALB 가용 영역별 + NAT용 탄력적 IP, 공용)", "monthlyUsd": _money(ipv4),
+        {"service": "공인 IPv4 주소", "spec": f"{n_ipv4}개 (ALB 가용 영역 {n_azs}개 + NAT용 탄력적 IP {n_nats}개, 공용)", "monthlyUsd": _money(ipv4),
          "why": "AWS는 사용 중인 공인 IPv4 주소마다 시간당 요금을 받음"},
     ]
     return {
@@ -81,14 +99,14 @@ def estimate(tier, prices, arch="X86_64"):
     }
 
 
-def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64"):
+def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", foundation=None):
     """권장 단계를 고른다.
 
     - 예상 사용자 수로 기본 단계를 정하고, 접속이 특정 시간에 몰리면(peak) 한 단계 올린다.
     - 월 예산(합계 기준)을 넘는 단계는 고르지 않는다. 권장 단계가 예산을 넘으면 예산 안에서 가장 큰 단계로 내린다.
     - 가장 작은 단계도 예산을 넘으면 recommended=None 과 이유를 낸다(AGENTS.md 5장 6단계: 만족할 구성이 없으면 이유를 알리고 종료).
     """
-    estimates = {t: estimate(t, prices, arch) for t in ORDER}
+    estimates = {t: estimate(t, prices, arch, foundation) for t in ORDER}
     base = USERS_TO_TIER.get(expected_users, "balanced")
     idx = ORDER.index(base)
     reasons = []
