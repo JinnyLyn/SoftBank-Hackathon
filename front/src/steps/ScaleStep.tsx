@@ -1,5 +1,6 @@
 import ProviderMark from '../components/ProviderMark'
 import QuickConnect from '../components/QuickConnect'
+import { ONPREM_ENABLED } from '../providers'
 import type { Connection, ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
 
 const USERS: { value: ExpectedUsers; note: string }[] = [
@@ -103,7 +104,7 @@ export default function ScaleStep({ scale, locked, connections, onChange, onConn
         </div>
         <p className={budgetValid(scale.monthlyBudgetUsd) ? 'hint' : 'conn-error'}>
           {budgetValid(scale.monthlyBudgetUsd)
-            ? '이 금액을 넘는 구성은 추천하지 않고 고를 수도 없습니다. 사내 서버는 추가 비용 0으로 계산합니다.'
+            ? `이 금액을 넘는 구성은 추천하지 않고 고를 수도 없습니다.${ONPREM_ENABLED ? ' 사내 서버는 추가 비용 0으로 계산합니다.' : ''}`
             : '1 이상의 금액을 넣어 주세요.'}
         </p>
       </div>

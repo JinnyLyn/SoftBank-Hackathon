@@ -3,7 +3,7 @@ import { api } from '../api'
 import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
 import InstallCommand from '../components/InstallCommand'
-import { CONSOLE_HOSTS, EXTERNAL_ID, PROVIDER_ORDER, PROVIDERS } from '../providers'
+import { CONSOLE_HOSTS, ENABLED_PROVIDERS, EXTERNAL_ID, ONPREM_ENABLED, PROVIDERS } from '../providers'
 import type { Connection, Provider } from '../types'
 
 interface Draft {
@@ -30,7 +30,7 @@ interface Props {
 
 export default function Connections({ connections, onChange }: Props) {
   const list = connections ?? []
-  const [draft, setDraft] = useState<Draft>(() => emptyDraft('aws', 0))
+  const [draft, setDraft] = useState<Draft>(() => emptyDraft(ENABLED_PROVIDERS[0], 0))
   const [saving, setSaving] = useState(false)
   const [checking, setChecking] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -107,8 +107,9 @@ export default function Connections({ connections, onChange }: Props) {
         <div>
           <h1>연결 관리</h1>
           <p>
-            AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할
-            위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.
+            {ONPREM_ENABLED
+              ? 'AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할 위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.'
+              : 'AWS 계정을 등록해 두면 분석할 때 구성과 비용을 비교합니다. 액세스 키 대신 역할 위임으로 연결합니다.'}
           </p>
         </div>
       </div>
@@ -210,8 +211,9 @@ export default function Connections({ connections, onChange }: Props) {
             )}
           </header>
           <div className="panel-body stack">
+            {ENABLED_PROVIDERS.length > 1 && (
             <div className="kind-grid" role="radiogroup" aria-label="종류">
-              {PROVIDER_ORDER.map((p) => (
+              {ENABLED_PROVIDERS.map((p) => (
                 <button
                   key={p}
                   role="radio"
@@ -225,6 +227,7 @@ export default function Connections({ connections, onChange }: Props) {
                 </button>
               ))}
             </div>
+            )}
 
             {meta.howto.length > 0 && (
             <ol className="howto">

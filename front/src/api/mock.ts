@@ -13,7 +13,7 @@ import type {
   TierKey,
 } from '../types'
 import { buildFiles, buildPlan, CATALOG, findTier, logScript, publicUrl } from './catalog'
-import { PROVIDERS } from '../providers'
+import { isEnabled, PROVIDERS } from '../providers'
 import { now } from '../format'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -73,7 +73,7 @@ const AWS_STACK_URL =
 
 export async function listConnections(): Promise<Connection[]> {
   await wait(150)
-  return connections
+  return connections.filter((c) => isEnabled(c.provider))
 }
 
 export async function saveConnection(input: ConnectionInput): Promise<Connection> {
@@ -168,7 +168,7 @@ const total = (resources: { monthlyUsd: number }[]) => resources.reduce((s, r) =
 
 export async function recommend(_projectId: string, scale: ScaleInput): Promise<Recommendation> {
   await wait(700)
-  const usable = connections.filter((c) => c.status === 'connected')
+  const usable = connections.filter((c) => c.status === 'connected' && isEnabled(c.provider))
   const options = usable.map((c) => ({
     connectionId: c.id,
     provider: c.provider,
@@ -202,7 +202,7 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
   if (options.length === 0) reason = '연결된 배포 대상이 없습니다.'
   else if (!best) {
     const cheapest = Math.min(...options.map((o) => cost(o.provider, 'lean')))
-    reason = `월 예산 $${budget} 안에 맞는 구성이 없습니다. 가장 싼 구성도 월 $${cheapest.toFixed(2)}입니다. 예산을 늘리거나 사내 서버를 배포 대상으로 추가해 주세요.`
+    reason = `월 예산 $${budget} 안에 맞는 구성이 없습니다. 가장 싼 구성도 월 $${cheapest.toFixed(2)}입니다. 예산을 늘려 주세요.`
   } else {
     const downgraded = tier !== wanted ? ` 규모로는 '${label(wanted)}'이 맞지만 예산 $${budget}을 넘어서 '${label(tier)}'으로 낮췄습니다.` : ''
     reason =
@@ -296,11 +296,13 @@ export async function status(_projectId: string): Promise<DeployStatus> {
 
 export async function history(): Promise<DeployRecord[]> {
   await wait(200)
-  return [
+  return HISTORY.filter((r) => isEnabled(r.provider))
+}
+
+const HISTORY: DeployRecord[] = [
     { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.ap-northeast-2.elb.amazonaws.com', createdAt: '2026-10-07 14:12' },
     { id: 'd5', app: 'club-attendance', version: 'v2', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'failed', note: '헬스체크 실패 → 포트 수정 후 v3', createdAt: '2026-10-07 13:58' },
     { id: 'd4', app: 'club-attendance', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', createdAt: '2026-10-05 18:03' },
     { id: 'd3', app: 'todo-api', version: 'v2', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', url: 'http://192.168.0.24:8080', createdAt: '2026-10-04 11:30' },
     { id: 'd2', app: 'todo-api', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'failed', note: 'requirements.txt 누락', createdAt: '2026-10-04 11:02' },
-  ]
-}
+]

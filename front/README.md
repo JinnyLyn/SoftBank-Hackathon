@@ -21,6 +21,7 @@ npm run build
 
 - 기본은 `src/api/mock.ts` 의 가짜 응답으로 끝까지 돌아감. 이때 화면 상단에 **MOCK** 띠가 뜨고 배포 결과에도 MOCK 표시가 붙음.
   zip 파일 이름이나 저장소 주소에 `fail` 이 들어가면 헬스체크 실패 + AI 진단 화면이 나옴.
+- 배포 대상 종류는 `VITE_PROVIDERS` 로 켜고 끔. 기본은 `aws` 만 (현재 결정: AWS 먼저, 시간이 되면 온프레미스). `aws,onprem` 으로 두면 온프레미스 연결·추천·compose 화면이 모두 보임.
 - `.env` 에 `VITE_USE_MOCK=false` 를 넣으면 `/api` 로 요청하고, dev 서버가 `localhost:8000` 으로 프록시함.
 - 엔드포인트는 `src/api/index.ts`, 응답 형태는 `src/types.ts` 에 있음. 아직 가안이라 백엔드와 맞춰야 함.
 

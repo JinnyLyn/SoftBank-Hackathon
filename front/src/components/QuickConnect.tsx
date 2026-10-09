@@ -2,7 +2,7 @@ import { useRef, useState } from 'react'
 import { api } from '../api'
 import { isSafeRedirect } from '../api/http'
 import InstallCommand from './InstallCommand'
-import { CONSOLE_HOSTS, PROVIDERS } from '../providers'
+import { CONSOLE_HOSTS, ENABLED_PROVIDERS, PROVIDERS } from '../providers'
 import type { Connection, Provider } from '../types'
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -122,10 +122,10 @@ export default function QuickConnect({ connections, onChange }: Props) {
 
   return (
     <div className="quick">
-      <strong>배포할 곳을 먼저 연결해 주세요</strong>
+      <strong>{ENABLED_PROVIDERS.length > 1 ? '배포할 곳을 먼저 연결해 주세요' : 'AWS 계정을 먼저 연결해 주세요'}</strong>
       <span className="hint">한 번 연결해 두면 다음 배포부터는 이 단계가 나오지 않습니다.</span>
-      <div className="quick-choices">
-        {(['aws', 'onprem'] as Provider[]).map((p) => (
+      <div className={'quick-choices' + (ENABLED_PROVIDERS.length === 1 ? ' is-single' : '')}>
+        {ENABLED_PROVIDERS.map((p) => (
           <button key={p} className="kind" onClick={() => start(p)} disabled={busy !== null}>
             <strong>{p === 'aws' ? 'AWS 계정 연결' : '사내 서버 연결'}</strong>
             <small>{busy === p ? '준비 중…' : PROVIDERS[p].summary}</small>

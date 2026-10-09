@@ -4,6 +4,7 @@ import NewDeploy from './pages/NewDeploy'
 import History from './pages/History'
 import Connections from './pages/Connections'
 import { api, IS_MOCK } from './api'
+import { isEnabled } from './providers'
 import type { Connection } from './types'
 
 export default function App() {
@@ -11,7 +12,11 @@ export default function App() {
   const [connections, setConnections] = useState<Connection[] | null>(null)
 
   useEffect(() => {
-    api.listConnections().then(setConnections).catch(() => setConnections([]))
+    // 꺼 둔 종류(VITE_PROVIDERS에 없는 것)는 백엔드가 돌려줘도 화면에서 뺌
+    api
+      .listConnections()
+      .then((list) => setConnections(list.filter((c) => isEnabled(c.provider))))
+      .catch(() => setConnections([]))
   }, [])
 
   return (

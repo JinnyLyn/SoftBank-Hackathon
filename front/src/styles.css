@@ -726,6 +726,7 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .quick > strong { font-size: 14.5px; }
 .quick > .hint { margin-top: -8px; }
 .quick-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.quick-choices.is-single { grid-template-columns: minmax(0, 320px); }
 .quick-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 
 /* ---------- MOCK 표시, 예산, 재검토 ---------- */
