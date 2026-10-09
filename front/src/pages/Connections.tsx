@@ -4,6 +4,7 @@ import { shortTime } from '../format'
 import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
 import InstallCommand from '../components/InstallCommand'
+import LoadError from '../components/LoadError'
 import { CONSOLE_HOSTS, ENABLED_PROVIDERS, EXTERNAL_ID, ONPREM_ENABLED, PROVIDERS } from '../providers'
 import type { Connection, Provider } from '../types'
 
@@ -26,10 +27,12 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 interface Props {
   connections: Connection[] | null
+  loadError: string | null
+  onReload: () => void
   onChange: (list: Connection[]) => void
 }
 
-export default function Connections({ connections, onChange }: Props) {
+export default function Connections({ connections, loadError, onReload, onChange }: Props) {
   const list = connections ?? []
   const [draft, setDraft] = useState<Draft>(() => emptyDraft(ENABLED_PROVIDERS[0], 0))
   const [saving, setSaving] = useState(false)
@@ -120,8 +123,13 @@ export default function Connections({ connections, onChange }: Props) {
           <header className="list-head">
             <h2>연결된 대상 {list.length}곳</h2>
           </header>
-          {connections === null && <p className="muted pad">불러오는 중…</p>}
-          {connections !== null && list.length === 0 && (
+          {loadError && (
+            <div className="pad">
+              <LoadError what="연결 목록" message={loadError} onRetry={onReload} />
+            </div>
+          )}
+          {!loadError && connections === null && <p className="muted pad">불러오는 중…</p>}
+          {!loadError && connections !== null && list.length === 0 && (
             <p className="muted pad">아직 없습니다. 오른쪽에서 첫 배포 대상을 추가하세요.</p>
           )}
           <ul className="conn-list">

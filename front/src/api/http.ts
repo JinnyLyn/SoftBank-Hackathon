@@ -33,8 +33,19 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, message)
 }
 
-export async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch('/api' + path, { ...init, credentials: 'same-origin' })
+/** 응답이 이 시간 안에 안 오면 실패로 봄. 큰 ZIP 업로드처럼 오래 걸리는 요청은 timeoutMs로 따로 지정 */
+const DEFAULT_TIMEOUT_MS = 20_000
+
+export async function req<T>(path: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
+  const { timeoutMs = DEFAULT_TIMEOUT_MS, ...rest } = init
+  let res: Response
+  try {
+    res = await fetch('/api' + path, { ...rest, credentials: 'same-origin', signal: AbortSignal.timeout(timeoutMs) })
+  } catch (e) {
+    if (e instanceof DOMException && (e.name === 'TimeoutError' || e.name === 'AbortError'))
+      throw new ApiError(408, `서버 응답이 ${Math.round(timeoutMs / 1000)}초 안에 오지 않았습니다.`)
+    throw new ApiError(0, '서버에 연결하지 못했습니다. 네트워크나 백엔드 실행 상태를 확인해 주세요.')
+  }
   if (!res.ok) throw await toApiError(res)
   const text = await res.text()
   return (text ? JSON.parse(text) : undefined) as T

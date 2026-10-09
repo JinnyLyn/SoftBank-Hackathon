@@ -76,6 +76,11 @@ export interface Tier {
   resources: Resource[]
   /** 추가 비용이 없을 때(온프레미스) 대신 보여 줄 자원 사용량 */
   usageNote?: string
+  /**
+   * 서버의 월 비용 추정 총액. 있으면 추천·선택 차단·승인 화면이 모두 이 값을 씀
+   * (리소스별 금액은 참고용이라 합계가 달라도 총액은 이 값)
+   */
+  totalUsd?: number
 }
 
 /** 연결된 배포 대상 하나에서 가능한 구성들 */

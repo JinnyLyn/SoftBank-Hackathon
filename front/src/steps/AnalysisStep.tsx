@@ -1,6 +1,6 @@
 import ProviderMark from '../components/ProviderMark'
 import { PROVIDERS } from '../providers'
-import { costText, tierTotal, usd } from '../format'
+import { costText, TIER_META, tierTotal, usd } from '../format'
 import type { Analysis, Choice, Recommendation, TierKey } from '../types'
 
 export type CodeState = 'idle' | 'loading' | 'ready' | 'error'
@@ -31,15 +31,20 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
   const selected = option?.tiers.find((t) => t.key === choice?.tier)
   const isRec = (id: string, t: TierKey) => rec.recommended?.connectionId === id && rec.recommended?.tier === t
 
-  // 열(구성 크기)마다 가장 싼 대상
+  const tierOf = (o: Recommendation['options'][number], k: TierKey) => o.tiers.find((t) => t.key === k)
+  // 어느 대상에든 계획이 있는 크기만 열로 보여 줌 (계획이 1~2개뿐일 수 있음)
+  const columns = TIER_KEYS.filter((k) => rec.options.some((o) => tierOf(o, k)))
+
+  // 열(구성 크기)마다 가장 싼 대상. 계획이 있는 칸만 비교
   const cheapest = Object.fromEntries(
-    TIER_KEYS.map((k) => {
-      const costs = rec.options.map((o) => ({ id: o.connectionId, c: tierTotal(o.tiers.find((t) => t.key === k)!) }))
+    columns.map((k) => {
+      const costs = rec.options.flatMap((o) => {
+        const t = tierOf(o, k)
+        return t ? [{ id: o.connectionId, c: tierTotal(t) }] : []
+      })
       return [k, costs.sort((a, b) => a.c - b.c)[0]?.id]
     }),
-  ) as Record<TierKey, string | undefined>
-
-  const head = rec.options[0]?.tiers
+  ) as Partial<Record<TierKey, string>>
 
   return (
     <div className="stack-lg">
@@ -83,10 +88,10 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
               <thead>
                 <tr>
                   <th>배포 대상</th>
-                  {head?.map((t) => (
-                    <th key={t.key}>
-                      {t.label}
-                      <small>{t.fit}</small>
+                  {columns.map((k) => (
+                    <th key={k}>
+                      {TIER_META[k].label}
+                      <small>{TIER_META[k].fit}</small>
                     </th>
                   ))}
                 </tr>
@@ -101,7 +106,18 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
                         <small>{PROVIDERS[o.provider].label}</small>
                       </span>
                     </th>
-                    {o.tiers.map((t) => {
+                    {columns.map((k) => {
+                      const t = tierOf(o, k)
+                      if (!t)
+                        return (
+                          <td key={k}>
+                            <button className="cell is-empty" disabled>
+                              <span className="cell-tags" />
+                              <strong>-</strong>
+                              <small>이 크기의 계획 없음</small>
+                            </button>
+                          </td>
+                        )
                       const on = choice?.connectionId === o.connectionId && choice?.tier === t.key
                       const over = tierTotal(t) > budget
                       return (

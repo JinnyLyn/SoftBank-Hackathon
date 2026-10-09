@@ -23,9 +23,11 @@ interface Props {
   page: Page
   onChange: (p: Page) => void
   connections: Connection[]
+  /** 연결 목록 조회 실패 (0곳과 구분) */
+  loadFailed: boolean
 }
 
-export default function Header({ page, onChange, connections }: Props) {
+export default function Header({ page, onChange, connections, loadFailed }: Props) {
   const broken = connections.filter((c) => c.status !== 'connected').length
 
   return (
@@ -47,8 +49,8 @@ export default function Header({ page, onChange, connections }: Props) {
           ))}
         </nav>
         <button className="account" onClick={() => onChange('targets')} title="연결 관리">
-          <span className={'dot' + (broken ? ' is-warn' : '')} />
-          대상 {connections.length}곳{broken ? ` · 확인 필요 ${broken}` : ''}
+          <span className={'dot' + (broken || loadFailed ? ' is-warn' : '')} />
+          {loadFailed ? '연결 정보 조회 실패' : `대상 ${connections.length}곳${broken ? ` · 확인 필요 ${broken}` : ''}`}
         </button>
       </div>
     </header>

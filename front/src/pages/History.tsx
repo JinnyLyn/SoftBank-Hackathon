@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import ProviderMark from '../components/ProviderMark'
+import LoadError from '../components/LoadError'
 import { costText, shortTime, usd } from '../format'
 import type { DeployRecord } from '../types'
 
@@ -12,10 +13,19 @@ const STATUS_TEXT: Record<DeployRecord['status'], string> = {
 
 export default function History() {
   const [records, setRecords] = useState<DeployRecord[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => {
-    api.history().then(setRecords).catch(() => setRecords([]))
+  // 조회 실패를 빈 이력으로 보이지 않게 따로 표시
+  const load = useCallback(() => {
+    setError(null)
+    setRecords(null)
+    api
+      .history()
+      .then(setRecords)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
   }, [])
+
+  useEffect(load, [load])
 
   // 앱별로 묶어서 최신 배포가 위로
   const groups = useMemo(() => {
@@ -34,11 +44,15 @@ export default function History() {
       <div className="page-head">
         <div>
           <h1>배포 이력</h1>
-          <p>앱별 배포 기록입니다. 배포 대상이 달라도 한곳에서 봅니다. 지금 떠 있는 앱 기준 월 예상 비용은 {costText(monthly)}입니다.</p>
+          <p>
+            앱별 배포 기록입니다.
+            {records && !error && ` 지금 떠 있는 앱 기준 월 예상 비용은 ${costText(monthly)}입니다.`}
+          </p>
         </div>
       </div>
 
-      {records === null && <p className="muted">불러오는 중…</p>}
+      {error && <LoadError what="배포 이력" message={error} onRetry={load} />}
+      {!error && records === null && <p className="muted">불러오는 중…</p>}
       {records !== null && groups.length === 0 && <p className="muted">아직 배포한 앱이 없습니다.</p>}
 
       {groups.map(([app, rs]) => {

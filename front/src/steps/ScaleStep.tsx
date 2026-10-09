@@ -1,5 +1,6 @@
 import ProviderMark from '../components/ProviderMark'
 import QuickConnect from '../components/QuickConnect'
+import LoadError from '../components/LoadError'
 import { ONPREM_ENABLED } from '../providers'
 import type { Connection, ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
 
@@ -24,12 +25,23 @@ interface Props {
   scale: ScaleInput
   locked: boolean
   connections: Connection[]
+  connectionsError: string | null
+  onReloadConnections: () => void
   onChange: (s: ScaleInput) => void
   onConnectionsChange: (list: Connection[]) => void
   onShowConnections: () => void
 }
 
-export default function ScaleStep({ scale, locked, connections, onChange, onConnectionsChange, onShowConnections }: Props) {
+export default function ScaleStep({
+  scale,
+  locked,
+  connections,
+  connectionsError,
+  onReloadConnections,
+  onChange,
+  onConnectionsChange,
+  onShowConnections,
+}: Props) {
   const usable = connections.filter((c) => c.status === 'connected')
   const skipped = connections.length - usable.length
 
@@ -123,7 +135,9 @@ export default function ScaleStep({ scale, locked, connections, onChange, onConn
         <p className="hint">몰리는 시간이나 저장하는 데이터 양을 적어 주면 사양을 더 알맞게 고릅니다.</p>
       </div>
 
-      {usable.length === 0 && !locked ? (
+      {connectionsError ? (
+        <LoadError what="연결 목록" message={connectionsError} onRetry={onReloadConnections} />
+      ) : usable.length === 0 && !locked ? (
         <QuickConnect connections={connections} onChange={onConnectionsChange} />
       ) : (
       <div className="compare-note">

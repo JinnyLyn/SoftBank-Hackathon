@@ -55,6 +55,8 @@ function createProject(source: Source): Promise<ProjectOut> {
       method: 'POST',
       headers: { 'Content-Type': 'application/zip' },
       body: source.file,
+      // 최대 200MB 업로드라 기본 제한(20초)보다 길게
+      timeoutMs: 10 * 60 * 1000,
     })
   }
   return req<ProjectOut>(
@@ -169,6 +171,8 @@ function toTier(p: PlanOut, key: TierKey): Tier {
     headline: str(v.headline) || p.module_id,
     tradeoff: str(v.tradeoff),
     resources,
+    // 화면의 모든 금액·예산 판단은 서버 추정 총액 하나로 (resources 합계와 달라도)
+    totalUsd: planCost(p),
   }
 }
 
@@ -263,22 +267,55 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
   }
 }
 
-/** 계획은 백엔드가 이미 만들어 둠 → 새로 생성하지 않고 저장해 둔 것을 돌려줌 */
+/**
+ * 계획은 백엔드가 이미 만들어 둠 → LLM을 다시 돌리지 않고 같은 계획을 다시 읽음.
+ * plan 파일 준비 여부(terraform_plan_ready)가 바뀌었는지 확인할 때도 씀.
+ * 다시 읽은 계획이 이후 승인 기준이 됨 (화면은 fingerprint가 바뀌면 확인 체크를 풀어 다시 검토하게 함)
+ */
 export async function generate(_projectId: string, choice: Choice): Promise<TerraformBundle> {
-  const p = plansByKey.get(keyOf(choice))
+  const k = keyOf(choice)
+  const p = plansByKey.get(k)
   if (!p) throw new ApiError(404, '이 구성의 배포 계획이 없습니다. 분석부터 다시 시작해 주세요.')
-  return toBundle(await req<PlanOut>(`/plans/${p.id}`))
+  const latest = await req<PlanOut>(`/plans/${p.id}`)
+  plansByKey.set(k, latest)
+  return toBundle(latest)
+}
+
+/** 이 계획으로 이미 등록된 배포가 있는지 */
+async function hasDeployment(projectId: string, planId: string) {
+  const q = new URLSearchParams({ project_id: projectId, limit: '100' })
+  const rows = await req<{ plan_id: string }[]>(`/deployments?${q}`)
+  return rows.some((r) => r.plan_id === planId)
 }
 
 /**
- * 승인 → 배포 대기열 등록. fingerprint는 사용자가 검토한 계획의 값을 그대로 보냄 (프런트가 계산하지 않음)
- * 승인 후 계획이 바뀌었으면 서버가 409로 막음
+ * 승인 → 배포 대기열 등록. 중간에 실패해도 다시 누르면 서버 상태를 보고 실패한 단계부터 이어 감
+ * - 이미 등록된 배포가 있으면 다시 등록하지 않고 끝냄 → 화면은 상태 조회로 넘어감 (중복 배포 방지)
+ * - 이미 승인된 계획이면 승인을 건너뜀
+ * - 검토한 뒤 계획 내용(fingerprint)이 바뀌었으면 승인하지 않고 다시 검토하게 함
+ * fingerprint는 서버가 준 값을 그대로 보냄 (프런트가 계산하지 않음)
  */
-export async function approve(_projectId: string, choice: Choice): Promise<void> {
-  const p = plansByKey.get(keyOf(choice))
-  if (!p) throw new ApiError(404, '승인할 배포 계획을 찾지 못했습니다. 분석부터 다시 시작해 주세요.')
-  const approved = await req<PlanOut>(`/plans/${p.id}/approve`, send('POST', { expected_fingerprint: p.fingerprint }))
-  await req(`/deployments`, send('POST', { plan_id: approved.id, expected_fingerprint: approved.fingerprint }))
+export async function approve(projectId: string, choice: Choice): Promise<void> {
+  const reviewed = plansByKey.get(keyOf(choice))
+  if (!reviewed) throw new ApiError(404, '승인할 배포 계획을 찾지 못했습니다. 분석부터 다시 시작해 주세요.')
+
+  if (await hasDeployment(projectId, reviewed.id)) return
+
+  let plan = await req<PlanOut>(`/plans/${reviewed.id}`)
+  if (plan.fingerprint !== reviewed.fingerprint)
+    throw new ApiError(409, '검토한 뒤 계획 내용이 바뀌었습니다. 코드 검토 화면에서 다시 확인하고 승인해 주세요.')
+  if (plan.status === 'awaiting_approval')
+    plan = await req<PlanOut>(`/plans/${plan.id}/approve`, send('POST', { expected_fingerprint: plan.fingerprint }))
+  else if (plan.status !== 'approved')
+    throw new ApiError(409, `이 계획은 더 이상 승인할 수 없는 상태입니다(${plan.status}). 분석부터 다시 진행해 주세요.`)
+
+  try {
+    await req('/deployments', send('POST', { plan_id: plan.id, expected_fingerprint: plan.fingerprint }))
+  } catch (e) {
+    // 응답을 못 받았지만 실제로는 등록됐을 수 있음 → 서버에 있으면 성공으로 보고 상태 조회로
+    if (await hasDeployment(projectId, plan.id).catch(() => false)) return
+    throw e
+  }
 }
 
 /** 실패 진단의 수정안을 반영하는 API는 아직 백엔드에 없음 */

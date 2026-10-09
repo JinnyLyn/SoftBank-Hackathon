@@ -18,7 +18,8 @@ export const TIER_META: Record<TierKey, { label: string; fit: string }> = {
   roomy: { label: '여유 있게', fit: '본격 운영, 하루 수천 명 이상' },
 }
 
-export const tierTotal = (t: Tier) => t.resources.reduce((s, r) => s + r.monthlyUsd, 0)
+/** 월 비용. 서버 추정 총액이 있으면 그것, 없으면(mock) 리소스 합계 */
+export const tierTotal = (t: Tier) => t.totalUsd ?? t.resources.reduce((s, r) => s + r.monthlyUsd, 0)
 
 /** 비용이 0이면(온프레미스) 금액 대신 문구 */
 export const costText = (n: number) => (n > 0 ? usd(n) : '추가 비용 없음')

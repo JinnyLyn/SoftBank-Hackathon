@@ -105,7 +105,7 @@ export default function ReviewStep({ bundle, tier, target, confirmed, locked, on
       )}
       {bundle.planInfo && !bundle.planInfo.ready && (
         <p className="conn-error">
-          서버에 Terraform plan 파일이 아직 올라오지 않아 승인할 수 없습니다. 준비되면 이 화면을 다시 열어 주세요.
+          서버에 Terraform plan 파일이 아직 올라오지 않아 승인할 수 없습니다. 몇 초마다 다시 확인해서 준비되면 바로 승인할 수 있게 바뀝니다.
         </p>
       )}
 

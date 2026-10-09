@@ -733,6 +733,40 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .quick-choices.is-single { grid-template-columns: minmax(0, 320px); }
 .quick-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
 
+/* ---------- 배포 상태 확인 지연·실패 ---------- */
+.poll-issue {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+  border: 1px solid #ecd9a2;
+  background: var(--marking-soft);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+}
+.poll-issue > div:first-child { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 320px; }
+.poll-issue strong { color: var(--marking-ink); }
+.poll-issue span { font-size: 13px; color: var(--ink-2); }
+.poll-actions { display: flex; gap: 6px; }
+.fail-note { margin: 10px 0 0; font-size: 13px; color: var(--ink-2); }
+
+/* ---------- 조회 실패 ---------- */
+.load-error {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid #ecc9c3;
+  background: var(--fail-soft);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+.load-error > div { display: flex; flex-direction: column; min-width: 0; }
+.load-error strong { color: var(--fail); font-size: 13.5px; }
+.load-error span { font-size: 12.5px; color: var(--ink-2); }
+.cell.is-empty { opacity: 0.5; }
+
 /* ---------- MOCK 표시, 예산, 재검토 ---------- */
 .mock-banner {
   background: var(--marking);

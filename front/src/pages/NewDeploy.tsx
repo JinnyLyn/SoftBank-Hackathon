@@ -8,6 +8,7 @@ import AnalysisStep, { type CodeState } from '../steps/AnalysisStep'
 import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
 import { costText, tierTotal, usd } from '../format'
+import type { PollIssue } from '../steps/DeployStep'
 import type {
   Analysis,
   Choice,
@@ -35,6 +36,12 @@ const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown',
 // 상태 확인 간격과, 일시적인 오류를 몇 번까지 다시 시도할지
 const POLL_MS = 700
 const MAX_POLL_ERRORS = 3
+// 배포 상태 확인 기한. 넘으면 실패로 단정하지 않고 "확인 지연"으로 안내하고, 사용자가 다시 조회하게 함
+// (자동으로 다시 배포하지 않음 → 중복 배포 방지)
+const FIRST_DEADLINE_MS = 30 * 60 * 1000
+const REPOLL_DEADLINE_MS = 10 * 60 * 1000
+// 코드 검토 중 plan 파일 준비 여부를 다시 확인하는 간격
+const PLAN_READY_POLL_MS = 3000
 
 type Busy = null | 'analyze' | 'approve' | 'fix'
 
@@ -43,12 +50,21 @@ const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
 
 interface Props {
   connections: Connection[]
+  connectionsError: string | null
+  onReloadConnections: () => void
   onConnectionsChange: (list: Connection[]) => void
   onShowHistory: () => void
   onShowConnections: () => void
 }
 
-export default function NewDeploy({ connections, onConnectionsChange, onShowHistory, onShowConnections }: Props) {
+export default function NewDeploy({
+  connections,
+  connectionsError,
+  onReloadConnections,
+  onConnectionsChange,
+  onShowHistory,
+  onShowConnections,
+}: Props) {
   const [step, setStep] = useState(0)
   const [source, setSourceState] = useState<Source | null>(null)
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
@@ -62,7 +78,10 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
   const [confirmed, setConfirmed] = useState(false)
   const [approved, setApproved] = useState(false)
   const [deploy, setDeploy] = useState<DeployStatus | null>(null)
-  const [runId, setRunId] = useState(0)
+  // 올릴 때마다 상태 확인을 새로 시작 (새 배포, 다시 조회)
+  const [pollRound, setPollRound] = useState(0)
+  const [pollIssue, setPollIssue] = useState<PollIssue | null>(null)
+  const deadlineRef = useRef(0)
   const [busy, setBusy] = useState<Busy>(null)
   const [error, setError] = useState<string | null>(null)
   // 분석을 새로 하면 이전 분석의 늦게 도착한 코드 응답은 버림
@@ -135,20 +154,29 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
   const selectedTier = option?.tiers.find((t) => t.key === choice?.tier) ?? null
   const usable = connections.filter((c) => c.status === 'connected')
 
-  // 승인 후 상태 확인. 끝나거나(성공·실패) 화면을 떠나거나 새 배포가 시작되면 멈춤
+  // 승인 후 상태 확인. 끝나거나(성공·실패), 기한을 넘기거나, 화면을 떠나거나, 새로 조회하면 멈춤
+  // 기한 초과·조회 실패는 배포 실패가 아님 → pollIssue로 안내만 하고 다시 조회는 사용자가 누름
   useEffect(() => {
-    if (!runId || !analysis) return
+    if (!pollRound || !analysis) return
     let stopped = false
     let timer: number | undefined
     let errors = 0
+    setPollIssue(null)
     const tick = async () => {
       try {
         const s = await api.status(analysis.projectId)
         if (stopped) return
         errors = 0
         setDeploy(s)
-        if (s.state === 'running') timer = window.setTimeout(tick, POLL_MS)
-        else setBusy(null)
+        if (s.state !== 'running') return setBusy(null)
+        if (Date.now() > deadlineRef.current) {
+          setPollIssue({
+            kind: 'timeout',
+            message: '예상보다 오래 걸리고 있습니다. 배포는 서버에서 계속 진행 중일 수 있습니다.',
+          })
+          return setBusy(null)
+        }
+        timer = window.setTimeout(tick, POLL_MS)
       } catch (e) {
         if (stopped) return
         errors += 1
@@ -157,7 +185,7 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
           timer = window.setTimeout(tick, POLL_MS * 2 ** errors)
           return
         }
-        setError(`배포 상태를 가져오지 못했습니다. ${errMsg(e)}`)
+        setPollIssue({ kind: 'error', message: errMsg(e) })
         setBusy(null)
       }
     }
@@ -166,7 +194,45 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
       stopped = true
       window.clearTimeout(timer)
     }
-  }, [runId])
+  }, [pollRound])
+
+  const startPolling = (deadlineMs: number) => {
+    deadlineRef.current = Date.now() + deadlineMs
+    setPollRound((n) => n + 1)
+  }
+
+  // 상태만 다시 읽음. 배포를 다시 요청하지 않음
+  const repoll = () => {
+    setBusy('approve')
+    startPolling(REPOLL_DEADLINE_MS)
+  }
+
+  // 코드 검토 중 plan 파일이 아직 없으면, LLM을 다시 돌리지 않고 같은 계획의 준비 상태만 다시 읽음
+  const planReady = bundle?.planInfo?.ready
+  useEffect(() => {
+    if (step !== 2 || locked || !analysis || !choice || planReady !== false) return
+    let stopped = false
+    let timer: number | undefined
+    const reviewedFingerprint = bundle?.planInfo?.fingerprint
+    const tick = async () => {
+      try {
+        const fresh = await api.generate(analysis.projectId, choice)
+        if (stopped) return
+        setBundles((m) => ({ ...m, [keyOf(choice)]: fresh }))
+        // 계획 내용이 바뀌었으면 이전 확인은 무효
+        if (fresh.planInfo?.fingerprint !== reviewedFingerprint) setConfirmed(false)
+        if (fresh.planInfo?.ready) return
+      } catch {
+        // 일시적인 오류면 다음에 다시
+      }
+      if (!stopped) timer = window.setTimeout(tick, PLAN_READY_POLL_MS)
+    }
+    timer = window.setTimeout(tick, PLAN_READY_POLL_MS)
+    return () => {
+      stopped = true
+      window.clearTimeout(timer)
+    }
+  }, [step, locked, key, planReady])
 
   const run = async (kind: Exclude<Busy, null>, fn: () => Promise<void>) => {
     setBusy(kind)
@@ -207,7 +273,7 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
       setApproved(true)
       setDeploy(null)
       setStep(3)
-      setRunId((n) => n + 1)
+      startPolling(FIRST_DEADLINE_MS)
     })
 
   // 실패 진단의 수정안 반영 → 검증·plan 재생성 → 코드 검토로 돌아가 다시 승인
@@ -220,10 +286,12 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
       setApproved(false)
       setConfirmed(false)
       setDeploy(null)
+      setPollIssue(null)
       setStep(2)
     })
 
   const restart = () => {
+    setPollIssue(null)
     setStep(0)
     setSourceState(null)
     setScaleState(DEFAULT_SCALE)
@@ -321,6 +389,8 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
                   scale={scale}
                   locked={locked || busy === 'analyze'}
                   connections={connections}
+                  connectionsError={connectionsError}
+                  onReloadConnections={onReloadConnections}
                   onChange={setScale}
                   onConnectionsChange={onConnectionsChange}
                   onShowConnections={onShowConnections}
@@ -356,6 +426,9 @@ export default function NewDeploy({ connections, onConnectionsChange, onShowHist
               status={deploy}
               targetName={option?.name ?? ''}
               fixing={busy === 'fix'}
+              pollIssue={pollIssue}
+              repolling={busy === 'approve'}
+              onRepoll={repoll}
               onFix={applyFix}
               onRestart={restart}
               onHistory={onShowHistory}
