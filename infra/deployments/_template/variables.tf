@@ -15,6 +15,8 @@ variable "platform" {
     database_url_parameter_arn = optional(string, "")
     # 실패한 배포를 얼마나 빨리 확정할지 조절한다. 느리게 뜨는 앱은 늘린다
     health_check_grace_seconds = optional(number, 90)
+    # 교체되는 태스크가 처리 중인 요청을 끝내도록 기다리는 시간(초)
+    deregistration_delay_seconds = optional(number, 30)
     foundation = object({
       alb_arn      = string
       alb_dns_name = string

@@ -112,9 +112,14 @@ variable "db_username" {
 }
 
 variable "ecr_keep_images" {
-  description = "ECR에 보관할 최근 이미지 수. 롤백 대상 이미지가 지워지지 않도록 넉넉하게 둔다"
+  description = "ECR에 보관할 최근 앱 이미지 수. 저장소 하나를 모든 앱이 같이 쓰므로 앱 수 x 롤백으로 되돌릴 버전 수보다 커야 한다(앱 49개 x 4버전 = 196). 부족하면 오래된 앱의 롤백 대상 이미지가 지워진다"
   type        = number
-  default     = 30
+  default     = 200
+
+  validation {
+    condition     = var.ecr_keep_images >= 10 && var.ecr_keep_images <= 1000
+    error_message = "ecr_keep_images는 10~1000이어야 합니다."
+  }
 }
 
 variable "protect_from_destroy" {

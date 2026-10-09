@@ -6,14 +6,14 @@
 # 관련 파일: ecs.tf(서비스가 대상 그룹에 태스크를 등록)
 
 # 대상 그룹 이름은 32자 제한이 있어 짧은 접두사를 쓴다 (예: pc-a1b2c3d4)
-# 데모 시간을 줄이려고 헬스체크 간격과 등록 해제 지연을 짧게 잡았다
+# 헬스체크 간격은 10초로 짧게 잡아 실패를 빨리 안다. 등록 해제 지연(deregistration_delay_seconds)은 교체되는 태스크가 처리 중인 요청을 끝낼 시간이다
 resource "aws_lb_target_group" "app" {
   name                 = local.short_name
   port                 = var.container_port
   protocol             = "HTTP"
   target_type          = "ip"
   vpc_id               = var.foundation.vpc_id
-  deregistration_delay = 10
+  deregistration_delay = var.deregistration_delay_seconds
 
   health_check {
     path                = var.health_check_path

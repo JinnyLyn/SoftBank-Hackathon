@@ -109,6 +109,17 @@ variable "database_url_parameter_arn" {
   }
 }
 
+variable "deregistration_delay_seconds" {
+  description = "교체되는 태스크가 대상 그룹에서 빠질 때 처리 중인 요청을 끝내도록 기다리는 시간(초). 짧으면 배포가 빨리 끝나지만 오래 걸리는 요청(업로드 등)이 끊긴다. ALB 기본값은 300"
+  type        = number
+  default     = 30
+
+  validation {
+    condition     = var.deregistration_delay_seconds >= 0 && var.deregistration_delay_seconds <= 300
+    error_message = "deregistration_delay_seconds는 0~300이어야 합니다."
+  }
+}
+
 variable "health_check_grace_seconds" {
   description = "새 태스크가 뜬 뒤 헬스체크 실패를 무시하는 시간(초). 느리게 기동하는 앱(JVM 등)은 늘려서 오탐 실패를 막는 용도다. 줄여도 실패한 배포가 빨리 확정되지는 않는다. 서킷 브레이커는 태스크가 3번 실패해야 배포를 FAILED로 만드는데, 실측으로 유예 90초에서 527초, 30초에서 500초가 걸렸다(태스크 기동, 대상 등록, 헬스체크 실패, 교체 시간이 지배적)"
   type        = number

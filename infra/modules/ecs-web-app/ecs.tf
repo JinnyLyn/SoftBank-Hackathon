@@ -40,6 +40,13 @@ resource "aws_ecs_task_definition" "app" {
       condition     = startswith(var.image, "${var.foundation.ecr_repository_url}:") || startswith(var.image, "${var.foundation.ecr_repository_url}@")
       error_message = "image는 foundation이 만든 ECR 저장소의 이미지여야 합니다."
     }
+
+    # 앱 전용 DB 접속 정보는 이 배포의 것이어야 한다. 모든 앱이 같은 실행 역할을 쓰고 그 역할은 /apps/ 아래 전체를 읽을 수 있으므로
+    # 다른 앱의 파라미터를 가리켜도 AWS가 막아 주지 않는다. 격리를 여기서 강제한다
+    precondition {
+      condition     = var.database_url_parameter_arn == "" || endswith(var.database_url_parameter_arn, "/apps/${var.deploy_id}/database-url")
+      error_message = "database_url_parameter_arn은 이 배포(${var.deploy_id})의 /apps/${var.deploy_id}/database-url 이어야 합니다. 다른 앱이나 관리자 접속 정보는 쓸 수 없습니다."
+    }
   }
 }
 

@@ -64,10 +64,13 @@ def classify(code, out):
     return "시험환경오류"
 
 
-def expect(name, want, code, out):
+def expect(name, want, code, out, why=None):
+    """why: 차단을 기대할 때 출력에 반드시 있어야 하는 문구(의도한 검증이 막았는지 확인). 다른 검증 오류로 막힌 것을 통과로 세지 않는다"""
     got = classify(code, out)
     if got == "시험환경오류":
         say("env", name, out.strip().replace("\n", " ")[:160])
+    elif got == want and want == "차단" and why and why not in out:
+        say("fail", f"{name} (다른 이유로 막힘: '{why}' 없음)", out.strip().replace("\n", " ")[:160])
     elif got == want:
         say("ok", name)
     else:
@@ -136,6 +139,8 @@ FAKE_FOUNDATION = {
     "database_url_parameter_arn": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/database-url",
     "db_admin_password_parameter_arn": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/db-admin-password",
     "db_admin_username": "paved_admin",
+    "db_name": "app",
+    "db_provisioner_execution_role_arn": "arn:aws:iam::123456789012:role/paved-clouds-db-provisioner-execution",
     "db_host": "paved-clouds-mysql.example.sa-east-1.rds.amazonaws.com",
     "db_port": 3306,
     "db_provisioner_log_group": "/paved-clouds/db-provisioner",
@@ -170,14 +175,14 @@ def run_module(d, p, a):
     return tf(d, "plan", "-input=false", "-refresh=false", "-lock=false", "-no-color")
 
 
-def case_module(d, name, want, pm=None, am=None):
+def case_module(d, name, want, pm=None, am=None, why=None):
     p, a = copy.deepcopy(BASE_P), copy.deepcopy(BASE_A)
     if pm:
         pm(p)
     if am:
         am(a)
     code, out = run_module(d, p, a)
-    expect("A " + name, want, code, out)
+    expect("A " + name, want, code, out, why)
     return code, out
 
 
@@ -190,14 +195,14 @@ def part_a(d):
     for n, k, v in [("container_port=0", "container_port", 0), ("container_port=70000", "container_port", 70000),
                     ("container_port=80.5", "container_port", 80.5), ("health_check_path='health'", "health_check_path", "health"),
                     ("health_check_path='/a b'", "health_check_path", "/a b"), ("task_size='large'", "task_size", "large")]:
-        case_module(d, n, "차단", am=lambda a, k=k, v=v: a.update({k: v}))
+        case_module(d, n, "차단", am=lambda a, k=k, v=v: a.update({k: v}), why=k)
     case_module(d, "min_tasks=3", "차단", am=lambda a: a.update(min_tasks=3, max_tasks=3))
     case_module(d, "max_tasks=5", "차단", am=lambda a: a.update(max_tasks=5))
     case_module(d, "min_tasks=2,max_tasks=1", "차단", am=lambda a: a.update(min_tasks=2, max_tasks=1))
     for k in ["DATABASE_URL", "DB_PASSWORD", "API_KEY", "lower"]:
         case_module(d, f"environment에 {k}", "차단", am=lambda a, k=k: a["environment"].update({k: "x"}))
     case_module(d, "environment 21개", "차단", am=lambda a: a.update(environment={f"K{i}": "v" for i in range(21)}))
-    case_module(d, "image :latest", "차단", lambda p: p.update(image=ECR + ":latest"))
+    case_module(d, "image :latest", "차단", lambda p: p.update(image=ECR + ":latest"), why="latest")
     case_module(d, "image 태그 없음", "차단", lambda p: p.update(image=ECR))
     case_module(d, "image docker.io", "차단", lambda p: p.update(image="docker.io/library/nginx:1"))
     case_module(d, "image 다른 ECR 저장소", "차단", lambda p: p.update(image="111122223333.dkr.ecr.sa-east-1.amazonaws.com/other/x:1"))
@@ -206,12 +211,20 @@ def part_a(d):
     case_module(d, "deploy_id='ab'", "차단", lambda p: p.update(deploy_id="ab", image=ECR + ":ab-r1"))
     case_module(d, "deploy_id='abc-1234'(하이픈)", "차단", lambda p: p.update(deploy_id="abc-1234"))
     case_module(d, "deploy_id 대문자", "차단", lambda p: p.update(deploy_id="ABCD1234"))
-    case_module(d, "cpu_architecture='arm'", "차단", lambda p: p.update(cpu_architecture="arm"))
+    case_module(d, "cpu_architecture='arm'", "차단", lambda p: p.update(cpu_architecture="arm"), why="cpu_architecture")
     case_module(d, "use_database=true, 파라미터 ARN 빈값", "차단", lambda p: p["foundation"].update(database_url_parameter_arn=""))
-    case_module(d, "health_check_grace_seconds=601", "차단", lambda p: p.update(health_check_grace_seconds=601))
+    case_module(d, "health_check_grace_seconds=601", "차단", lambda p: p.update(health_check_grace_seconds=601), why="health_check_grace_seconds")
     case_module(d, "database_url_parameter_arn 형식 오류", "차단", lambda p: p.update(database_url_parameter_arn="not-an-arn"))
-    case_module(d, "listener_protocol='FTP'", "차단", lambda p: p["foundation"].update(listener_protocol="FTP"))
-    case_module(d, "HTTPS인데 certificate_arn 비어 있음", "차단", lambda p: p["foundation"].update(listener_protocol="HTTPS"))
+    case_module(d, "listener_protocol='FTP'", "차단", lambda p: p["foundation"].update(listener_protocol="FTP"), why="listener_protocol")
+    case_module(d, "HTTPS인데 certificate_arn 비어 있음", "차단", lambda p: p["foundation"].update(listener_protocol="HTTPS"), why="certificate_arn")
+    # 앱 전용 DB 접속 정보는 이 배포의 것이어야 한다(격리를 모듈이 강제)
+    other = "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/other123/database-url"
+    case_module(d, "다른 앱의 DB 접속 정보 ARN", "차단", lambda p: p.update(database_url_parameter_arn=other), why="database_url_parameter_arn")
+    case_module(d, "공유 관리자 DB URL ARN을 앱 전용 값으로 지정", "차단",
+                lambda p: p.update(database_url_parameter_arn=FAKE_FOUNDATION["database_url_parameter_arn"]), why="database_url_parameter_arn")
+    case_module(d, "정상: 이 배포의 앱 전용 DB 접속 정보 ARN", "통과",
+                lambda p: p.update(database_url_parameter_arn="arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/database-url"))
+    case_module(d, "deregistration_delay_seconds=301", "차단", lambda p: p.update(deregistration_delay_seconds=301), why="deregistration_delay_seconds")
     case_module(d, "정상: HTTPS + 인증서", "통과", lambda p: p["foundation"].update(listener_protocol="HTTPS", certificate_arn=FAKE_CERT))
 
 
@@ -323,6 +336,7 @@ def part_c(d, with_aws):
     inv("nat_ami_id 형식 오류", R, "-var=nat_ami_id=ubuntu")
     inv("db_backup_retention_days=0", R, "-var=db_backup_retention_days=0")
     inv("db_backup_retention_days=36", R, "-var=db_backup_retention_days=36")
+    inv("ecr_keep_images=5", R, "-var=ecr_keep_images=5")
 
     if not with_aws:
         print("\n=== C. foundation 계획 내용 === (AWS 자격증명이 없거나 --skip-aws라서 건너뜀)")
@@ -352,7 +366,19 @@ def part_c(d, with_aws):
     is_("기본: RDS 삭제 보호 켜짐, 단일 AZ", planned(base, "aws_db_instance.this")[0]["deletion_protection"] is True
         and planned(base, "aws_db_instance.this")[0]["multi_az"] is False)
     # IAM 정책은 다른 리소스의 ARN이 apply 때 정해져서 계획에서는 값을 볼 수 없다. 정책 코드에 경로가 있는지 확인한다
-    is_("기본: IAM이 앱별 DB 접속 정보 경로(/apps/*)를 읽을 수 있다", "/apps/*" in (INFRA / "foundation" / "iam.tf").read_text(encoding="utf-8"))
+    # IAM 정책은 다른 리소스의 ARN이 apply 때 정해져서 계획에서 값을 볼 수 없다. 그래서 정책 문서 블록 단위로 소스를 확인한다(소스 확인)
+    iam = (INFRA / "foundation" / "iam.tf").read_text(encoding="utf-8")
+    app_doc = iam.split('data "aws_iam_policy_document" "read_secrets"')[1].split("\n}\n")[0]
+    prov_doc = iam.split('data "aws_iam_policy_document" "db_provisioner_read"')[1].split("\n}\n")[0]
+    is_("기본(소스 확인): 앱 공유 실행 역할은 앱별 접속 정보(/apps/*)를 읽지만 DB 관리자 비밀번호는 읽지 못한다",
+        "apps_param_arn" in app_doc and "db_admin_password" not in app_doc)
+    is_("기본(소스 확인): 관리자 비밀번호는 DB 작업 전용 역할만 읽는다", "db_admin_password" in prov_doc)
+    is_("기본: DB 작업 전용 실행 역할이 만들어진다", n(base, "aws_iam_role.db_provisioner_execution") == 1)
+    pol = json.loads(planned(base, "aws_ecr_lifecycle_policy.apps")[0]["policy"])
+    r1, r2 = pol["rules"][0]["selection"], pol["rules"][1]["selection"]
+    is_("기본: ECR 보관 정책은 앱 이미지 200개, tools- 이미지는 별도 규칙(우선순위가 더 앞)",
+        r1.get("tagPrefixList") == ["tools-"] and pol["rules"][0]["rulePriority"] < pol["rules"][1]["rulePriority"]
+        and r2["countNumber"] == 200 and r2["tagStatus"] == "any", str(pol)[:160])
 
     ha, out = pj("-var=enable_nat_instance=true", "-var=nat_high_availability=false")
     if ha:
@@ -417,9 +443,10 @@ def part_d():
     say("ok" if lines == want else "fail", "D 앱 전용 DB 이름·파라미터·ARN 규칙", "" if lines == want else f"{lines} {err[:80]}")
 
     sample = ("connecting to mysql://paved_admin:Sup3rS3cretPw@host:3306/app\nAKIAABCDEFGHIJKLMNOP\npassword=hunter2 token: abc123\n"
+              "PASSWORD=UpperPw1 Api-Key: UpperKey2 API_KEY=UpperKey3\n"
               "GET /health 200 OK")
     rc, out, err = sh(f"printf '%s' '{sample}' | mask")
-    masked_ok = all(s not in out for s in ["Sup3rS3cretPw", "ABCDEFGHIJKLMNOP", "hunter2", "abc123"]) and "GET /health 200 OK" in out
+    masked_ok = all(s not in out for s in ["Sup3rS3cretPw", "ABCDEFGHIJKLMNOP", "hunter2", "abc123", "UpperPw1", "UpperKey2", "UpperKey3"]) and "GET /health 200 OK" in out
     say("ok" if masked_ok else "fail", "D 로그 마스킹: 비밀은 가리고 정상 로그는 남긴다", "" if masked_ok else out[:120])
 
     for mode, want_secrets, need_text in [("provision", {"DB_ADMIN_PASSWORD", "APP_URL"}, "CREATE DATABASE"),
@@ -439,7 +466,9 @@ def part_d():
                   and c["logConfiguration"]["options"]["awslogs-group"] == FAKE_FOUNDATION["db_provisioner_log_group"]
                   and c["logConfiguration"]["options"]["awslogs-region"] == "sa-east-1"
                   and c["image"] == FAKE_FOUNDATION["ecr_repository_url"] + ":tools-mysql84"
-                  and td["executionRoleArn"] == FAKE_FOUNDATION["execution_role_arn"]
+                  # 관리자 비밀번호는 앱이 쓰는 공유 실행 역할이 아니라 DB 작업 전용 역할만 읽는다
+                  and td["executionRoleArn"] == FAKE_FOUNDATION["db_provisioner_execution_role_arn"]
+                  and {e["name"]: e["value"] for e in c["environment"]}.get("OTHER_DB") == FAKE_FOUNDATION["db_name"]
                   and {x["valueFrom"] for x in c["secrets"]} <= {FAKE_FOUNDATION["db_admin_password_parameter_arn"],
                                                                  "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/database-url"})
             # 접속 정보는 secrets(valueFrom ARN)로만 전달되고 평문 비밀번호는 JSON에 없다
@@ -559,7 +588,7 @@ def part_d():
 
 
     # ---- 롤백 대상을 이미지가 아니라 배포 항목(이미지 + 앱 설정)으로 고르는지 (Codex 재리뷰 지적) ----
-    def entry_case(name, history, snaps, applied, want):
+    def entry_case(name, history, applied, want):
         """history: [(image, stamp, app_config)], applied: (image, app_config) 또는 None(보관본 없음)"""
         # 폴더 이름은 ASCII로 한다. 설명 문장(한글·화살표)을 쓰면 Windows에서 Python이 경로를 열지 못한다
         entry_case.n = getattr(entry_case, "n", 0) + 1
@@ -584,21 +613,174 @@ def part_d():
     c2 = {"container_port": 8000, "health_check_path": "/health2", "environment": {"A": "2"}}
     c3 = {"container_port": 9000, "health_check_path": "/health", "environment": {"A": "1"}}
     entry_case("이미지는 그대로(r1)이고 설정만 바꾼 업데이트 뒤 → 직전 설정의 항목(옛 코드는 대상을 못 찾음)",
-               [("IMG:r1", "s1", c1), ("IMG:r1", "s2", c2)], None, ("IMG:r1", c2), "IMG:r1|s1")
+               [("IMG:r1", "s1", c1), ("IMG:r1", "s2", c2)], ("IMG:r1", c2), "IMG:r1|s1")
     entry_case("설정만 바꾼 업데이트가 여러 번(c1→c2→c3) → 직전(c2) 항목",
-               [("IMG:r1", "s1", c1), ("IMG:r1", "s2", c2), ("IMG:r1", "s3", c3)], None, ("IMG:r1", c3), "IMG:r1|s2")
+               [("IMG:r1", "s1", c1), ("IMG:r1", "s2", c2), ("IMG:r1", "s3", c3)], ("IMG:r1", c3), "IMG:r1|s2")
     entry_case("마지막으로 apply한 것이 실패한 설정 변경(이력에 없음) → 마지막 정상 항목",
-               [("IMG:r1", "s1", c1)], None, ("IMG:r1", c2), "IMG:r1|s1")
+               [("IMG:r1", "s1", c1)], ("IMG:r1", c2), "IMG:r1|s1")
     entry_case("이미지와 설정이 모두 같은 중복 항목은 건너뛴다",
-               [("IMG:r0", "s0", c3), ("IMG:r1", "s1", c1), ("IMG:r1", "s2", c1)], None, ("IMG:r1", c1), "IMG:r0|s0")
-    entry_case("이미지가 다르면 대상(이미지 r1→r2)", [("IMG:r1", "s1", c1), ("IMG:r2", "s2", c1)], None, ("IMG:r2", c1), "IMG:r1|s1")
+               [("IMG:r0", "s0", c3), ("IMG:r1", "s1", c1), ("IMG:r1", "s2", c1)], ("IMG:r1", c1), "IMG:r0|s0")
+    entry_case("이미지가 다르면 대상(이미지 r1→r2)", [("IMG:r1", "s1", c1), ("IMG:r2", "s2", c1)], ("IMG:r2", c1), "IMG:r1|s1")
     entry_case("보관본(applied)이 없는 옛 배포는 이미지끼리 비교(현재 r9, 스냅샷 없는 옛 이력)",
-               [("IMG:r1", "", None), ("IMG:r9", "", None)], None, None, "IMG:r1|")
+               [("IMG:r1", "", None), ("IMG:r9", "", None)], None, "IMG:r1|")
 
     # 정지 태스크 조회가 실패하면 조용히 0으로 넘기지 않고 경고를 낸다
     rc, out, err = sh('aws() { echo "InvalidParameterException: 거부됨" >&2; return 255; }; count_stopped_tasks sa-east-1 paved-clouds ecs-svc/CUR')
     ok = out.strip() == "0" and "조회하지 못했습니다" in err and "InvalidParameterException" in err
     say("ok" if ok else "fail", "D 정지 태스크 조회가 실패하면 0으로 대신하되 경고를 낸다(조용히 숨기지 않음)", err[:100])
+
+
+    # ---- 리뷰 지적 수정: ID 검증, 폴더 정리, 입력 되돌리기, foundation 갱신, ECR 확인, 헬스체크 대기 ----
+    # 배포 ID가 아닌 값으로 destroy/status/rollback을 부르면 deployments 밖 폴더(foundation)를 건드린다
+    for sub in ["cmd_destroy ../foundation --yes", "cmd_status ../foundation", "cmd_rollback ../foundation --plan-only", "cmd_update .. --image x"]:
+        rc, out, err = sh('terraform() { echo TERRAFORM_CALLED; }; aws() { echo AWS_CALLED; }; ' + sub)
+        say("ok" if rc != 0 and "TERRAFORM_CALLED" not in out and "AWS_CALLED" not in out and "deploy id" in err else "fail",
+            f"D 배포 ID가 아닌 값은 거부(terraform 실행 없음): {sub.split()[0]} {sub.split()[1]}", f"rc={rc} {err[:80]}")
+
+    # up이 쓸 폴더: 삭제 끝난 폴더는 보관 폴더로 옮겨 같은 ID를 다시 쓸 수 있고, 아직 살아 있는 배포는 거부
+    croot = WORK / "claimroot"
+    (croot / "deployments" / "abcd1234").mkdir(parents=True, exist_ok=True)
+    rc, out, err = sh(f'ROOT={P(croot)}; claim_deploy_dir abcd1234')
+    say("ok" if rc != 0 and "이미 있는 배포" in err else "fail", "D 아직 삭제하지 않은 같은 ID 폴더는 거부", err[:80])
+    (croot / "deployments" / "abcd1234" / "destroyed").write_text("x", encoding="utf-8")
+    rc, out, err = sh(f'ROOT={P(croot)}; claim_deploy_dir abcd1234')
+    arch = list((croot / "deployments" / "_destroyed").glob("abcd1234-*")) if (croot / "deployments" / "_destroyed").exists() else []
+    say("ok" if rc == 0 and len(arch) == 1 and not (croot / "deployments" / "abcd1234").exists() else "fail",
+        "D destroy가 끝난 폴더는 보관 폴더로 옮기고 같은 ID를 다시 쓸 수 있다", f"rc={rc} {err[:80]}")
+
+    # up이 apply 전에 실패하면 만들다 만 폴더를 지우고, apply가 시작됐거나 성공했으면 지우지 않는다
+    for phase, status, want_exists, label in [("prep", "1", False, "apply 전에 실패하면 폴더를 지운다"),
+                                              ("", "1", True, "apply가 시작된 뒤 실패하면(state가 있을 수 있음) 지우지 않는다"),
+                                              ("prep", "0", True, "성공(--plan-only 포함)이면 지우지 않는다")]:
+        cdir = WORK / ("cleanup_" + (phase or "none") + status)
+        cdir.mkdir(parents=True, exist_ok=True)
+        (cdir / "terraform.tfstate").write_text("{}", encoding="utf-8")
+        rc, out, err = sh(f'UP_DIR={P(cdir)}; UP_PHASE="{phase}"; set +e; (exit {status}); cleanup_failed_up')
+        say("ok" if cdir.exists() == want_exists else "fail", "D up 정리: " + label, f"존재={cdir.exists()}")
+
+    # --plan-only만 하고 버린 변경이 다음 계획에 섞이지 않는다
+    rdir = WORK / "reset1"
+    rdir.mkdir(parents=True, exist_ok=True)
+    good_app = {"app": {"container_port": 8000, "use_database": False}}
+    good_plat = {"platform": {"deploy_id": "abcd1234", "image": "IMG:good", "database_url_parameter_arn": "", "foundation": {"x": 1}}}
+    (rdir / "applied.app.json").write_text(json.dumps(good_app), encoding="utf-8")
+    (rdir / "applied.platform.json").write_text(json.dumps(good_plat), encoding="utf-8")
+    (rdir / "app.auto.tfvars.json").write_text(json.dumps({"app": {"container_port": 9999, "use_database": True}}), encoding="utf-8")
+    (rdir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "image": "IMG:discarded", "database_url_parameter_arn": "arn:x", "foundation": {"x": 2}}}), encoding="utf-8")
+    (rdir / "tfplan").write_text("x", encoding="utf-8")
+    (rdir / "db-isolated").write_text("app_abcd1234\n", encoding="utf-8")   # 버린 계획이 켠 표식(provisioned 아님)
+    rc, out, err = sh(f'reset_inputs {P(rdir)}')
+    a = json.loads((rdir / "app.auto.tfvars.json").read_text(encoding="utf-8"))
+    pl = json.loads((rdir / "platform.auto.tfvars.json").read_text(encoding="utf-8"))
+    say("ok" if a == good_app and pl == good_plat and not (rdir / "tfplan").exists() and not (rdir / "db-isolated").exists() else "fail",
+        "D 입력 되돌리기: 버린 계획의 이미지·앱 설정·앱 전용 DB 표식·저장된 계획이 남지 않는다", f"{a} {pl}"[:120])
+    rdir2 = WORK / "reset2"
+    rdir2.mkdir(parents=True, exist_ok=True)
+    plat_db = {"platform": {"deploy_id": "abcd1234", "image": "IMG:good", "database_url_parameter_arn": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/database-url", "foundation": {}}}
+    (rdir2 / "applied.app.json").write_text(json.dumps(good_app), encoding="utf-8")
+    (rdir2 / "applied.platform.json").write_text(json.dumps(plat_db), encoding="utf-8")
+    (rdir2 / "app.auto.tfvars.json").write_text("{}", encoding="utf-8")
+    (rdir2 / "platform.auto.tfvars.json").write_text("{}", encoding="utf-8")
+    rc, out, err = sh(f'reset_inputs {P(rdir2)}')
+    say("ok" if (rdir2 / "db-isolated").exists() else "fail", "D 입력 되돌리기: 배포된 상태가 앱 전용 DB를 쓰면 표식을 맞춘다", err[:80])
+    rdir3 = WORK / "reset3"
+    rdir3.mkdir(parents=True, exist_ok=True)
+    (rdir3 / "platform.auto.tfvars.json").write_text("KEEP", encoding="utf-8")
+    rc, out, err = sh(f'reset_inputs {P(rdir3)}')
+    say("ok" if (rdir3 / "platform.auto.tfvars.json").read_text(encoding="utf-8") == "KEEP" else "fail", "D 입력 되돌리기: apply된 적 없는 배포(up --plan-only 직후)는 그대로 둔다")
+
+    # update·rollback이 foundation 값을 지금 출력으로 갱신한다
+    fdir = WORK / "fresh"
+    fdir.mkdir(parents=True, exist_ok=True)
+    (fdir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "image": "IMG:good", "foundation": {"alb_dns_name": "OLD", "listener_protocol": "HTTP"}}}), encoding="utf-8")
+    new_f = dict(FAKE_FOUNDATION, listener_protocol="HTTPS", certificate_arn=FAKE_CERT)
+    fj.write_text(json.dumps(new_f), encoding="utf-8")
+    rc, out, err = sh(f'export_foundation() {{ :; }}; refresh_foundation {P(fdir)}')
+    pl = json.loads((fdir / "platform.auto.tfvars.json").read_text(encoding="utf-8"))["platform"]
+    say("ok" if pl["foundation"] == new_f and pl["image"] == "IMG:good" else "fail", "D update/rollback은 foundation 값을 지금 출력(HTTPS 등)으로 갱신하고 나머지 입력은 유지", err[:80])
+    fj.write_text(json.dumps(FAKE_FOUNDATION), encoding="utf-8")
+
+    # 이미지 변경은 JSON으로 한다(sed였을 때는 &, 역슬래시가 치환 문법으로 해석됨)
+    idir = WORK / "imgset"
+    idir.mkdir(parents=True, exist_ok=True)
+    (idir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"image": "OLD"}}), encoding="utf-8")
+    rc, out, err = sh(f'd={P(idir)}; set_platform_field "$d" image "a&b:tag"; input_image "$d"')
+    say("ok" if out.strip() == "a&b:tag" else "fail", "D 이미지 값 교체: & 가 있어도 그대로 들어간다(sed 치환이었다면 깨짐)", out.strip()[:60])
+
+    # ECR에 이미지가 있는지(없는 이미지로 배포하면 서킷 브레이커까지 8분 넘게 걸림)
+    ilog = WORK / "ecr-args.log"
+    img = "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps:abcd1234-r1"
+    rc, out, err = sh(f'aws() {{ echo "$@" >> {P(ilog)}; echo "{{}}"; }}; check_image_exists "{img}"')
+    args = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    say("ok" if rc == 0 and "--repository-name paved-clouds/apps" in args and "imageTag=abcd1234-r1" in args else "fail", "D ECR 이미지 확인: 태그 이미지를 올바른 저장소·태그로 조회", f"{rc} {args[:100]}")
+    ilog.unlink(missing_ok=True)
+    dg = "a" * 64
+    rc, out, err = sh(f'aws() {{ echo "$@" >> {P(ilog)}; echo "{{}}"; }}; check_image_exists "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps@sha256:{dg}"')
+    args = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    say("ok" if rc == 0 and ("imageDigest=sha256:" + dg) in args else "fail", "D ECR 이미지 확인: 다이제스트 이미지는 imageDigest로 조회", args[:100])
+    rc, out, err = sh('aws() { echo "An error occurred (ImageNotFoundException) when calling the DescribeImages operation" >&2; return 254; }; check_image_exists "%s"' % img)
+    say("ok" if rc != 0 and "ECR에 이미지가 없습니다" in err else "fail", "D ECR 이미지 확인: 없으면 배포 전에 중단(롤백 대상이 만료된 경우 포함)", err[:100])
+    rc, out, err = sh('aws() { echo "An error occurred (AccessDeniedException)" >&2; return 254; }; check_image_exists "%s"' % img)
+    say("ok" if rc != 0 and "확인하지 못했습니다" in err else "fail", "D ECR 이미지 확인: 권한 오류는 '없음'이 아니라 확인 실패로 구분", err[:100])
+
+    # 포트 자동 할당: 조회가 실패하면 8001로 넘어가지 않고 중단
+    rc, out, err = sh('aws() { return 255; }; pick_port')
+    say("ok" if rc != 0 and out.strip() == "" and "조회하지 못했습니다" in err else "fail", "D 포트 자동 할당: 리스너 조회 실패를 숨기고 8001을 고르지 않는다", f"rc={rc} out={out.strip()} {err[:60]}")
+    rc, out, err = sh('aws() { echo "80 8001 8002"; }; pick_port')
+    say("ok" if out.strip() == "8003" else "fail", "D 포트 자동 할당: 쓰는 포트를 건너뛰고 가장 작은 빈 포트", out.strip())
+
+    # S3 state: 버전 확인, 이미 있는 원격 state를 덮어쓰지 않는다
+    for ver, want in [("1.9.8", False), ("1.10.0", True), ("1.16.5", True), ("1.10.0-beta1", True)]:
+        rc, out, err = sh(f'tf_version() {{ echo {ver}; }}; require_tf_for_s3')
+        say("ok" if (rc == 0) == want else "fail", f"D S3 state는 Terraform 1.10 이상만({ver})", err[:60])
+    fdir2 = WORK / "fstate"
+
+    def fstate_case(name, aws_body, local_state, want_rc, want_in_log, want_override):
+        fdir2.mkdir(parents=True, exist_ok=True)
+        for f in fdir2.glob("*"):
+            f.unlink()
+        if local_state:
+            (fdir2 / "terraform.tfstate").write_text('{"version":4}', encoding="utf-8")
+        tlog = WORK / "tf-calls.log"
+        tlog.unlink(missing_ok=True)
+        code = (f'FOUNDATION={P(fdir2)}; tf_version() {{ echo 1.16.5; }}; aws() {{ {aws_body}; }}; '
+                f'terraform() {{ echo "$@" >> {P(tlog)}; }}; cmd_foundation_state')
+        rc, out, err = sh(code, {"PAVED_STATE_BUCKET": "my-state-bucket"})
+        calls = tlog.read_text(encoding="utf-8") if tlog.exists() else ""
+        ok = (rc == 0) == want_rc and (want_in_log in calls if want_in_log else calls == "") and (fdir2 / "backend_override.tf").exists() == want_override
+        say("ok" if ok else "fail", "D foundation-state: " + name, f"rc={rc} calls={calls.strip()[:80]} {err[:60]}")
+
+    fstate_case("S3에 이미 있고 이 PC에도 로컬 state가 있으면 덮어쓰지 않고 중단", 'echo "{}"', True, False, "", False)
+    fstate_case("S3에 이미 있고 로컬 state가 없으면 그 state를 연결(-reconfigure)", 'echo "{}"', False, True, "-reconfigure", True)
+    fstate_case("S3에 없으면 로컬 state를 옮긴다(-migrate-state)", 'echo "An error occurred (404) when calling the HeadObject operation: Not Found" >&2; return 254', True, True, "-migrate-state", True)
+    fstate_case("S3 확인이 권한 오류면 없다고 보지 않고 중단", 'echo "An error occurred (403) when calling the HeadObject operation: Forbidden" >&2; return 254', True, False, "", False)
+
+    # DB 작업이 컨테이너 시작 전에 실패하면 이유를 보여 준다
+    rc, out, err = sh("""region() { echo sa-east-1; }; ensure_tools_image() { :; }; db_taskdef_json() { echo "{}"; }
+        awsn() { case "$*" in *register-task-definition*) echo arn:td;; *run-task*) echo arn:aws:ecs:sa-east-1:1:task/c/abc123;; *) :;; esac; }
+        aws() { case "$*" in *"stoppedReason"*) printf 'CannotPullContainerError: image not found\\tNone\\n';; *exitCode*) echo None;; *) :;; esac; }
+        db_task provision abcd1234""")
+    say("ok" if rc != 0 and "CannotPullContainerError" in err and "컨테이너가 시작되지 못함" in err else "fail", "D DB 작업이 시작도 못 하면 종료 코드 None 대신 stoppedReason을 보여 준다", err[:160])
+
+    # ---- 헬스체크 대기: 통과·실패 판정 (실제 AWS로만 확인했던 핵심 흐름) ----
+    def wait_case(name, th_state, th_desc, rollout, want_rc, want_reason, timeout="1", stopped="0"):
+        code = ('tf() { echo x; }; sleep() { :; }; '
+                'aws() { case "$*" in *describe-target-health*) printf "%s\\t%s\\n" "$TH_STATE" "$TH_DESC";; '
+                '*describe-services*) printf "%s\\t%s\\n" "$ROLLOUT" "ecs-svc/CUR";; *list-tasks*) echo "$STOPPED";; esac; }; '
+                'wait_healthy abcd1234 && rc=0 || rc=$?; echo "RC=$rc REASON=$WAIT_REASON"')
+        rc, out, err = sh(code, {"TH_STATE": th_state, "TH_DESC": th_desc, "ROLLOUT": rollout, "HEALTH_TIMEOUT": timeout, "STOPPED": stopped})
+        got = out.strip().splitlines()[-1] if out.strip() else ""
+        ok = f"RC={want_rc}" in got and want_reason in got
+        say("ok" if ok else "fail", "D 헬스체크 대기: " + name, got[:120])
+
+    wait_case("ECS 배포가 COMPLETED이고 대상이 healthy면 통과", "healthy", "None", "COMPLETED", 0, "")
+    wait_case("대상이 healthy여도 롤아웃이 IN_PROGRESS면 통과하지 않는다(옛 태스크 때문에 일찍 통과하던 버그)", "healthy", "None", "IN_PROGRESS", 1, "시간 초과")
+    wait_case("COMPLETED여도 대상이 unhealthy면 통과하지 않는다", "unhealthy", "None", "COMPLETED", 1, "시간 초과")
+    wait_case("헬스체크가 4xx를 4번 연속 돌려주면 시간 초과를 기다리지 않고 실패", "unhealthy", "Health checks failed with these codes: [404]", "IN_PROGRESS", 1, "4xx", timeout="300")
+    wait_case("5xx(시작 중 503)는 즉시 실패로 보지 않는다", "unhealthy", "Health checks failed with these codes: [503]", "IN_PROGRESS", 1, "시간 초과")
+    wait_case("ECS 서킷 브레이커가 FAILED로 만들면 실패", "unhealthy", "None", "FAILED", 1, "서킷 브레이커", timeout="300")
+    wait_case("이번 배포의 태스크가 3개 이상 종료되면 실패", "initial", "None", "IN_PROGRESS", 1, "반복해서 종료", timeout="300", stopped="3")
+    wait_case("이번 배포의 정지 태스크가 2개면 계속 기다린다", "initial", "None", "IN_PROGRESS", 1, "시간 초과", stopped="2")
 
 
 def part_e():

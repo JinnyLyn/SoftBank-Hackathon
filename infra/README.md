@@ -76,7 +76,7 @@ export AWS_REGION=sa-east-1
 
 # 2) foundation. 앱을 프라이빗 서브넷에 두는 실제 배포 구성은 enable_nat_instance=true
 terraform -chdir=infra/foundation init
-bash infra/scripts/deploy.sh foundation-state        # foundation state를 S3로 (선택, 권장)
+bash infra/scripts/deploy.sh foundation-state        # foundation state를 S3로 (선택, 권장. S3 state는 Terraform 1.10 이상)
 terraform -chdir=infra/foundation apply -var="region=sa-east-1" -var="enable_nat_instance=true" \
   -var="certificate_arn=<ACM 인증서 ARN>"             # 인증서가 없으면 이 줄을 뺀다(HTTP만 열림, 시험용)
 terraform -chdir=infra/foundation output -json deploy_inputs > infra/deployments/foundation.json
@@ -98,6 +98,7 @@ terraform -chdir=infra/foundation output -json deploy_inputs > infra/deployments
 | `db_multi_az` | `false` | 다중 AZ(비용 약 2배) |
 | `final_snapshot` | `true` | RDS를 지울 때 최종 스냅샷을 남긴다 |
 | `protect_from_destroy` | `true` | RDS 삭제 보호, ECR 강제 삭제 방지 |
+| `ecr_keep_images` | `200` | ECR에 보관할 최근 앱 이미지 수. **저장소 하나를 모든 앱이 같이 쓰므로** 앱 수 × 되돌릴 버전 수보다 커야 한다. 부족하면 오래된 앱의 롤백 대상 이미지가 지워진다. DB 작업용 `tools-` 이미지는 별도 규칙이라 밀려나지 않는다 |
 
 ## 배포 1건 (플랫폼 자동화 대상)
 
@@ -162,8 +163,12 @@ bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 
 - **기록은 두 가지**다.
   - `deployments/<id>/history.log`: 헬스체크를 **통과한** 배포만. 한 줄이 `시각|이미지|스냅샷 이름`이고 롤백이 여기서 대상을 고른다. 스냅샷(`history/<이름>.app.json`, `.platform.json`)에는 그때의 **앱 설정 전체와 이미지·아키텍처·유예 시간**이 들어 있다.
   - `deployments/<id>/attempts.log`: 성공·**실패를 가리지 않는 모든 시도**. 한 줄이 `시각|결과(ok/fail)|이미지|사유`이고 실패 사유(시간 초과, 4xx, 서킷 브레이커, 태스크 반복 종료, `terraform apply` 실패, 앱 전용 DB 준비 실패)가 남는다. `status`가 최근 5건을 보여 주고 `diagnose` JSON에도 들어간다.
-- **롤백**은 이력에서 **지금 배포된 것(Terraform 상태 기준)과 다른 가장 최근의 정상 이미지**를 고르고, 그 이미지가 정상이던 때의 **앱 설정도 함께** 복원한다. 그래서 업데이트가 실패했을 때도 마지막 정상 이미지로 돌아가고(이력의 마지막 줄로 "현재"를 정하면 실패한 업데이트 뒤에 이 이미지를 빼 버린다), `update --app`으로 포트·헬스체크 경로·크기·환경 변수를 바꿨어도 옛 이미지에 새 설정이 붙어 또 실패하지 않는다. foundation 값은 스냅샷이 아니라 지금 것을 쓴다. 스냅샷이 없는 옛 이력은 이미지만 되돌리고 경고한다. **사람이 명령으로 실행하며, 자동 복구는 만들지 않았다.**
+- **롤백**은 이력에서 **지금 배포된 것과 (이미지, 앱 설정)이 다른 가장 최근의 정상 항목**을 고르고(지금 배포된 것은 마지막으로 `apply`한 입력 `applied.*` 기준이다. 보관본이 없는 옛 배포만 Terraform 상태의 이미지로 이미지끼리 비교한다), 그 이미지가 정상이던 때의 **앱 설정도 함께** 복원한다. 그래서 업데이트가 실패했을 때도 마지막 정상 이미지로 돌아가고(이력의 마지막 줄로 "현재"를 정하면 실패한 업데이트 뒤에 이 이미지를 빼 버린다), `update --app`으로 포트·헬스체크 경로·크기·환경 변수를 바꿨어도 옛 이미지에 새 설정이 붙어 또 실패하지 않는다. foundation 값은 스냅샷이 아니라 지금 것을 쓴다. 스냅샷이 없는 옛 이력은 이미지만 되돌리고 경고한다. **사람이 명령으로 실행하며, 자동 복구는 만들지 않았다.**
 - 롤백은 DB 스키마와 데이터를 되돌리지 않는다.
+- **입력 되돌리기**: `update`와 `rollback`은 시작할 때 입력 파일(`*.auto.tfvars.json`)을 마지막으로 `apply`한 값으로 되돌린 뒤 변경을 적용한다. `--plan-only`로 계획만 만들고 버린 변경(이미지, 앱 설정, 롤백 스냅샷, 앱 전용 DB 전환)이 다음 계획에 섞이지 않게 하려는 것이다. 새 `update`·`rollback`을 하면 앞서 저장한 계획(`tfplan`)은 버려진다. 한 번도 `apply`하지 않은 배포(`up --plan-only` 직후)는 그대로 둔다.
+- **foundation 값 갱신**: `update`와 `rollback`은 plan 전에 foundation 출력을 다시 읽어 입력의 `foundation` 값을 갱신한다. `up` 때 복사한 값을 계속 쓰면 foundation을 다시 apply한 뒤(HTTPS 추가, ALB·보안 그룹 재생성) 사라진 리소스를 가리킨다.
+- **이미지 확인**: `up`·`update`·`rollback`은 plan 전에 이미지가 ECR에 실제로 있는지 확인한다. 태그를 잘못 썼거나 롤백 대상이 보관 개수 제한으로 지워졌으면 태스크가 이미지를 받지 못해 서킷 브레이커까지 8분 넘게 기다리게 되므로, 그 전에 중단한다(롤백이면 `--to`로 다른 이미지를 지정).
+- **ID 검증과 폴더**: 모든 명령이 배포 ID 형식(소문자·숫자 4~8자)을 먼저 검사한다. `up`이 `apply` 시작 전에 실패하거나 취소되면 만들다 만 폴더를 지운다(`apply`가 시작된 뒤에는 state가 생길 수 있어 지우지 않는다). `destroy`가 끝난 폴더에는 `destroyed` 표식이 붙고, 같은 ID로 다시 `up`하면 `deployments/_destroyed/`로 옮겨진다. 앱 전용 DB를 `drop-db` 하지 않았다면 같은 ID로 다시 만들 때 그 DB를 다시 쓴다(접속 비밀번호는 새로 만든다).
 - `diagnose`는 ECS 배포 상태와 실패 사유, 대상 헬스 사유, 서비스 이벤트, 중단된 태스크 사유, 최근 로그를 JSON으로 낸다. 접속 URL의 계정·비밀번호, AWS 키, `password`·`token`·`secret` 값은 가린다. 정규식 기반이라 모든 형태의 비밀을 보장하지는 않는다.
 - **NAT 점검**: NAT를 쓰는 foundation이면 `up` 전에 NAT 인스턴스의 부팅 로그로 초기화 성공을 확인한다. 로그가 없으면 90초 기다린 뒤 실패로 본다(1시간 넘게 실행된 인스턴스는 로그가 밀려났을 수 있어 경고만 한다).
 
@@ -175,6 +180,7 @@ bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 
 - DB는 프라이빗 서브넷에 있어서 VPC 안에서 `mysql` 클라이언트를 한 번 실행하는 Fargate 작업으로 만든다. 그 클라이언트 이미지는 처음에 한 번 ECR에 올린다(`docker` 필요).
 - `destroy`는 앱만 지우고 **앱 전용 DB와 접속 정보는 보존한다**(데이터 보호). 지우려면 `drop-db` 또는 `destroy --drop-db`.
 - `db-check`는 앱 전용 계정으로 접속해 자기 DB는 되고, 공유 DB(`app`)와 시스템 테이블은 막혀 있고, `SHOW DATABASES`에 다른 앱의 DB가 보이지 않는지 확인한다.
+- **권한 분리**: 앱 태스크가 쓰는 공유 실행 역할은 DB 관리자 비밀번호를 읽을 수 없다. 관리자 비밀번호는 앱별 DB를 만드는 1회성 작업의 전용 실행 역할(`<project>-db-provisioner-execution`)만 읽는다. 또 배포 모듈은 `database_url_parameter_arn`이 **이 배포의** `/apps/<id>/database-url`일 때만 통과시킨다(다른 앱이나 관리자 접속 정보를 가리키면 plan에서 막힌다). 한계: 앱들이 실행 역할 하나를 같이 쓰므로 IAM 수준에서 앱별로 격리된 것은 아니다. 격리는 모듈의 사전 조건과 DB 계정 권한이 맡는다(배포마다 역할을 만들면 IAM 전파 지연이 배포 시간을 늘리고 역할 수 할당량에 걸린다).
 - `--shared-db`를 주면 공유 DB를 관리자 계정으로 쓴다(이전 방식). 공유 DB의 테이블 충돌 문제가 그대로 있다. 이 선택은 배포에 기록되어(`db-shared`) 나중에 `update`가 몰래 앱 전용 DB로 바꾸지 않는다.
 - **DB 없이 만든 배포를 `update`로 `use_database: true`로 바꾸면** 앱 전용 DB로 전환한다(승인 후 `apply`에서 DB와 접속 정보를 만든다). 전환하지 않으면 모듈이 foundation의 공유 URL(DB 관리자 계정)로 대체해서, 앱 전용 DB가 기본이라는 약속과 달리 조용히 모든 DB에 대한 관리자 권한이 붙는다.
 - 테이블 생성 주체(앱이 시작할 때 만드는지, 별도 마이그레이션인지)는 아직 팀이 정하지 않았다(`docs/OPEN_QUESTIONS.md`). 앱 전용 DB는 빈 상태로 만들어지므로 지금은 앱이 스스로 만드는 방식(`sample-back`)과 맞는다.
@@ -214,6 +220,8 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - DB 비밀번호는 foundation state에 남는다. 로컬 state를 쓰면 Git에 올리지 않고 담당자만 보관한다. S3 state를 쓰면 버킷 접근 권한을 담당자로 제한한다.
 - RDS는 MySQL 8.4다. 8.0은 2026-07-31 표준 지원이 끝나 유료 Extended Support 대상이라 막아 두었다.
 - **보안 그룹**: 앱 태스크는 앱마다 전용 보안 그룹을 받고 ALB가 보내는 컨테이너 포트 하나만 허용한다. 그래서 앱끼리 서로 접근할 수 없고, DB를 쓰지 않는 앱은 DB에 닿을 수 없다. 앱 아웃바운드는 전체 허용이다(ECR, 로그, 앱이 부르는 외부 API). ALB의 8001~8049 포트는 의도적으로 전 세계에 열려 있다(공개 앱).
+- **보안 그룹 소유권**: 앱 배포 모듈이 foundation이 만든 ALB 보안 그룹과 DB 보안 그룹에 앱별 규칙(ALB 아웃바운드, DB 3306 인바운드)을 추가·삭제한다. AGENTS.md 6장의 "앱 배포에서 foundation 리소스를 변경하지 않는다"와 부딪히는 지점이라 보안 그룹 소유권 합의가 필요하다(인프라 계약의 미결 항목). 앱 하나당 규칙은 보안 그룹별 1개이고 기본 할당량(60)이 포트 49개를 넘으므로 지금은 한도에 걸리지 않는다.
+- 대상 그룹의 등록 해제 지연은 30초(`deregistration_delay_seconds`)다. 교체되는 태스크가 처리 중인 요청을 끝낼 시간이고, 업로드처럼 오래 걸리는 요청이 있으면 늘린다(ALB 기본은 300초).
 - **RDS 보호**: 자동 백업 7일(기본), 삭제할 때 최종 스냅샷(기본), 삭제 보호(기본). 다중 AZ는 `db_multi_az`로 켠다. 교육용·무료 계정은 백업 보관 기간이나 다중 AZ를 제한할 수 있어서 그때는 변수로 낮춘다.
 - `enable_nat_instance = false`(기본)면 앱 태스크가 퍼블릭 서브넷에서 퍼블릭 IP로 실행된다. 앱 전용 보안 그룹이 ALB가 보내는 포트만 허용한다.
 - `enable_nat_instance = true`면 NAT Gateway 대신 EC2 NAT 인스턴스(`nat_instance_type`, 기본 `t4g.small`, Amazon Linux 2023 arm64)와 Elastic IP를 만든다. 고가용성(기본)이면 AZ마다 1대씩이고 프라이빗 라우트 테이블도 AZ별로 나뉘어 AZ 하나가 멈춰도 다른 AZ의 외부 통신(ECR pull·로그 전송·SSM 조회)을 유지한다. `nat_high_availability=false`면 1대를 모두가 쓴다.
@@ -252,6 +260,13 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - **실패 배포**(헬스체크 경로 오류 404): 스크립트의 4xx 즉시 판정이 `apply` 후 183초에 실패를 확정하고 이력에 기록하지 않음. ECS 서킷 브레이커는 500초(8분 20초)에 배포를 `FAILED`로 만듦(유예 90초에서 527초였으니 유예는 거의 영향이 없다). `diagnose`가 배포 `FAILED` 상태·사유, 대상 헬스 404, 중단된 태스크, 로그를 수집.
 - **업데이트·롤백**(새 구조에서): 이미지 교체와 직전 정상 이미지로의 복귀가 무중단(교체 구간 1초 간격 감시에서 `/health`와 로그인 쿠키 모두 끊김 0회, 약 3.5분). 태스크 2개에 요청이 분산되고 어느 태스크에서나 로그인이 유지된다. 롤백 후 `db-check` 통과.
 - **삭제**: `destroy`는 앱 전용 DB를 보존(앱 없이 `db-check` 통과), `drop-db`는 DB와 접속 정보 파라미터를 지움.
+- **코드 리뷰 지적 수정 후 실제 AWS로 확인한 것(2026-10-09, 읽기 전용 또는 임시 리소스를 바로 지움)**
+  - `put-parameter --value file://...`: Git Bash에서 `cygpath -m` 경로(`C:/...`)로 넘기면 값이 그대로 저장된다(읽어서 일치 확인 후 삭제). 비밀번호를 명령줄 인자로 넘기지 않으려고 쓴다.
+  - ECR 이미지 확인: 실제 저장소에서 있는 태그·다이제스트·`tools-` 태그는 통과하고, 없는 태그는 "이미지가 없습니다", 없는 저장소는 "확인하지 못했습니다"로 구분된다.
+  - S3 state 확인: 있는 키는 성공, 없는 키는 `(404) ... Not Found`로 응답해 `foundation-state`의 판정 문구와 맞는다.
+  - 헬스체크 대기: 두 번 부르던 AWS 조회를 한 번으로 합친 버전을 실제 배포 2건에 실행해 대상이 2개일 때(`healthy healthy`)도 통과했다.
+  - ECR 보관 정책(`tools-` 규칙 + 앱 이미지 200개)은 실제 저장소에 미리보기로 적용해 정책이 유효함을 확인했다(삭제 대상 0개, 정책 자체는 적용하지 않음).
+  - 현재 AWS의 foundation state에 새 코드로 `plan`: 추가 4(DB 작업 전용 역할·정책·관리형 정책 연결, 정책 교체 1), 변경 1(앱 공유 역할 정책에서 관리자 비밀번호 제거)뿐이고 다른 변화는 없다. 적용은 하지 않았다.
 - 이전 구조에서 확인한 것(2026-10-08): foundation 생성·삭제, 앱 배포 4건, 프라이빗 서브넷 태스크의 NAT·SSM·RDS 경로, 세션이 DB에 있어 교체 후에도 로그인 유지.
 
 **시험 중 발견해 고친 문제**
@@ -264,6 +279,9 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - 회귀 시험이 위 버그들을 놓친 이유(로그 그룹 값을 확인하지 않음, 경로 형태가 실제와 다름, 시험 복사에 `backend_override.tf`가 섞임)를 고쳐 시험에 반영. 보강한 시험이 수정을 뺀 상태에서는 실제로 실패하는 것까지 확인.
 
 **검증 안 됨**
+
+- 새 foundation 코드(DB 작업 전용 실행 역할, 앱 역할의 관리자 비밀번호 권한 제거, ECR 보관 정책)는 `plan`과 정책 미리보기까지만 확인했고 실제 foundation에 적용하지 않았다. 적용 후 `db-check`·`up`이 새 역할로 동작하는지는 확인하지 못했다(옛 foundation에서는 `db_provisioner_execution_role_arn`이 없다는 안내가 나오며 중단한다).
+- `up`이 `apply` 전에 실패했을 때 폴더를 지우는 동작, `destroy` 뒤 같은 ID 재사용, `update`·`rollback`의 입력 되돌리기와 foundation 갱신은 함수 단위 시험(모의 AWS)으로만 확인했고 실제 배포로 처음부터 끝까지 돌려 보지는 않았다.
 
 - 실제 도메인 인증서(ACM DNS 검증)와 도메인 기반 라우팅. 자체 서명 인증서로만 시험했다.
 - 다른 PC에서 S3 state로 이어서 `destroy`(한 PC에서만 시험).

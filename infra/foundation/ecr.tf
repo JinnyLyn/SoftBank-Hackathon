@@ -18,21 +18,39 @@ resource "aws_ecr_repository" "apps" {
   }
 }
 
+# 보관 개수는 저장소 전체(모든 앱) 기준이다. 앱마다 롤백 대상 이미지가 남아 있어야 하므로 넉넉하게 둔다.
+# DB 작업용 mysql 클라이언트 이미지(tools- 태그)는 앱 이미지가 밀어내지 못하도록 별도 규칙으로 둔다
+# (우선순위가 낮은 숫자가 먼저 적용되고, 태그가 있는 모든 이미지를 잡는 규칙은 맨 뒤에 둔다)
 resource "aws_ecr_lifecycle_policy" "apps" {
   repository = aws_ecr_repository.apps.name
 
   policy = jsonencode({
-    rules = [{
-      rulePriority = 1
-      description  = "Keep the most recent images only"
-      selection = {
-        tagStatus   = "any"
-        countType   = "imageCountMoreThan"
-        countNumber = var.ecr_keep_images
-      }
-      action = {
-        type = "expire"
-      }
-    }]
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep tool images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["tools-"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 10
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep the most recent app images only"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = var.ecr_keep_images
+        }
+        action = {
+          type = "expire"
+        }
+      },
+    ]
   })
 }

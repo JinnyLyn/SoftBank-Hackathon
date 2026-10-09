@@ -16,7 +16,7 @@
 #   deploy.sh drop-db  a1b2c3d4 [--yes]    # 앱 전용 DB와 계정을 지운다 (되돌릴 수 없다)
 #   deploy.sh foundation-state             # foundation state를 S3로 옮긴다 (PAVED_STATE_BUCKET 필요)
 #
-# 필요한 것: terraform(>=1.6), aws CLI(자격증명 설정 완료), python(python3 또는 python),
+# 필요한 것: terraform(>=1.6, S3 state(PAVED_STATE_BUCKET)를 쓰면 >=1.10), aws CLI(자격증명 설정 완료), python(python3 또는 python),
 #            앱별 DB를 쓰려면 docker(mysql 클라이언트 이미지를 ECR에 올릴 때 최초 1회).
 # foundation은 먼저 apply되어 있어야 한다.
 # 환경 변수
@@ -52,6 +52,9 @@ awsn() { MSYS_NO_PATHCONV=1 aws "$@"; }
 # 네이티브 프로그램(docker 등)에 넘길 경로. Git Bash에서는 Windows 경로로 바꾼다
 native_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else echo "$1"; fi; }
 
+# aws CLI의 file:// 인자에 넣을 경로. Git Bash에서는 C:/Users/... 형태(슬래시)여야 aws.exe가 읽는다(실제 AWS로 확인)
+file_uri_path() { if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else echo "$1"; fi; }
+
 region() {
   local r="${AWS_REGION:-${AWS_DEFAULT_REGION:-}}"
   [ -n "$r" ] || r="$(aws configure get region 2>/dev/null || true)"
@@ -66,10 +69,38 @@ valid_id() {
   [[ "$1" =~ ^[a-z0-9]{4,8}$ ]] || die "deploy id는 소문자·숫자 4~8자여야 합니다 (하이픈 불가): $1"
 }
 
+# 배포 ID로 폴더를 찾는다. ID 형식을 먼저 검사한다: 검사하지 않으면 `destroy ../foundation` 같은 값이
+# deployments 밖의 Terraform 폴더(foundation)를 가리켜 공유 인프라를 지울 수 있다
 existing_dir() {
+  valid_id "$1"
   local d; d="$(deploy_dir "$1")"
   [ -d "$d" ] || die "없는 배포입니다: $1"
   echo "$d"
+}
+
+# up이 쓸 폴더를 확보한다. 이미 있으면 거부하되, destroy가 끝난 폴더(destroyed 표식)는 보관 폴더로 옮기고 같은 ID를 다시 쓸 수 있게 한다
+claim_deploy_dir() {
+  local id="$1" d; d="$(deploy_dir "$id")"
+  [ -e "$d" ] || return 0
+  if [ -f "$d/destroyed" ]; then
+    local arch="$ROOT/deployments/_destroyed"
+    mkdir -p "$arch"
+    mv "$d" "$arch/$id-$(date -u +%Y%m%dT%H%M%SZ)"
+    log "이전에 삭제한 같은 ID의 폴더를 deployments/_destroyed로 옮겼습니다"
+    return 0
+  fi
+  die "이미 있는 배포입니다: $d (삭제하려면 destroy를 먼저 실행하세요. 계획만 만들고 멈춘 배포라면 apply 하세요)"
+}
+
+# up이 apply를 시작하기 전에 실패하거나 취소되면 반쯤 만들어진 폴더를 지운다(계속 남으면 같은 ID로 다시 만들 수 없다).
+# apply가 시작된 뒤에는 state가 생겼을 수 있으므로 절대 지우지 않는다
+cleanup_failed_up() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "${UP_PHASE:-}" = "prep" ] && [ -n "${UP_DIR:-}" ] && [ -d "$UP_DIR" ]; then
+    rm -rf "${UP_DIR:?}"
+    echo "[정리] 만들다 만 폴더를 지웠습니다: $UP_DIR" >&2
+  fi
+  return $rc
 }
 
 confirm() {
@@ -170,7 +201,9 @@ pick_port() {
   local rgn alb from to used p PY
   rgn="$(region)"; alb="$(fjson alb_arn)"; PY="$(pick_python)"
   from="$(fjson allowed_listener_ports from)"; to="$(fjson allowed_listener_ports to)"
-  used="$(aws elbv2 describe-listeners --region "$rgn" --load-balancer-arn "$alb" --query 'Listeners[].Port' --output text 2>/dev/null || true)"
+  # 조회가 실패하면 중단한다. 빈 값으로 넘어가면 이미 쓰는 8001을 다시 골라 apply에서야 포트 중복으로 실패한다
+  used="$(aws elbv2 describe-listeners --region "$rgn" --load-balancer-arn "$alb" --query 'Listeners[].Port' --output text)" \
+    || die "ALB 리스너 목록을 조회하지 못했습니다. 자격증명과 권한을 확인하거나 --port 로 포트를 직접 지정하세요"
   "$PY" - "$from" "$to" "$used" <<'PYEOF'
 import sys
 lo, hi = int(sys.argv[1]), int(sys.argv[2])
@@ -190,38 +223,63 @@ PYEOF
 state_setup() {
   local d="$1" id="$2"
   [ -n "${PAVED_STATE_BUCKET:-}" ] || return 0
-  cat > "$d/backend_override.tf" <<EOF
-terraform {
-  backend "s3" {
-    bucket       = "${PAVED_STATE_BUCKET}"
-    key          = "deployments/${id}/terraform.tfstate"
-    region       = "${PAVED_STATE_REGION:-$(region)}"
-    encrypt      = true
-    use_lockfile = true
-  }
-}
-EOF
+  require_tf_for_s3
+  write_backend "$d" "deployments/${id}/terraform.tfstate"
   log "state를 S3에 저장합니다: s3://${PAVED_STATE_BUCKET}/deployments/${id}/terraform.tfstate"
 }
 
-# foundation의 state도 S3로 옮긴다. foundation은 DB 비밀번호가 든 state를 가장 많이 담고 있어서 우선순위가 높다.
-# 로컬 state가 있으면 그대로 복사하고, 없으면 새로 시작한다. 환경마다 값이 다른 backend_override.tf는 Git에서 제외된다
-cmd_foundation_state() {
-  [ -n "${PAVED_STATE_BUCKET:-}" ] || die "PAVED_STATE_BUCKET을 지정하세요 (infra/bootstrap으로 만든 버킷)"
-  need terraform
-  cat > "$FOUNDATION/backend_override.tf" <<EOF
+# S3 backend 설정 파일을 만든다(배포와 foundation이 같이 쓴다). 사용: write_backend <폴더> <state 키>
+write_backend() {
+  cat > "$1/backend_override.tf" <<EOF
 terraform {
   backend "s3" {
     bucket       = "${PAVED_STATE_BUCKET}"
-    key          = "foundation/terraform.tfstate"
+    key          = "$2"
     region       = "${PAVED_STATE_REGION:-$(region)}"
     encrypt      = true
     use_lockfile = true
   }
 }
 EOF
+}
+
+# S3 잠금(use_lockfile)은 Terraform 1.10부터 지원한다. 낮은 버전은 init에서 알 수 없는 인수라는 오류로 멈추므로 먼저 알려 준다
+tf_version() {
+  "$(pick_python)" -c "import json,subprocess,sys;print(json.loads(subprocess.run(['terraform','version','-json'],capture_output=True,text=True).stdout)['terraform_version'])" 2>/dev/null || true
+}
+
+require_tf_for_s3() {
+  local v; v="$(tf_version)"
+  [ -n "$v" ] || die "terraform 버전을 확인하지 못했습니다"
+  "$(pick_python)" -c "import sys;t=tuple(int(x) for x in sys.argv[1].split('-')[0].split('.')[:2]);sys.exit(0 if t>=(1,10) else 1)" "$v" \
+    || die "S3 state(PAVED_STATE_BUCKET)는 Terraform 1.10 이상이 필요합니다(현재 $v)"
+}
+
+# foundation의 state도 S3로 옮긴다. foundation은 DB 비밀번호가 든 state를 가장 많이 담고 있어서 우선순위가 높다.
+# 로컬 state가 있으면 그대로 복사하고, 없으면 새로 시작한다. 환경마다 값이 다른 backend_override.tf는 Git에서 제외된다.
+# S3에 이미 foundation state가 있으면 로컬 state로 덮어쓰지 않는다(다른 PC가 올린 최신 state를 잃지 않도록)
+cmd_foundation_state() {
+  [ -n "${PAVED_STATE_BUCKET:-}" ] || die "PAVED_STATE_BUCKET을 지정하세요 (infra/bootstrap으로 만든 버킷)"
+  need terraform; need aws
+  require_tf_for_s3
+  local key="foundation/terraform.tfstate" out remote=0 localstate="$FOUNDATION/terraform.tfstate"
+  if out="$(awsn s3api head-object --bucket "$PAVED_STATE_BUCKET" --key "$key" --region "${PAVED_STATE_REGION:-$(region)}" 2>&1)"; then
+    remote=1
+  elif ! printf '%s' "$out" | grep -Eqi 'Not Found|404|NoSuchKey'; then
+    die "S3에서 foundation state를 확인하지 못했습니다: $(printf '%s' "$out" | head -c 200)"
+  fi
+  write_backend "$FOUNDATION" "$key"
+  if [ "$remote" = "1" ]; then
+    if [ -s "$localstate" ]; then
+      rm -f "$FOUNDATION/backend_override.tf"
+      die "S3에 이미 foundation state가 있고 이 PC에도 로컬 state가 있습니다. 덮어쓰면 최신 state를 잃을 수 있어 중단합니다. 로컬 terraform.tfstate가 낡은 것이 맞다면 지우고 다시 실행하세요"
+    fi
+    tf "$FOUNDATION" init -input=false -reconfigure >/dev/null
+    log "S3의 foundation state를 이 PC에서 쓰도록 연결했습니다: s3://${PAVED_STATE_BUCKET}/$key"
+    return 0
+  fi
   tf "$FOUNDATION" init -input=false -migrate-state -force-copy >/dev/null
-  log "foundation state를 S3로 옮겼습니다: s3://${PAVED_STATE_BUCKET}/foundation/terraform.tfstate"
+  log "foundation state를 S3로 옮겼습니다: s3://${PAVED_STATE_BUCKET}/$key"
   log "로컬 terraform.tfstate 파일은 더 이상 쓰이지 않습니다. 확인한 뒤 지우세요"
 }
 
@@ -269,8 +327,12 @@ db_taskdef_json() {
   local mode="$1" id="$2" PY; PY="$(pick_python)"
   # 값은 먼저 모두 읽어 둔다. 같은 줄에서 MSYS_NO_PATHCONV=1을 앞에 두면 뒤쪽 $(fjson ...)에도 적용되어
   # Python이 /c/... 경로를 열지 못한다
-  local family="paved-clouds-dbinit-$id-$mode" rgn ecr exec_role lg host port admin_user admin_arn app_arn app_db
-  rgn="$(region)"; ecr="$(fjson ecr_repository_url)"; exec_role="$(fjson execution_role_arn)"
+  local family="paved-clouds-dbinit-$id-$mode" rgn ecr exec_role lg host port admin_user admin_arn app_arn app_db other_db
+  rgn="$(region)"; ecr="$(fjson ecr_repository_url)"
+  # 관리자 비밀번호는 앱이 쓰는 공유 실행 역할이 읽을 수 없다. DB 작업은 전용 실행 역할을 쓴다
+  exec_role="$(fjson db_provisioner_execution_role_arn 2>/dev/null)" \
+    || die "foundation이 옛 버전입니다(db_provisioner_execution_role_arn 없음). foundation을 새 코드로 다시 apply하세요"
+  other_db="$(fjson db_name 2>/dev/null || echo app)"
   lg="$(fjson db_provisioner_log_group)"; host="$(fjson db_host)"; port="$(fjson db_port)"
   admin_user="$(fjson db_admin_username)"; admin_arn="$(fjson db_admin_password_parameter_arn)"
   app_arn="$(db_param_arn "$id")"; app_db="$(db_name_of "$id")"
@@ -278,7 +340,7 @@ db_taskdef_json() {
   # awslogs-group이 C:/Program Files/Git/... 로 들어가 작업 정의 등록이 실패한다. 변환 끄기는 이 호출에만 적용한다
   MSYS_NO_PATHCONV=1 MODE="$mode" ID="$id" FAMILY="$family" RGN="$rgn" ECR="$ecr" EXEC="$exec_role" LG="$lg" \
   DB_HOST="$host" DB_PORT="$port" DB_ADMIN_USER="$admin_user" ADMIN_PW_ARN="$admin_arn" APP_PARAM_ARN="$app_arn" \
-  APP_DB="$app_db" TOOLS_TAG="$TOOLS_TAG" \
+  APP_DB="$app_db" OTHER_DB="$other_db" TOOLS_TAG="$TOOLS_TAG" \
   "$PY" - <<'PYEOF'
 import json, os, sys
 e = os.environ
@@ -327,7 +389,7 @@ env = [
     {"name": "DB_PORT", "value": e["DB_PORT"]},
     {"name": "DB_ADMIN_USER", "value": e["DB_ADMIN_USER"]},
     {"name": "APP_DB", "value": e["APP_DB"]},
-    {"name": "OTHER_DB", "value": "app"},
+    {"name": "OTHER_DB", "value": e["OTHER_DB"]},
 ]
 td = {
     "family": e["FAMILY"],
@@ -356,7 +418,7 @@ PYEOF
 
 # 1회성 DB 작업을 실행하고 종료 코드를 확인한다. 로그(비밀 마스킹)는 표준 오류로 보여 준다
 db_task() {
-  local mode="$1" id="$2" rgn cluster td_arn task_arn code subnets sg pub tid events
+  local mode="$1" id="$2" rgn cluster td_arn task_arn code subnets sg pub tid events why
   rgn="$(region)"; cluster="$(fjson cluster_name)"
   ensure_tools_image
   td_arn="$(awsn ecs register-task-definition --region "$rgn" --cli-input-json "$(db_taskdef_json "$mode" "$id")" \
@@ -372,12 +434,18 @@ db_task() {
   aws ecs wait tasks-stopped --region "$rgn" --cluster "$cluster" --tasks "$task_arn" || true
   code="$(aws ecs describe-tasks --region "$rgn" --cluster "$cluster" --tasks "$task_arn" \
     --query 'tasks[0].containers[0].exitCode' --output text 2>/dev/null || echo "")"
+  # 이미지 pull·시크릿 조회 실패처럼 컨테이너가 시작되지 못하면 종료 코드가 없고 이유는 stoppedReason에만 있다
+  why="$(aws ecs describe-tasks --region "$rgn" --cluster "$cluster" --tasks "$task_arn" \
+    --query 'tasks[0].[stoppedReason,containers[0].reason]' --output text 2>/dev/null | tr '\t' ' ' | mask || true)"
   tid="${task_arn##*/}"
   events="$(awsn logs get-log-events --region "$rgn" --log-group-name "$(fjson db_provisioner_log_group)" \
     --log-stream-name "dbinit/dbinit/$tid" --query 'events[].message' --output text 2>/dev/null | tr '\t' '\n' | mask || true)"
   [ -n "$events" ] && printf '%s\n' "$events" | sed 's/^/    | /' >&2
   awsn ecs deregister-task-definition --region "$rgn" --task-definition "$td_arn" >/dev/null 2>&1 || true
-  [ "$code" = "0" ] || die "DB 작업($mode)이 실패했습니다 (종료 코드 ${code:-알 수 없음}). 위 로그를 확인하세요"
+  if [ "$code" != "0" ]; then
+    { [ "$code" != "None" ] && [ -n "$code" ]; } || code="없음(컨테이너가 시작되지 못함)"
+    die "DB 작업($mode)이 실패했습니다 (종료 코드 $code). 사유: ${why:-알 수 없음}. 위 로그를 확인하세요"
+  fi
   DB_TASK_LOG="$events"
 }
 
@@ -392,8 +460,15 @@ db_provision() {
   host="$(fjson db_host)"; port="$(fjson db_port)"; pw="$(random_password)"
   url="mysql://${name}:${pw}@${host}:${port}/${name}"
   log "앱 전용 DB 준비: $name"
-  awsn ssm put-parameter --region "$rgn" --name "$(db_param_name "$id")" --type SecureString --overwrite \
-    --description "Per-app DATABASE_URL for deployment $id" --value "$url" >/dev/null || die "접속 정보를 SSM에 저장하지 못했습니다"
+  # 비밀번호가 든 URL을 명령줄 인자로 넘기면 실행 중 프로세스 목록에 보인다. 임시 파일(file://)로 넘기고 바로 지운다
+  local tmp vf; tmp="$(mktemp -d)"; vf="$tmp/value"
+  ( umask 077; printf '%s' "$url" > "$vf" )
+  if ! awsn ssm put-parameter --region "$rgn" --name "$(db_param_name "$id")" --type SecureString --overwrite \
+      --description "Per-app DATABASE_URL for deployment $id" --value "file://$(file_uri_path "$vf")" >/dev/null; then
+    rm -rf "${tmp:?}"
+    die "접속 정보를 SSM에 저장하지 못했습니다"
+  fi
+  rm -rf "${tmp:?}"
   awsn ssm add-tags-to-resource --region "$rgn" --resource-type Parameter --resource-id "$(db_param_name "$id")" \
     --tags Key=Project,Value=paved-clouds Key=DeployId,Value="$id" Key=ManagedBy,Value=paved-clouds-platform >/dev/null 2>&1 || true
   unset pw url
@@ -485,7 +560,8 @@ previous_entry() {
   else
     mode=image; cur="$(current_image "$d")"
   fi
-  tac "$d/history.log" 2>/dev/null | while IFS='|' read -r ts image stamp; do
+  # tac은 macOS에 없어서 awk로 줄 순서를 뒤집는다(최근 항목부터 본다)
+  awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' "$d/history.log" 2>/dev/null | while IFS='|' read -r ts image stamp; do
     if [ "$mode" = config ]; then
       if [ -n "$stamp" ] && [ -f "$d/history/$stamp.app.json" ]; then
         efp="$(fingerprint "$d/history/$stamp.app.json" "$image")"
@@ -529,7 +605,58 @@ PYEOF
 }
 
 # 이번에 시도하는 이미지(입력 파일 기준)
-input_image() { grep -o '"image": *"[^"]*"' "$1/platform.auto.tfvars.json" | head -1 | sed -E 's/.*: *"//; s/"$//'; }
+input_image() { image_in_file "$1/platform.auto.tfvars.json"; }
+
+# 이미지가 ECR에 실제로 있는지 확인한다. 없으면 태스크가 이미지를 받지 못해 서킷 브레이커까지 8분 넘게 기다리게 되고,
+# 롤백 대상 이미지가 보관 개수 제한으로 지워졌을 때도 같은 일이 생긴다
+check_image_exists() {
+  local image="$1" rest repo ref rgn out
+  rgn="$(region)"
+  rest="${image#*/}"                      # <저장소 경로>:<태그> 또는 <저장소 경로>@sha256:...
+  case "$rest" in
+    *@sha256:*) repo="${rest%%@*}"; ref="imageDigest=${rest#*@}" ;;
+    *:*) repo="${rest%:*}"; ref="imageTag=${rest##*:}" ;;
+    *) die "이미지 이름을 해석하지 못했습니다: $image" ;;
+  esac
+  if out="$(aws ecr describe-images --region "$rgn" --repository-name "$repo" --image-ids "$ref" 2>&1 >/dev/null)"; then
+    return 0
+  fi
+  if printf '%s' "$out" | grep -q 'ImageNotFoundException'; then
+    die "ECR에 이미지가 없습니다: $image (태그가 틀렸거나 보관 개수 제한으로 지워졌습니다). 롤백이라면 --to 로 다른 이미지를 지정하세요"
+  fi
+  die "ECR에서 이미지를 확인하지 못했습니다: $(printf '%s' "$out" | head -c 200)"
+}
+
+# 계획만 만들고 적용하지 않은 변경이 다음 계획에 섞이지 않게, 입력을 마지막으로 apply한 값(applied.*)으로 되돌린다.
+# 입력 파일은 --plan-only만 해도 바뀌므로(이미지, 앱 설정, 롤백 스냅샷, 앱 전용 DB 표식) 새 변경은 항상 배포된 상태에서 시작한다.
+# apply된 적이 없는 배포(up --plan-only 직후)는 그대로 둔다
+reset_inputs() {
+  local d="$1" arn
+  [ -f "$d/applied.app.json" ] && [ -f "$d/applied.platform.json" ] || return 0
+  cp "$d/applied.app.json" "$d/app.auto.tfvars.json"
+  cp "$d/applied.platform.json" "$d/platform.auto.tfvars.json"
+  rm -f "$d/tfplan" "$d/plan.json"
+  arn="$(jget "$d/applied.platform.json" platform database_url_parameter_arn 2>/dev/null || true)"
+  if [ -n "$arn" ] && [ "$arn" != "None" ]; then
+    [ -f "$d/db-isolated" ] || printf '%s\n' "$(db_name_of "$(basename "$d")")" > "$d/db-isolated"
+  elif [ -f "$d/db-isolated" ] && [ ! -f "$d/db-provisioned" ]; then
+    rm -f "$d/db-isolated"    # 버린 계획이 켠 앱 전용 DB 표식
+  fi
+}
+
+# 입력의 foundation 값을 지금 foundation 출력으로 갱신한다. up 때 복사한 값을 계속 쓰면 foundation을 다시 apply한 뒤
+# (HTTPS 추가, ALB·보안 그룹 재생성) update·rollback이 사라진 리소스를 가리킨다
+refresh_foundation() {
+  local d="$1"
+  export_foundation
+  "$(pick_python)" - "$d/platform.auto.tfvars.json" "$FOUNDATION_JSON" <<'PYEOF'
+import json, sys
+p, f = sys.argv[1], sys.argv[2]
+d = json.load(open(p, encoding="utf-8"))
+d["platform"]["foundation"] = json.load(open(f, encoding="utf-8"))
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+PYEOF
+}
 
 # 입력 파일(platform.auto.tfvars.json)의 최상위 platform 필드 하나를 바꾼다
 set_platform_field() {  # set_platform_field <디렉터리> <키> <값>
@@ -597,6 +724,7 @@ plan_confirm_apply() {
 apply_saved() {
   local d="$1" id="$2" image
   [ -f "$d/tfplan" ] || die "저장된 계획이 없습니다. 먼저 --plan-only 로 계획을 만드세요"
+  UP_PHASE=""   # 여기서부터는 state가 생길 수 있어 폴더를 지우지 않는다
   image="$(input_image "$d")"
   # 앱 전용 DB는 승인된 뒤에만 만든다 (계획 단계에서는 접속 정보 ARN만 쓰고 아무것도 만들지 않는다)
   if [ -f "$d/db-isolated" ] && [ ! -f "$d/db-provisioned" ]; then
@@ -659,13 +787,14 @@ cmd_up() {
   need terraform; need aws
 
   local d; d="$(deploy_dir "$id")"
-  [ ! -e "$d" ] || die "이미 있는 배포입니다: $d (새 ID를 쓰거나 destroy 후 다시 하세요)"
+  claim_deploy_dir "$id"
 
   local rgn; rgn="$(region)"
   log "배포 $id 준비 (리전 $rgn)"
 
   export_foundation
   nat_preflight
+  check_image_exists "$image"
 
   if [ "$port" = "auto" ]; then
     port="$(pick_port)" || die "허용 범위에 빈 포트가 없습니다"
@@ -674,7 +803,7 @@ cmd_up() {
 
   # 앱이 DB를 쓰면 기본으로 앱 전용 DB를 쓴다. --shared-db 이면 공유 DB(관리자 계정)를 쓴다
   local use_db param_arn=""
-  use_db="$("$(pick_python)" -c "import json,sys;print(str(bool(json.load(open(sys.argv[1],encoding='utf-8')).get('use_database'))).lower())" "$app")"
+  use_db="$(app_uses_db "$app")"
   if [ "$use_db" = "true" ] && [ "$shared_db" = "0" ]; then
     param_arn="$(db_param_arn "$id")"
     log "앱 전용 DB를 사용합니다: $(db_name_of "$id") (접속 정보는 승인 후 apply 때 만듭니다)"
@@ -686,6 +815,9 @@ cmd_up() {
   export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
   mkdir -p "$TF_PLUGIN_CACHE_DIR"
 
+  # 여기부터 apply 시작 전까지 실패하거나 취소하면 만들다 만 폴더를 지운다(cleanup_failed_up)
+  UP_DIR="$d"; UP_PHASE=prep
+  trap cleanup_failed_up EXIT
   mkdir -p "$d"
   tar -C "$TEMPLATE" --exclude=.terraform -cf - . | tar -C "$d" -xf -
   [ -z "$param_arn" ] || printf '%s\n' "$(db_name_of "$id")" > "$d/db-isolated"
@@ -711,6 +843,7 @@ EOF
   log "init"
   tf "$d" init -input=false >/dev/null
   plan_confirm_apply "$d" "$id"
+  UP_PHASE=""
 }
 
 # 이미지나 앱 설정을 바꿔 다시 배포한다. 롤백도 같은 경로를 쓴다
@@ -720,14 +853,17 @@ redeploy() {
   need terraform; need aws
   if [ -n "$image" ]; then
     # 입력 파일의 image 값만 바꾼다. 태그는 덮어쓸 수 없으니 새 태그를 쓴다
-    sed -i -E 's#("image": *")[^"]*(")#\1'"$image"'\2#' "$d/platform.auto.tfvars.json"
-    grep -q "\"image\": \"$image\"" "$d/platform.auto.tfvars.json" || die "image 값을 바꾸지 못했습니다"
+    # sed -i는 GNU와 BSD 문법이 다르고, 이미지 이름의 & 같은 문자가 치환 문법으로 해석되어서 JSON으로 고친다
+    set_platform_field "$d" image "$image"
+    [ "$(input_image "$d")" = "$image" ] || die "image 값을 바꾸지 못했습니다"
   fi
   if [ -n "$app" ]; then
     [ -f "$app" ] || die "app 파일이 없습니다: $app"
     printf '{"app": %s}\n' "$(cat "$app")" > "$d/app.auto.tfvars.json"
     ensure_db_isolation "$d" "$id" "$app"
   fi
+  refresh_foundation "$d"
+  check_image_exists "$(input_image "$d")"
   export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
   plan_confirm_apply "$d" "$id"
 }
@@ -745,6 +881,7 @@ cmd_update() {
     esac
   done
   [ -n "$image" ] || [ -n "$app" ] || die "--image 나 --app 중 하나는 필요합니다"
+  reset_inputs "$(existing_dir "$id")"
   redeploy "$id" "$image" "$app"
 }
 
@@ -760,6 +897,7 @@ cmd_rollback() {
     esac
   done
   local d stamp entry; d="$(existing_dir "$id")"
+  reset_inputs "$d"
   if [ -n "$to" ]; then
     stamp="$(snapshot_of_image "$d" "$to")"
   else
@@ -787,7 +925,7 @@ cmd_rollback() {
 #   - 이번 배포의 태스크가 반복해서 죽거나 시간이 지나도 실패로 끝낸다. ECS 서킷 브레이커가 배포를 FAILED로 만드는 데는 더 걸린다
 # 실패하면 WAIT_REASON에 사유를 남긴다(attempts.log에 기록된다)
 wait_healthy() {
-  local id="$1" d tg cluster svc start state stopped rollout depid reasons mismatch=0 rgn
+  local id="$1" d tg cluster svc start state stopped rollout depid reasons mismatch=0 rgn th dep
   WAIT_REASON=""
   d="$(deploy_dir "$id")"; rgn="$(region)"
   tg="$(tf "$d" output -raw target_group_arn)"
@@ -796,15 +934,16 @@ wait_healthy() {
   start=$(date +%s)
   log "헬스체크 대기 (최대 ${HEALTH_TIMEOUT}초)"
   while true; do
-    state="$(aws elbv2 describe-target-health --region "$rgn" --target-group-arn "$tg" \
-      --query 'TargetHealthDescriptions[].TargetHealth.State' --output text 2>/dev/null || true)"
-    # 헬스체크 실패 설명(예: "Health checks failed with these codes: [404]")
-    reasons="$(aws elbv2 describe-target-health --region "$rgn" --target-group-arn "$tg" \
-      --query 'TargetHealthDescriptions[].TargetHealth.Description' --output text 2>/dev/null || true)"
-    rollout="$(aws ecs describe-services --region "$rgn" --cluster "$cluster" --services "$svc" \
-      --query 'services[0].deployments[?status==`PRIMARY`]|[0].rolloutState' --output text 2>/dev/null || true)"
-    depid="$(aws ecs describe-services --region "$rgn" --cluster "$cluster" --services "$svc" \
-      --query 'services[0].deployments[?status==`PRIMARY`]|[0].id' --output text 2>/dev/null || true)"
+    # 대상 상태와 헬스체크 실패 설명(예: "Health checks failed with these codes: [404]")을 한 번에 읽는다. 한 줄이 대상 하나(탭 구분)
+    th="$(aws elbv2 describe-target-health --region "$rgn" --target-group-arn "$tg" \
+      --query 'TargetHealthDescriptions[].[TargetHealth.State,TargetHealth.Description]' --output text 2>/dev/null | tr -d '\r' || true)"
+    state="$(printf '%s\n' "$th" | awk -F'\t' 'NF { printf "%s ", $1 }')"
+    reasons="$(printf '%s\n' "$th" | awk -F'\t' 'NF { print $2 }')"
+    # 현재(PRIMARY) 배포의 롤아웃 상태와 ID
+    dep="$(aws ecs describe-services --region "$rgn" --cluster "$cluster" --services "$svc" \
+      --query 'services[0].deployments[?status==`PRIMARY`]|[0].[rolloutState,id]' --output text 2>/dev/null | tr -d '\r' || true)"
+    rollout="$(printf '%s' "$dep" | awk -F'\t' '{ print $1 }')"
+    depid="$(printf '%s' "$dep" | awk -F'\t' '{ print $2 }')"
     log "대상=${state:-등록 대기} 배포=${rollout:-?}"
     if [ "$rollout" = "FAILED" ]; then
       WAIT_REASON="ECS 서킷 브레이커가 배포를 FAILED로 만들었습니다(태스크가 3번 실패)"
@@ -874,7 +1013,7 @@ mask() {
     -e 's#(mysql|postgres(ql)?|redis|mongodb)://[^:@/[:space:]]+:[^@/[:space:]]+@#\1://***:***@#g' \
     -e 's#AKIA[0-9A-Z]{16}#AKIA****************#g' \
     -e 's#(ASIA|AIDA)[0-9A-Z]{16}#\1****************#g' \
-    -e 's#((password|passwd|pwd|secret|token|api[_-]?key)[=:" ]+)[^ ",;&]+#\1***#Ig'
+    -e 's#(([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|[Pp][Aa][Ss][Ss][Ww][Dd]|[Pp][Ww][Dd]|[Ss][Ee][Cc][Rr][Ee][Tt]|[Tt][Oo][Kk][Ee][Nn]|[Aa][Pp][Ii][_-]?[Kk][Ee][Yy])[=:" ]+)[^ ",;&]+#\1***#g'
 }
 
 # 실패 분석용 정보를 JSON으로 모은다: 서비스 이벤트, 중단된 태스크의 종료 사유, 대상 헬스, 최근 로그
@@ -908,16 +1047,14 @@ cmd_diagnose() {
 
   awsn logs tail "$lg" --region "$rgn" --since 30m --format short 2>/dev/null | tail -n 60 | mask > "$tmp/logs.txt" || true
 
+  # 로그뿐 아니라 JSON 전체를 셸 mask()로 거른다(마스킹 규칙을 한 곳에 둔다)
   ID="$id" IMAGE="$(tf "$d" output -raw image)" URL="$(tf "$d" output -raw url)" DIR="$tmp" HIST="$(tail -n 3 "$d/history.log" 2>/dev/null || true)" ATT="$(tail -n 5 "$d/attempts.log" 2>/dev/null || true)" \
-  "$PY" - <<'PYEOF'
+  "$PY" - <<'PYEOF' | mask
 import json, os, re, sys
 d = os.environ["DIR"]
 def load(n):
     with open(os.path.join(d, n), encoding="utf-8") as f:
         return json.load(f)
-def mask(s):
-    s = re.sub(r"(mysql|postgres(?:ql)?|redis|mongodb)://[^:@/\s]+:[^@/\s]+@", r"\1://***:***@", s)
-    return re.sub(r"AKIA[0-9A-Z]{16}", "AKIA****************", s)
 with open(os.path.join(d, "logs.txt"), encoding="utf-8", errors="replace") as f:
     logs = f.read().splitlines()
 out = {
@@ -932,7 +1069,7 @@ out = {
     "logTail": logs,
 }
 sys.stdout.reconfigure(encoding="utf-8")
-print(mask(json.dumps(out, ensure_ascii=False, indent=2)))
+print(json.dumps(out, ensure_ascii=False, indent=2))
 PYEOF
   rm -rf "$tmp"
 }
@@ -960,7 +1097,8 @@ cmd_destroy() {
       log "앱 전용 DB $(cat "$d/db-isolated") 와 접속 정보는 남겼습니다. 지우려면: deploy.sh drop-db $id"
     fi
   fi
-  log "삭제했습니다. 폴더(state 포함)는 남겨 둡니다: $d"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$d/destroyed"
+  log "삭제했습니다. 폴더(state 포함)는 남겨 둡니다: $d (같은 ID로 다시 만들면 deployments/_destroyed로 옮겨집니다)"
 }
 
 main() {
