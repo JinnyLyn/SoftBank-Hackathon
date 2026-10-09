@@ -22,22 +22,30 @@ npm run build
 - 기본은 `src/api/mock.ts` 의 가짜 응답으로 끝까지 돌아감. 이때 화면 상단에 **MOCK** 띠가 뜨고 배포 결과에도 MOCK 표시가 붙음.
   zip 파일 이름이나 저장소 주소에 `fail` 이 들어가면 헬스체크 실패 + AI 진단 화면이 나옴.
 - 배포 대상 종류는 `VITE_PROVIDERS` 로 켜고 끔. 기본은 `aws` 만 (현재 결정: AWS 먼저, 시간이 되면 온프레미스). `aws,onprem` 으로 두면 온프레미스 연결·추천·compose 화면이 모두 보임.
-- `.env` 에 `VITE_USE_MOCK=false` 를 넣으면 `/api` 로 요청하고, dev 서버가 `localhost:8000` 으로 프록시함.
-- 엔드포인트는 `src/api/index.ts`, 응답 형태는 `src/types.ts` 에 있음. 아직 가안이라 백엔드와 맞춰야 함.
+- 실제 백엔드: `.env` 에 `VITE_USE_MOCK=false`. dev 서버가 `/api` 를 `http://127.0.0.1:8000` 으로 넘김(다른 주소면 `API_TARGET` 환경 변수). 같은 출처가 되므로 백엔드 CORS 설정이 필요 없음.
+- 연동 코드는 `src/api/real.ts` 한 파일. 계약은 백엔드 `back/API.md` (현재 `wisetg` 브랜치) 기준이고, 화면 타입(`src/types.ts`)으로 바꾸는 일도 여기서만 함.
 
-| 화면 동작 | 요청 |
+| 화면 동작 | 백엔드 요청 |
 | --- | --- |
-| 배포 대상 목록 / 추가 / 수정 / 삭제 | `GET /api/connections`, `POST /api/connections`, `PUT /api/connections/:id`, `DELETE /api/connections/:id` |
-| 연결 다시 확인 | `POST /api/connections/:id/check` → `Connection` |
-| (AWS) 연결 방식 | 저장하면 `status: "pending"` + `setupUrl`(CloudFormation 빠른 생성 주소)을 돌려줌. 사용자가 콘솔에서 스택을 만들면 `check` 에서 `connected` 와 계정 ID로 바뀜. Role ARN, 리전 입력 없음 |
-| (온프레미스) 연결 방식 | 이름만 받아 저장하면 `status: "pending"` + `installCommand`(일회용 토큰이 든 설치 명령 한 줄) + `expiresAt`(10분)을 돌려줌. 사용자가 서버에서 실행하면 스크립트가 Docker 설치, `deploy` 사용자 생성, 공개 키 등록 후 서버 사양을 보고함 → 화면이 3초마다 `check` 해서 `connected` 로 바뀜. 만료되면 같은 id로 다시 저장해 새 명령 발급. 스크립트 내용은 `src/providers.ts` 의 `INSTALL_SCRIPT_PREVIEW` |
-| 분석 | `POST /api/projects` (multipart: `file` 또는 `repo_url`+`branch`, `expected_users`, `traffic_pattern`, `purpose`, `monthly_budget_usd`) → `Analysis` |
-| 구성 추천 | `POST /api/projects/:id/recommend` → `Recommendation` (연결된 대상별 `options`, 추천 `{connectionId, tier}`, 미리 만든 코드 `bundles["connectionId:tier"]` — 최소한 추천 조합은 포함). 월 예산을 넘는 칸은 화면에서 고를 수 없음. 예산 안에 맞는 구성이 없으면 `recommended: null` + `reason` 에 이유 |
-| 코드 생성 | `POST /api/projects/:id/code` (`{ connectionId, tier }`) → `TerraformBundle` (AWS는 terraform, 온프레미스는 compose) |
-| 승인 | `POST /api/projects/:id/deploy` (`{ connectionId, tier }`) |
-| 실패 후 수정 | `POST /api/projects/:id/fix` (`{ connectionId, tier }`) → 수정안을 반영해 검증·plan을 다시 만든 `TerraformBundle` (`patches` 에 바뀐 내용). 화면은 코드 검토로 돌아가 **다시 승인**받은 뒤에만 `deploy` 호출 |
-| 진행 상태 | `GET /api/projects/:id/status` → `DeployStatus` (로그, URL, 실패 시 진단) — 0.7초 간격 폴링 |
-| 배포 이력 | `GET /api/deployments` → `DeployRecord[]` |
+| 연결 목록 / 추가 / 이름 수정 / 삭제 | `GET/POST /api/connections`, `PUT/DELETE /api/connections/{id}` (본문은 `provider`, `name`, `fields` 만) |
+| 연결 확인 | `POST /api/connections/{id}/check` — 저장된 상태를 다시 읽음. 실제 AWS 확인은 worker가 기록 |
+| 분석 시작 (ZIP) | `POST /api/projects?name=&filename=` 본문은 ZIP 원본 바이트, `Content-Type: application/zip` |
+| 분석 시작 (GitHub) | `POST /api/projects/github` `{ name, repository_url, ref }` |
+| 분석 결과 대기 | `GET /api/projects/{id}/analyses/latest` 를 2초 간격 (404는 대기, 5분 제한) |
+| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 + `GET /api/connections` (2초 간격, 5분 제한) |
+| 코드 검토 | `GET /api/plans/{id}` — 변수값, 설명, 모듈, 가격 기준, fingerprint, plan 파일 준비 여부 |
+| 승인하고 배포 | `POST /api/plans/{id}/approve` `{ expected_fingerprint }` → `POST /api/deployments` `{ plan_id, expected_fingerprint }` (202 = 대기열 등록) |
+| 배포 진행 | `GET /api/projects/{id}/status` 0.7초 간격 (404는 대기열 대기로 표시) |
+| 배포 이력 | `GET /api/deployments?limit=50` |
+
+### 아직 백엔드와 맞춰야 할 것
+
+- **분석 결과(`result`) 형태**: 백엔드가 고정하지 않음. 화면은 `stack`(`[{label, value}]`), `findings`(`[{level: info|warn, title, detail}]`), `evidence`(문자열 또는 `{file, line, text}`)를 읽고, 없으면 최상위 값들을 스택 표로 보여 줌. LLM 담당과 합의 필요.
+- **계획 변수 중 화면용 키**: `tier`(lean/balanced/roomy), `recommended`(true면 추천), `headline`, `tradeoff`, `reason`, `resources`(`[{service, spec, monthlyUsd, why}]`). 없으면 비용 순서로 크기를 정하고 계획 전체를 한 줄로 보여 줌.
+- **사용 규모·월 예산 전달**: 백엔드 API에 받는 곳이 없음. 지금은 화면에서 예산 초과 계획을 거르는 데만 씀. 분석·계획 모듈이 써야 하면 받을 위치를 정해야 함.
+- **분석·계획 생성 시작**: 프로젝트를 등록하면 누가 분석과 계획 생성을 시작하는지 정해지지 않음. 화면은 결과가 생길 때까지 기다리기만 함.
+- **plan 요약 개수**: 추가/변경/삭제 개수를 주는 필드가 없어 `-` 로 표시.
+- **실패 후 수정**: 수정안 반영 API(`/fix`)가 없어 안내 문구로 실패 처리. `status` 의 `diagnosis` 는 `{cause, fix, patch: {file, before, after}}` 형태일 때 화면에 나옴.
 
 ## 보안
 

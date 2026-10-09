@@ -4,6 +4,9 @@ import type {
   Analysis,
   Choice,
   Connection,
+  ConnectionInput,
+  DeployRecord,
+  DeployStatus,
   Finding,
   Recommendation,
   ScaleInput,
@@ -279,6 +282,59 @@ export async function approve(_projectId: string, choice: Choice): Promise<void>
 }
 
 /** 실패 진단의 수정안을 반영하는 API는 아직 백엔드에 없음 */
-export async function applyFix(): Promise<TerraformBundle> {
+export async function applyFix(_projectId: string, _choice: Choice): Promise<TerraformBundle> {
   throw new ApiError(501, '수정안 반영 API가 아직 백엔드에 없습니다. 원인을 고친 뒤 분석부터 다시 진행해 주세요.')
+}
+
+// ---------- 배포 상태, 이력 ----------
+
+/**
+ * 프로젝트의 최근 배포 상태. 대기열 등록 직후에는 배포 이력이 아직 없어 404일 수 있음 → 대기 중으로 표시
+ * diagnosis는 화면 형태(cause, fix, patch)일 때만 씀
+ */
+export async function status(projectId: string): Promise<DeployStatus> {
+  const s = await reqOrNull<{ state: DeployStatus['state']; log: string[]; url: string | null; diagnosis?: unknown }>(
+    `/projects/${projectId}/status`,
+  )
+  if (!s) return { state: 'running', log: ['배포 대기열에 등록했습니다. worker가 가져가기를 기다리는 중입니다.'] }
+  const d = s.diagnosis
+  const diagnosis =
+    isObj(d) && typeof d.cause === 'string' && typeof d.fix === 'string' && isObj(d.patch)
+      ? (d as unknown as DeployStatus['diagnosis'])
+      : undefined
+  return { state: s.state, log: s.log, url: s.url ?? undefined, diagnosis }
+}
+
+/** 배포 이력. 백엔드가 화면용 요약 필드(app, tier, monthlyUsd 등)를 같이 줌 */
+export async function history(): Promise<DeployRecord[]> {
+  const rows = await req<(DeployRecord & { url: string | null })[]>('/deployments?limit=50')
+  return rows.map((r) => ({
+    id: r.id,
+    app: r.app,
+    version: r.version,
+    tier: r.tier,
+    provider: r.provider,
+    target: r.target,
+    monthlyUsd: r.monthlyUsd,
+    status: r.status,
+    url: r.url ?? undefined,
+    createdAt: r.createdAt,
+  }))
+}
+
+// ---------- 연결 ----------
+
+export const listConnections = () => req<Connection[]>('/connections')
+
+/** 저장된 연결 상태를 다시 읽음. 백엔드가 AWS를 실시간으로 검증하지는 않음 (worker가 완료를 기록) */
+export const checkConnection = (id: string) => req<Connection>(`/connections/${id}/check`, { method: 'POST' })
+
+export const deleteConnection = (id: string) => req<void>(`/connections/${id}`, { method: 'DELETE' })
+
+/** 백엔드는 정의되지 않은 필드를 거절(422)하므로 id는 주소에만 넣고 본문에서 뺌 */
+export function saveConnection(input: ConnectionInput): Promise<Connection> {
+  const body = { provider: input.provider, name: input.name, fields: input.fields }
+  return input.id
+    ? req<Connection>(`/connections/${input.id}`, send('PUT', body))
+    : req<Connection>('/connections', send('POST', body))
 }
