@@ -9,11 +9,45 @@ export class ApiError extends Error {
   }
 }
 
+// 백엔드 오류 형식: { "error": "설명", "details": [{ loc, msg }] }  (details는 422일 때만)
+interface ErrorBody {
+  error?: string
+  details?: { loc?: (string | number)[]; msg?: string }[]
+}
+
+async function toApiError(res: Response): Promise<ApiError> {
+  const text = await res.text()
+  let message = text || res.statusText
+  try {
+    const body = JSON.parse(text) as ErrorBody
+    if (body.error) {
+      const fields = (body.details ?? [])
+        .map((d) => [d.loc?.filter((p) => p !== 'body').join('.'), d.msg].filter(Boolean).join(': '))
+        .filter(Boolean)
+      message = fields.length ? `${body.error} (${fields.join(', ')})` : body.error
+    }
+  } catch {
+    // JSON이 아니면 본문 그대로
+  }
+  if (res.status === 503) message = `서버가 DB에 연결하지 못했습니다. ${message}`
+  return new ApiError(res.status, message)
+}
+
 export async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch('/api' + path, { ...init, credentials: 'same-origin' })
-  if (!res.ok) throw new ApiError(res.status, `${res.status} ${await res.text()}`)
+  if (!res.ok) throw await toApiError(res)
   const text = await res.text()
   return (text ? JSON.parse(text) : undefined) as T
+}
+
+/** 404면 null. 아직 만들어지지 않은 결과(분석, 배포 상태)를 기다릴 때 씀 */
+export async function reqOrNull<T>(path: string): Promise<T | null> {
+  try {
+    return await req<T>(path)
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null
+    throw e
+  }
 }
 
 export const send = (method: string, body: unknown): RequestInit => ({

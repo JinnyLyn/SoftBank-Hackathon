@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import ProviderMark from '../components/ProviderMark'
-import { costText, usd } from '../format'
+import { costText, shortTime, usd } from '../format'
 import type { DeployRecord } from '../types'
 
 const STATUS_TEXT: Record<DeployRecord['status'], string> = {
@@ -70,7 +70,7 @@ export default function History() {
                     </span>
                     {r.note && <small>{r.note}</small>}
                   </span>
-                  <span className="t-time mono">{r.createdAt}</span>
+                  <span className="t-time mono">{shortTime(r.createdAt)}</span>
                   <span className={'t-status rs-' + r.status}>{STATUS_TEXT[r.status]}</span>
                 </li>
               ))}

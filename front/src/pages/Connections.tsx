@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react'
 import { api } from '../api'
+import { shortTime } from '../format'
 import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
 import InstallCommand from '../components/InstallCommand'
@@ -156,7 +157,7 @@ export default function Connections({ connections, onChange }: Props) {
                   <span className={'conn-status is-' + c.status}>
                     {{ connected: '연결됨', pending: '연결 대기', error: '확인 필요' }[c.status]}
                   </span>
-                  <span className="small muted">{c.checkedAt.slice(5)} 확인</span>
+                  <span className="small muted">{shortTime(c.checkedAt)} 확인</span>
                 </div>
                 <div className="conn-actions">
                   <button className="btn btn-ghost btn-sm" onClick={() => check(c.id)} disabled={checking === c.id}>
