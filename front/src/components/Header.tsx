@@ -5,7 +5,7 @@ export type Page = 'new' | 'history' | 'targets'
 const TABS: { key: Page; label: string }[] = [
   { key: 'new', label: '새 배포' },
   { key: 'history', label: '배포 이력' },
-  { key: 'targets', label: '배포 대상' },
+  { key: 'targets', label: '연결 관리' },
 ]
 
 export function Logo({ size = 22 }: { size?: number }) {
@@ -46,7 +46,7 @@ export default function Header({ page, onChange, connections }: Props) {
             </button>
           ))}
         </nav>
-        <button className="account" onClick={() => onChange('targets')} title="배포 대상 관리">
+        <button className="account" onClick={() => onChange('targets')} title="연결 관리">
           <span className={'dot' + (broken ? ' is-warn' : '')} />
           대상 {connections.length}곳{broken ? ` · 확인 필요 ${broken}` : ''}
         </button>

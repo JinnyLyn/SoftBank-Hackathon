@@ -3,7 +3,7 @@ import { api } from '../api'
 import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
 import InstallCommand from '../components/InstallCommand'
-import { EXTERNAL_ID, PROVIDER_ORDER, PROVIDERS } from '../providers'
+import { CONSOLE_HOSTS, EXTERNAL_ID, PROVIDER_ORDER, PROVIDERS } from '../providers'
 import type { Connection, Provider } from '../types'
 
 interface Draft {
@@ -20,9 +20,6 @@ const emptyDraft = (provider: Provider, count: number): Draft => ({
     PROVIDERS[provider].fields.map((f) => [f.key, f.options?.[0].value ?? (f.key === 'port' ? '22' : '')]),
   ),
 })
-
-// 백엔드가 준 콘솔 주소가 진짜 벤더 콘솔인지 확인한 뒤에만 링크로 보여 줌
-const CONSOLE_HOSTS = ['console.aws.amazon.com']
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
@@ -108,7 +105,7 @@ export default function Connections({ connections, onChange }: Props) {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>배포 대상</h1>
+          <h1>연결 관리</h1>
           <p>
             AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할
             위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.

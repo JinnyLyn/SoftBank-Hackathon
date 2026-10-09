@@ -1,4 +1,5 @@
 import ProviderMark from '../components/ProviderMark'
+import QuickConnect from '../components/QuickConnect'
 import type { Connection, ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
 
 const USERS: { value: ExpectedUsers; note: string }[] = [
@@ -23,10 +24,11 @@ interface Props {
   locked: boolean
   connections: Connection[]
   onChange: (s: ScaleInput) => void
+  onConnectionsChange: (list: Connection[]) => void
   onShowConnections: () => void
 }
 
-export default function ScaleStep({ scale, locked, connections, onChange, onShowConnections }: Props) {
+export default function ScaleStep({ scale, locked, connections, onChange, onConnectionsChange, onShowConnections }: Props) {
   const usable = connections.filter((c) => c.status === 'connected')
   const skipped = connections.length - usable.length
 
@@ -120,11 +122,12 @@ export default function ScaleStep({ scale, locked, connections, onChange, onShow
         <p className="hint">몰리는 시간이나 저장하는 데이터 양을 적어 주면 사양을 더 알맞게 고릅니다.</p>
       </div>
 
+      {usable.length === 0 && !locked ? (
+        <QuickConnect connections={connections} onChange={onConnectionsChange} />
+      ) : (
       <div className="compare-note">
         <div>
-          <strong>
-            {usable.length > 0 ? `연결된 배포 대상 ${usable.length}곳을 모두 비교합니다` : '연결된 배포 대상이 없습니다'}
-          </strong>
+          <strong>연결된 배포 대상 {usable.length}곳을 모두 비교합니다</strong>
           <span className="compare-targets">
             {usable.map((c) => (
               <span key={c.id}>
@@ -135,9 +138,10 @@ export default function ScaleStep({ scale, locked, connections, onChange, onShow
           </span>
         </div>
         <button className="link-btn" onClick={onShowConnections}>
-          {usable.length > 0 ? '대상 관리' : '대상 추가하기'}
+          연결 관리
         </button>
       </div>
+      )}
     </div>
   )
 }

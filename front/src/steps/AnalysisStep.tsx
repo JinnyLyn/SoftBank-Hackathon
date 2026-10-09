@@ -76,7 +76,7 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
         <p className={'rec-reason' + (rec.recommended ? '' : ' is-blocked')}>{rec.reason}</p>
 
         {rec.options.length === 0 ? (
-          <p className="muted">비교할 배포 대상이 없습니다. 배포 대상 탭에서 하나 이상 연결해 주세요.</p>
+          <p className="muted">비교할 배포 대상이 없습니다. 첫 화면이나 연결 관리 탭에서 하나 이상 연결해 주세요.</p>
         ) : (
           <div className="matrix-wrap">
             <table className="matrix">

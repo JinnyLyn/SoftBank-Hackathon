@@ -713,6 +713,21 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
   padding: 12px 16px;
 }
 
+/* ---------- 새 배포 안에서 바로 연결 ---------- */
+.quick {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border: 1px solid var(--line-strong);
+  border-left: 4px solid var(--marking);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+.quick > strong { font-size: 14.5px; }
+.quick > .hint { margin-top: -8px; }
+.quick-choices { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.quick-actions { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+
 /* ---------- MOCK 표시, 예산, 재검토 ---------- */
 .mock-banner {
   background: var(--marking);

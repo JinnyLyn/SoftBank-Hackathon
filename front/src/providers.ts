@@ -50,6 +50,9 @@ export const PROVIDER_ORDER: Provider[] = ['aws', 'onprem']
 
 export const EXTERNAL_ID = 'pc-7f3a91'
 
+/** 백엔드가 준 콘솔 주소는 이 호스트의 https 주소일 때만 링크로 보여 줌 */
+export const CONSOLE_HOSTS = ['console.aws.amazon.com']
+
 /** 설치 스크립트 미리 보기. 실제 스크립트는 백엔드가 같은 내용으로 제공 */
 export const INSTALL_SCRIPT_PREVIEW = `#!/bin/sh
 # Paved Clouds 서버 연결 스크립트. root 권한으로 한 번만 실행

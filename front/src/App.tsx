@@ -27,6 +27,7 @@ export default function App() {
         <div hidden={page !== 'new'}>
           <NewDeploy
             connections={connections ?? []}
+            onConnectionsChange={setConnections}
             onShowHistory={() => setPage('history')}
             onShowConnections={() => setPage('targets')}
           />

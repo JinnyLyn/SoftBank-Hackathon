@@ -43,11 +43,12 @@ const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
 
 interface Props {
   connections: Connection[]
+  onConnectionsChange: (list: Connection[]) => void
   onShowHistory: () => void
   onShowConnections: () => void
 }
 
-export default function NewDeploy({ connections, onShowHistory, onShowConnections }: Props) {
+export default function NewDeploy({ connections, onConnectionsChange, onShowHistory, onShowConnections }: Props) {
   const [step, setStep] = useState(0)
   const [source, setSourceState] = useState<Source | null>(null)
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
@@ -321,6 +322,7 @@ export default function NewDeploy({ connections, onShowHistory, onShowConnection
                   locked={locked || busy === 'analyze'}
                   connections={connections}
                   onChange={setScale}
+                  onConnectionsChange={onConnectionsChange}
                   onShowConnections={onShowConnections}
                 />
               </section>
