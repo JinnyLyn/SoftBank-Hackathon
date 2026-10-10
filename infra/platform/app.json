@@ -1,0 +1,15 @@
+{
+  "container_port": 8000,
+  "health_check_path": "/health",
+  "task_size": "small",
+  "min_tasks": 1,
+  "max_tasks": 1,
+  "use_database": true,
+  "environment": {
+    "UPLOAD_DIR": "/var/lib/paved-clouds/uploads",
+    "PLAN_ARTIFACT_DIR": "/var/lib/paved-clouds/plans",
+    "MAX_UPLOAD_BYTES": "52428800",
+    "AWS_REGION": "sa-east-1"
+  },
+  "init_command": ["python", "-m", "app.cli", "migrate"]
+}

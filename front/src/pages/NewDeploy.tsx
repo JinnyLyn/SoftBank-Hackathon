@@ -12,6 +12,7 @@ import { domainDone, domainFailed } from '../components/DomainProgress'
 import WorkProgress from '../components/WorkProgress'
 import { STAGE_SIZE } from '../progress'
 import { costText, tierTotal, usd } from '../format'
+import { isEnabled } from '../providers'
 import type { PollIssue } from '../steps/DeployStep'
 import type {
   Analysis,
@@ -34,7 +35,14 @@ const DEPLOY = 4
 
 const STEPS = [
   { label: '앱 제출', title: '앱 제출', desc: '코드와 대략적인 사용 규모, 월 예산을 받습니다.' },
-  { label: '도메인', title: '도메인', desc: '앱에 접속할 주소를 고릅니다. 자동 주소를 고르면 설정 없이 바로 https 주소가 생깁니다.' },
+  {
+    label: '도메인',
+    title: '도메인',
+    // 온프레미스(로컬 Docker)만 켠 경우 도메인·HTTPS가 없다
+    desc: isEnabled('aws')
+      ? '앱에 접속할 주소를 고릅니다. 자동 주소를 고르면 설정 없이 바로 https 주소가 생깁니다.'
+      : '온프레미스(로컬 Docker)는 이 PC의 로컬 주소로 접속합니다. 도메인·HTTPS는 지원하지 않습니다.',
+  },
   { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과 구성별 비용을 비교합니다.' },
   {
     label: '비용 승인',
@@ -388,8 +396,11 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setError(null)
   }
 
-  const domainLabel =
-    domainChoice.mode === 'auto' ? '자동 주소' : `${domainChoice.name || '이름 미입력'} (보유)`
+  const domainLabel = !isEnabled('aws')
+    ? '로컬 주소 (도메인 없음)'
+    : domainChoice.mode === 'auto'
+      ? '자동 주소'
+      : `${domainChoice.name || '이름 미입력'} (보유)`
 
   const railItems: RailItem[] = STEPS.map((s, i) => {
     let sub: string | undefined

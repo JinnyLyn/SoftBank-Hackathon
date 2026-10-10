@@ -225,3 +225,29 @@ variable "environment" {
     error_message = "비밀로 보이는 이름(SECRET, PASSWORD, TOKEN, API_KEY 등)은 environment에 넣을 수 없습니다."
   }
 }
+
+variable "secret_parameter_arns" {
+  description = "앱에 **비밀**로 주입할 SSM 파라미터. {환경 변수 이름 = 파라미터 ARN}. 운영자가 /<프로젝트>/apps/<deploy_id>/secrets/<이름> 으로 SecureString을 미리 만들어 두고 deploy.sh up --secret <이름> 으로 넘긴다. 값은 plan·state·작업 정의에 들어가지 않고 ECS가 컨테이너를 시작할 때 읽는다(environment에는 TOKEN·PASSWORD 같은 이름을 평문으로 넣을 수 없어서 이 경로를 쓴다). LLM이 정하는 값이 아니라 플랫폼이 넘기는 값이다"
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = length(var.secret_parameter_arns) <= 10
+    error_message = "secret_parameter_arns는 10개 이하여야 합니다."
+  }
+
+  validation {
+    condition     = alltrue([for k in keys(var.secret_parameter_arns) : can(regex("^[A-Z_][A-Z0-9_]{0,63}$", k))])
+    error_message = "secret_parameter_arns의 키는 대문자, 숫자, 밑줄로 된 64자 이하 환경 변수 이름이어야 합니다."
+  }
+
+  validation {
+    condition     = !contains(keys(var.secret_parameter_arns), "DATABASE_URL")
+    error_message = "DATABASE_URL은 secret_parameter_arns로 넘길 수 없습니다. 앱 전용 DB는 use_database=true로 주입합니다."
+  }
+
+  validation {
+    condition     = alltrue([for v in values(var.secret_parameter_arns) : can(regex("^arn:aws[a-z-]*:ssm:[a-z0-9-]+:[0-9]{12}:parameter/.+$", v))])
+    error_message = "secret_parameter_arns의 값은 SSM 파라미터 ARN이어야 합니다."
+  }
+}

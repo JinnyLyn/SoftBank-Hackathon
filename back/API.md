@@ -119,6 +119,8 @@ LLM 분석 요청 자체는 이 API가 수행하지 않습니다. 분석 담당 
 
 AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니다. 응답에는 서버가 만든 `fingerprint`, `status: "awaiting_approval"`, `terraform_plan_ready` 등이 포함됩니다. 이 fingerprint는 사용자가 승인하는 계획 내용의 식별자이므로 프런트가 임의로 계산하거나 바꾸면 안 됩니다.
 
+`target`은 `aws`(제품 배포 대상) 또는 `local_docker`(발표자 PC의 Docker로 올리는 시연용 선택 대상, 화면에서는 "온프레미스")입니다. `local_docker` 계획은 Terraform plan 파일 대신 승인할 **compose 파일**을 `variables.compose_yaml`에 담고, 그 SHA-256을 `terraform_plan_sha256`에 넣어야 합니다(없으면 422). 별도 plan 파일 업로드가 없어 `terraform_plan_ready`는 항상 `true`입니다. 비용 추정은 `0`이고 전기·회선·PC 사용 비용은 포함하지 않는다고 `variables.cost.excluded`에 밝힙니다. 새 계획은 **같은 대상**의 승인 대기 계획만 `superseded`로 바꾸므로 한 프로젝트가 AWS와 `local_docker` 계획을 함께 가질 수 있고, 둘 중 하나를 승인하면 같은 프로젝트의 다른 승인 대기 일반 배포 계획은 `superseded`가 됩니다(쓰지 않을 계획이 Fargate vCPU를 계속 예약하지 않게). `local_docker` 롤백은 지원하지 않습니다.
+
 현재 비용 추정 통화는 `USD`만 허용합니다. 프런트 이력의 `monthlyUsd` 필드는 이 금액을 그대로 표시합니다.
 
 - `GET /api/projects/{project_id}/plans`: 프로젝트 계획 목록
@@ -172,6 +174,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 }
 ```
 
+`reason`은 `available`, `first_deployment`, `no_previous_healthy`, `not_failed`, `unsupported_target`(실패한 배포가 `local_docker`)입니다.
+
 롤백 불가 시 `reason`은 `first_deployment`, `no_previous_healthy`, `not_failed` 중 하나입니다. `first_deployment`와 `no_previous_healthy`에서는 AI 분석·수정 → 새 plan/비용/terraform plan 확인 → 사용자 승인 → `POST /api/deployments`로 재배포합니다.
 
 사용자가 롤백 계획 생성을 명시적으로 선택·확인한 경우에만 아래 요청을 보냅니다. 이 요청은 실행을 승인하지 않으며 새 `awaiting_approval` rollback plan을 반환합니다.
@@ -214,7 +218,7 @@ CloudFormation callback과 worker 경로는 다음과 같습니다.
 - `POST /api/worker/plans/{plan_id}/terraform-plan`: `Content-Type: application/octet-stream`으로 Terraform binary plan 업로드. 서버가 SHA-256을 확인합니다.
 - `POST /api/worker/rollback-plans/{plan_id}/terraform-plan`: 새 rollback Terraform binary plan을 저장합니다. `X-Terraform-Plan-SHA256` 헤더와 본문 해시가 같아야 하며, 기존 성공 배포의 plan을 재사용할 수 없습니다.
 - `POST /api/worker/rollback-plans/{plan_id}/summary`: 새 rollback plan의 SHA-256과 Terraform diff 요약을 저장합니다. 이 요약과 artifact가 모두 있어야 사용자 승인이 가능합니다.
-- `POST /api/worker/deployments/claim`: 대기 중인 AWS 일반 배포 또는 사용자 승인 롤백 작업 하나를 가져옵니다. 롤백 작업에는 `operation_type: "rollback"`, `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다. 없으면 `{ "job": null }`.
+- `POST /api/worker/deployments/claim`: 대기 중인 AWS 일반 배포 또는 사용자 승인 롤백 작업 하나를 가져옵니다. 롤백 작업에는 `operation_type: "rollback"`, `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다. 없으면 `{ "job": null }`. 선택 쿼리 `targets`(쉼표 구분, 기본 `aws`)로 worker가 다루는 배포 대상(`aws`, `local_docker`)을 알립니다. 생략하면 `aws`라서 `targets`를 모르는 옛 worker는 `local_docker` 작업을 가져가지 않고, 알 수 없는 값은 422입니다. `local_docker` 작업에는 `terraform_plan_download_path`가 없습니다(compose 파일은 `variables.compose_yaml`).
 - claim의 작업 객체에는 `source_download_path`와 `terraform_plan_download_path`가 포함됩니다. worker는 API base URL과 경로를 결합해 아래 다운로드 API에서 파일을 받아야 합니다. S3 artifact 모드에서는 `source_path`와 `terraform_plan_path`를 `null`로 반환하므로 호스트 파일 경로를 사용하지 않습니다. 로컬 개발 모드에서는 기존 경로 필드도 호환을 위해 남습니다.
 - `GET /api/worker/projects/{project_id}/source`: 원본 ZIP을 스트리밍합니다. S3 사용 여부와 관계없이 API가 저장소에서 읽어 주며, worker token이 필요합니다.
 - `GET /api/worker/plans/{plan_id}/terraform-plan`: 진행 중(`provisioning` 또는 `deploying`)인 배포의 binary plan을 스트리밍합니다. 저장된 SHA-256을 서버가 확인하고 `X-Terraform-Plan-SHA256` 응답 헤더로 전달합니다. worker도 받은 파일의 SHA-256을 대조해야 합니다.

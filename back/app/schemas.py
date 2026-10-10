@@ -163,7 +163,8 @@ class CostEstimate(APIModel):
 class PlanIn(APIModel):
     project_id: UUID
     analysis_id: UUID | None = None
-    target: Literal["aws"]
+    # aws: Terraform 저장 plan. local_docker: 발표자 PC의 Docker로 올리는 compose 파일(그 SHA-256이 terraform_plan_sha256 자리에 들어간다)
+    target: Literal["aws", "local_docker"]
     module_id: str = Field(min_length=1, max_length=100)
     variables: dict[str, Any]
     summary: str = Field(min_length=1, max_length=8000)
@@ -233,7 +234,7 @@ class RollbackPlanSummaryIn(APIModel):
 
 class RollbackCandidateOut(APIModel):
     rollback_available: bool
-    reason: Literal["available", "first_deployment", "no_previous_healthy", "not_failed"]
+    reason: Literal["available", "first_deployment", "no_previous_healthy", "not_failed", "unsupported_target"]
     target_deployment_id: UUID | None = None
     target_plan_id: UUID | None = None
 

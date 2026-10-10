@@ -6,6 +6,8 @@
 
 이 worker의 `healthy`는 앱 배포 상태다. 도메인 신규 등록·DNS·인증서·호스트 라우팅의 제품 흐름은 아직 포함하지 않는다. 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
 
+이 worker는 기본으로 AWS만 다룬다. 발표자 PC의 Docker로 올리는 선택 기능은 [로컬 Docker 배포](#로컬-docker-배포-발표자-pc-시연용-선택-기능)에 따로 적었고 `--targets local_docker`를 줄 때만 켜진다.
+
 백엔드는 ZIP·분석 결과·계획·승인·배포 대기열을 저장만 하고 Terraform·Docker·AWS를 실행하지 않는다(`back/API.md`).
 프런트는 계획이 생길 때까지 기다리기만 한다. 그 사이를 이 worker가 채운다.
 
@@ -156,6 +158,40 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 **현재 worker에는 rollback plan 생성·업로드·diff 등록과 롤백 전용 실행 연동이 구현돼 있지 않다.** 위 내용은 연결해야 할 계약이며 현재 end-to-end 지원을 뜻하지 않는다. 연동 전에는 제품 롤백 실행을 제공하지 않고 미지원 상태를 알린다. 이 공백을 사람이 `deploy.sh rollback`을 직접 실행하는 방식으로 대체하지 않는다. 저수준 CLI의 확인 프롬프트도 백엔드의 사용자 승인을 대신하지 않는다.
 
+## 로컬 Docker 배포 (발표자 PC 시연용 선택 기능)
+
+worker를 `--targets`로 켜면 AWS 대신(또는 AWS와 함께) **이 PC의 Docker**로 앱을 올린다. 화면에서는 "온프레미스"로 보이고 백엔드에는 `target=local_docker`로 저장된다. **팀이 확정한 제품 범위가 아니다**([PRODUCT_DIRECTION §1](../../docs/PRODUCT_DIRECTION.md)은 배포 대상을 AWS로 정한다). 발표자 PC 시연용 선택 기능이며 기본은 꺼져 있다([docs/OPEN_QUESTIONS.md](../../docs/OPEN_QUESTIONS.md)). 원격 서버(SSH)·사용자 서버 연결·HTTPS·도메인은 없다.
+
+```bash
+export WORKER_API_TOKEN=<백엔드와 같은 값>
+python infra/worker/worker.py --targets local_docker             # 로컬 Docker만. bash·Terraform·AWS CLI가 필요 없다
+python infra/worker/worker.py --targets aws,local_docker         # AWS 계획과 로컬 계획을 함께 만들어 화면에서 비교한다
+```
+
+| 설정 | 기본값 |
+|---|---|
+| `WORKER_TARGETS` / `--targets` | `aws`. `local_docker`를 더해야 켜진다. 기본에서는 docker를 부르지 않고 claim 요청도 예전과 같다 |
+| `LOCAL_DOCKER_HOST` / `--local-host` | `localhost`. 접속 주소(`http://<이름>:<포트>`)에 쓸 이름. 발표 화면·휴대폰에서 열 주소(PC의 IP 등) |
+| `LOCAL_DOCKER_BIND` / `--local-bind` | `127.0.0.1`. 이 PC에서만 접속된다. `0.0.0.0`이면 같은 네트워크의 누구나 접속할 수 있어 시작할 때 경고한다(로그인 없는 앱 주의) |
+| `LOCAL_DOCKER_DIR` / `--local-dir` | `infra/local-deployments`. 배포 1건 = `<배포ID>/`(compose 파일, `secrets/`). Git에서 제외된다 |
+
+필요한 것: Docker Desktop(`docker compose` v2). 앱이 DB를 쓰면 `mysql:8.4` 이미지가 이 PC에 있어야 시연 중 내려받기를 기다리지 않는다. 빌드는 앱 Dockerfile 안의 `pip install` 등이 인터넷을 쓴다.
+
+흐름은 AWS와 같고 실행기만 다르다.
+
+1. **계획**(`plan_pending_local`): 분석 결과가 있는 프로젝트마다 `docker info`로 Docker가 쓸 수 있는 CPU·메모리를 읽어 구성 단계(`lean`/`balanced`/`roomy`, 예상 사용자 수·접속 패턴으로 고름)를 정하고, 메모리에 안 맞으면 낮춘다. 승인 대상인 **compose 파일을 만들어** 그 SHA-256과 함께 `POST /api/plans`(`target=local_docker`)로 등록한다. 파일은 `variables.compose_yaml`에 들어 있어 따로 올리지 않는다. 이미지를 만들거나 컨테이너를 띄우지 않는다. 비용은 0(전기·회선·PC 사용 비용은 제외라고 계획에 적는다). 승인 대기·승인·배포됨 계획이 이미 있거나, 다른 대상으로 이미 승인한 프로젝트는 건너뛴다.
+2. **실행**(`execute_local_job`): 승인된 작업을 가져오면(`claim?targets=local_docker`) 먼저 **승인된 계획 그대로인지** 확인한다 — 계획 변수에서 compose 파일을 다시 만들어 승인된 본문과 같은지, 그 SHA-256이 승인된 값인지. 다르면 아무것도 실행하지 않고 `plan_mismatch`로 `failed` 보고한다. 이어서 소스 ZIP의 SHA-256(AWS와 같은 규칙), `docker build`(이 PC의 로컬 이미지 `pc-local/<배포ID>:s<소스지문>`, 어디에도 push하지 않음), `docker compose up -d`, 앱 초기화 명령(`init_command`, AWS와 같이 여러 번 실행돼도 안전해야 한다), 헬스체크 순이다.
+3. **헬스체크**: 200~399면 통과. 4xx가 4번 연속이거나, 앱 컨테이너가 종료되거나 재시작을 3번 연속 확인하거나, 제한 시간(180초)을 넘으면 `failed`(AWS 경로와 같은 판정). 5xx·연결 실패는 시작 중일 수 있어 기다린다.
+4. **실패**: 자동 롤백하지 않는다. 컨테이너를 **멈추기만** 하고(재시작 루프가 PC 자원을 쓰지 않게) 지우지 않아 로그를 볼 수 있다. 이벤트에 컨테이너 상태와 마스킹된 로그 끝부분(`diagnose`)이 담긴다. 롤백은 지원하지 않는다(백엔드도 로컬 Docker 롤백 후보를 만들지 않는다 — `rollback-candidate`는 `unsupported_target`).
+
+compose 파일이 만드는 것: 앱 컨테이너 1개(`127.0.0.1:<포트>:<컨테이너 포트>`, CPU·메모리 한도, `restart: unless-stopped`, `no-new-privileges`)와, 앱이 DB를 쓰면 `mysql:8.4` 컨테이너 1개(이 배포 전용 DB `app_<배포ID>`와 계정, 이름 있는 볼륨 `db-data`, healthcheck)다. 호스트 경로 마운트·docker 소켓·특권 모드·`network_mode`는 렌더러가 만들지 않고, 실행기는 렌더러가 만든 모양이 아닌 파일을 실행하지 않는다.
+
+- **비밀**: DB 비밀번호는 실행할 때 `secrets/db.env`·`secrets/app.env`(소유자만 읽도록 0600, Windows는 사용자 폴더 권한)에 만든다. compose 본문에는 `env_file` 참조만 있다(백엔드가 `*_PASSWORD` 같은 이름의 값을 가진 계획을 거부하므로 비밀을 compose 환경 변수로 넣을 수 없다). 계획·compose·이벤트·로그에는 비밀번호가 없고, 로그는 이 파일의 값을 통째로 가린다. 다시 배포해도 비밀 파일은 그대로다(MySQL은 첫 초기화 때 비밀번호가 정해진다). 비밀 파일 없이 DB 볼륨만 남았으면 임의로 이어 쓰지 않고 `secrets_missing`으로 알린다.
+- **포트**: 배포 ID에서 정한 시작 포트부터 비어 있는 첫 포트(18001~18999)를 계획할 때 고른다. 두 계획이 같은 포트를 고르면 늦게 띄우는 쪽이 `apply_failed`(호스트 포트 사용 중)로 실패한다.
+- **정리**: `python infra/worker/local_docker.py list | status <ID> | destroy <ID> [--drop-data]`. `destroy`는 컨테이너·네트워크만 지우고 DB 볼륨과 비밀 파일은 남긴다. `--drop-data`는 볼륨과 배포 폴더까지 지운다(되돌릴 수 없다).
+- **한계**: 이 PC의 Docker만 대상이다(발표자 PC가 꺼지면 서비스도 멈춘다). HTTP·`localhost` 주소만 있고 도메인·HTTPS·부하 분산·백업·자동 확장이 없다. 컨테이너 하나라 하드웨어 장애를 막지 못한다. 롤백 없음. 분석 결과의 안내 문구 중 일부("공용 MySQL…", "비밀 저장소로 주입")는 AWS 기준 문구라 로컬 배포에는 맞지 않는다(`ai/` 담당). 실제 다중 사용자 공개 운영 근거가 아니다.
+- **검증**: `python -X utf8 infra/worker/test_local_docker.py`(69개, 가짜 docker·가짜 백엔드, Docker 없이 돈다). 별도로 이 PC의 실제 Docker 29.8·Compose 5.5와 실제 백엔드(MySQL 8.4)·프런트로 한 번 끝까지 실행했다(샘플 `launchpad`: 업로드 → 규칙 분석 → 계획 → 승인 → 빌드 → 컨테이너 2개 → 헬스체크 → 앱 가입 API로 앱 전용 DB 쓰기 확인). 실제 Docker로 실패 경로(재시작 루프 감지·포트 충돌·정리)도 한 번 확인했다. 실제 AWS와 동시에 두 대상을 비교하는 화면(`aws,local_docker`)은 AWS 계획을 만들 수 있는 환경이 없어 확인하지 못했다.
+
 ## connector: 사용자 AWS 연결 확인
 
 백엔드(PR #23)에는 사용자가 CloudFormation 스택으로 만든 AWS 역할을 확인하는 worker 경로가 있다([back/API.md](../../back/API.md)). 사용자 AWS 연결은 기본 제품 흐름이 아니므로([PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)) 기존 연결 화면·API와의 호환을 위한 부분이다. 템플릿과 운영자 준비는 [infra/README.md](../README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용)를 따른다.
@@ -196,5 +232,6 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 ```bash
 python infra/worker/test_worker.py      # 161개(약 3분). 실제 AWS·Docker 없이 돈다. Windows 한글 콘솔(cp949)이면 python -X utf8 로 돌린다
+python infra/worker/test_local_docker.py   # 69개(약 1분). 로컬 Docker 배포(위 "로컬 Docker 배포"). 가짜 docker·가짜 백엔드
 python infra/scripts/test_infra.py      # deploy.sh와 Terraform 모듈 시험
 ```

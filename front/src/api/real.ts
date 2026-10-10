@@ -12,6 +12,7 @@ import type {
   DomainPlan,
   DomainStatus,
   Finding,
+  Provider,
   Recommendation,
   ScaleInput,
   Source,
@@ -21,6 +22,7 @@ import type {
 } from '../types'
 import { ApiError, req, reqOrNull, send } from './http'
 import { sourceName, TIER_META, usd } from '../format'
+import { isEnabled } from '../providers'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -185,6 +187,7 @@ interface PlanOut {
   id: string
   project_id: string
   analysis_id: string | null
+  /** aws: Terraform 저장 plan, local_docker: 발표자 PC의 Docker로 올리는 compose 파일 (화면에서는 온프레미스) */
   target: string
   module_id: string
   variables: Record<string, unknown>
@@ -246,11 +249,18 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
   return out
 }
 
+const LOCAL = 'local_docker'
+/** 온프레미스(로컬 Docker)는 연결 기록이 없어서 화면용 고정 id를 씀. 백엔드의 연결(connections)과 무관 */
+const LOCAL_CONNECTION_ID = 'local-docker'
+const isLocal = (p: PlanOut) => p.target === LOCAL
+/** 먼저 온 쪽 계획만 있을 때 다른 대상의 계획을 더 기다리는 시간 (AWS 계획은 만드는 데 30초쯤 걸림) */
+const OTHER_TARGET_GRACE_MS = 90 * 1000
+
 // 화면에서 고른 칸(대상:크기) → 백엔드 계획. 승인할 때 plan id와 fingerprint를 여기서 찾음
 let plansByKey = new Map<string, PlanOut>()
 
 /** 계획 변수 중 화면 문구용 키를 빼고 짧게 요약 */
-const META_KEYS = ['tier', 'recommended', 'headline', 'tradeoff', 'reason', 'resources', 'connection_name']
+const META_KEYS = ['tier', 'recommended', 'headline', 'tradeoff', 'reason', 'resources', 'connection_name', 'usage_note']
 function variableSummary(v: Record<string, unknown>) {
   const text = Object.entries(v)
     .filter(([k, x]) => !META_KEYS.includes(k) && ['string', 'number', 'boolean'].includes(typeof x))
@@ -276,6 +286,8 @@ function toTier(p: PlanOut, key: TierKey): Tier {
     headline: str(v.headline) || p.module_id,
     tradeoff: str(v.tradeoff),
     resources,
+    // 추가 비용이 없는 온프레미스는 금액 대신 자원 한도를 보여 줌
+    usageNote: str(v.usage_note) || undefined,
     // 화면의 모든 금액·예산 판단은 서버 추정 총액 하나로 (resources 합계와 달라도)
     totalUsd: planCost(p),
   }
@@ -287,7 +299,35 @@ function draftFile(p: PlanOut): { name: string; content: string }[] {
   return isObj(d) && typeof d.content === 'string' && d.content ? [{ name: 'Dockerfile (초안)', content: d.content }] : []
 }
 
+/** 온프레미스(로컬 Docker) 계획: 검토·승인 대상은 compose 파일과 실행 변수. compose의 SHA-256이 백엔드의 승인 식별자(fingerprint)에 들어 있음 */
+function toComposeBundle(p: PlanOut): TerraformBundle {
+  const v = p.variables
+  const containers = Array.isArray(v.resources) ? v.resources.length : null
+  return {
+    tool: 'compose',
+    files: [
+      { name: 'docker-compose.yml', content: str(v.compose_yaml) },
+      { name: 'local-plan.variables.json', content: JSON.stringify(v, null, 2) },
+    ],
+    plan: {
+      add: containers,
+      change: containers === null ? null : 0,
+      destroy: containers === null ? null : 0,
+      text: [`# module: ${p.module_id}`, `# compose sha256: ${p.terraform_plan_sha256 ?? '(아직 없음)'}`, '', p.summary].join('\n'),
+    },
+    planInfo: {
+      planId: p.id,
+      moduleId: p.module_id,
+      summary: p.summary,
+      fingerprint: p.fingerprint,
+      ready: p.terraform_plan_ready,
+      pricingAsOf: undefined,
+    },
+  }
+}
+
 function toBundle(p: PlanOut): TerraformBundle {
+  if (isLocal(p)) return toComposeBundle(p)
   return {
     tool: 'terraform',
     // AGENTS.md: 제품 LLM은 Terraform 변수값까지만 바꿈 → 검토 대상은 변수값과 계획 설명
@@ -318,87 +358,121 @@ function toBundle(p: PlanOut): TerraformBundle {
 }
 
 /**
+ * 켜 둔 배포 대상(VITE_PROVIDERS)의 승인 대기 계획을 기다림. 모든 대상의 계획이 오면 바로, 한쪽만 먼저 왔으면 다른 쪽을
+ * OTHER_TARGET_GRACE_MS 동안 더 기다린 뒤 있는 것만으로 진행 (한 대상의 계획 생성이 막혀도 다른 대상으로 배포할 수 있게)
+ * AWS만 켠 기본 설정은 예전처럼 AWS 계획이 오면 바로 끝남
+ */
+async function waitForPlans(projectId: string, want: { aws: boolean; local: boolean }): Promise<PlanOut[]> {
+  const timeoutMs = 5 * 60 * 1000
+  const until = Date.now() + timeoutMs
+  let firstSeen = 0
+  for (;;) {
+    const list = await req<PlanOut[]>(`/projects/${projectId}/plans`)
+    const waiting = list.filter(
+      (p) => p.status === 'awaiting_approval' && (isLocal(p) ? want.local : want.aws && p.target === 'aws'),
+    )
+    if (waiting.length) {
+      if (!firstSeen) firstSeen = Date.now()
+      const complete = (!want.aws || waiting.some((p) => !isLocal(p))) && (!want.local || waiting.some(isLocal))
+      if (complete || Date.now() - firstSeen > OTHER_TARGET_GRACE_MS) return waiting
+    }
+    if (Date.now() > until)
+      throw new ApiError(
+        408,
+        `${Math.round(timeoutMs / 60000)}분 동안 기다렸지만 배포 계획이(가) 오지 않았습니다. 배포 계획은 인프라 worker(infra/worker)가 만듭니다. worker가 실행 중인지 확인한 뒤 다시 기다려 주세요.`,
+      )
+    await wait(2000)
+  }
+}
+
+/**
  * 계획 모듈이 승인 대기 계획을 만들어 둘 때까지 기다린 뒤 비교표로 바꿈.
  * 크기는 계획 변수의 tier를 쓰고, 없으면 싼 순서대로 작게 시작 / 권장 / 여유 있게
  * 월 예산을 넘는 계획은 추천하지 않음 (화면에서도 고를 수 없음)
  */
 export async function recommend(projectId: string, scale: ScaleInput): Promise<Recommendation> {
   const [plans, conns] = await Promise.all([
-    poll(
-      async () => {
-        const list = await req<PlanOut[]>(`/projects/${projectId}/plans`)
-        const waiting = list.filter((p) => p.status === 'awaiting_approval' && p.target === 'aws')
-        return waiting.length ? waiting : null
-      },
-      {
-        intervalMs: 2000,
-        timeoutMs: 5 * 60 * 1000,
-        what: '배포 계획',
-        // 계획은 AI가 아니라 인프라 worker가 만듦. 분석은 이미 끝난 상태
-        hint: '배포 계획은 인프라 worker(infra/worker)가 만듭니다. worker가 실행 중인지 확인한 뒤 다시 기다려 주세요.',
-      },
-    ),
+    waitForPlans(projectId, { aws: isEnabled('aws'), local: isEnabled('onprem') }),
     req<Connection[]>('/connections'),
   ])
 
   const aws = conns.find((c) => c.provider === 'aws' && c.status === 'connected')
-  const connectionId = aws?.id ?? 'aws'
+  const awsId = aws?.id ?? 'aws'
+  const localName = str(plans.find(isLocal)?.variables.connection_name) || '이 PC (로컬 Docker)'
 
-  // 크기별로 가장 최근 계획 하나씩
-  const byTier = new Map<TierKey, PlanOut>()
-  const sorted = [...plans].sort((a, b) => planCost(a) - planCost(b))
-  sorted.forEach((p, i) => {
-    const declared = TIER_KEYS.find((k) => k === p.variables.tier)
-    const key = declared ?? TIER_KEYS[Math.min(i, TIER_KEYS.length - 1)]
-    const prev = byTier.get(key)
-    if (!prev || prev.created_at < p.created_at) byTier.set(key, p)
-  })
+  // 대상마다 한 칸씩. AWS는 연결이 없으면 worker가 쓰는 운영자 AWS (관리형 배포), 온프레미스는 worker가 도는 PC의 로컬 Docker
+  const groups: { connectionId: string; provider: Provider; name: string; plans: PlanOut[] }[] = [
+    { connectionId: awsId, provider: 'aws', name: aws?.name ?? '관리형 AWS', plans: plans.filter((p) => !isLocal(p)) },
+    { connectionId: LOCAL_CONNECTION_ID, provider: 'onprem', name: localName, plans: plans.filter(isLocal) },
+  ]
 
   plansByKey = new Map()
   const bundles: Record<string, TerraformBundle> = {}
-  const tiers: Tier[] = []
-  // 새 worker: 가장 최근 계획 하나에 비교 안(options)이 들어 있음. 없으면 예전처럼 크기별 계획을 하나씩 씀
-  const newest = [...plans].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0]
-  const fromOptions = newest ? tiersFromOptions(newest) : []
-  if (fromOptions.length) {
-    byTier.clear()
-    for (const { key, tier } of fromOptions.sort((a, b) => TIER_KEYS.indexOf(a.key) - TIER_KEYS.indexOf(b.key))) {
-      tiers.push(tier)
-      if (!tier.planned) continue
-      const k = keyOf({ connectionId, tier: key })
-      byTier.set(key, newest)
-      plansByKey.set(k, newest)
-      bundles[k] = toBundle(newest)
+  const options: Recommendation['options'] = []
+  const cells: { choice: Choice; plan: PlanOut }[] = []
+  for (const g of groups) {
+    if (!g.plans.length) continue
+    // 크기별로 가장 최근 계획 하나씩
+    const byTier = new Map<TierKey, PlanOut>()
+    const sorted = [...g.plans].sort((a, b) => planCost(a) - planCost(b))
+    sorted.forEach((p, i) => {
+      const declared = TIER_KEYS.find((k) => k === p.variables.tier)
+      const key = declared ?? TIER_KEYS[Math.min(i, TIER_KEYS.length - 1)]
+      const prev = byTier.get(key)
+      if (!prev || prev.created_at < p.created_at) byTier.set(key, p)
+    })
+    const tiers: Tier[] = []
+    // 대상별 최신 계획의 비교 안을 유지하되, 실제 계획이 있는 칸만 승인·추천 대상으로 등록
+    const newest = [...g.plans].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0]
+    const fromOptions = tiersFromOptions(newest)
+    if (fromOptions.length) {
+      for (const { key, tier } of fromOptions.sort((a, b) => TIER_KEYS.indexOf(a.key) - TIER_KEYS.indexOf(b.key))) {
+        tiers.push(tier)
+        if (!tier.planned) continue
+        const choice = { connectionId: g.connectionId, tier: key }
+        const k = keyOf(choice)
+        plansByKey.set(k, newest)
+        bundles[k] = toBundle(newest)
+        cells.push({ choice, plan: newest })
+      }
+    } else {
+      for (const key of TIER_KEYS) {
+        const p = byTier.get(key)
+        if (!p) continue
+        const choice = { connectionId: g.connectionId, tier: key }
+        const k = keyOf(choice)
+        plansByKey.set(k, p)
+        bundles[k] = toBundle(p)
+        tiers.push(toTier(p, key))
+        cells.push({ choice, plan: p })
+      }
     }
-  } else {
-    for (const key of TIER_KEYS) {
-      const p = byTier.get(key)
-      if (!p) continue
-      const k = keyOf({ connectionId, tier: key })
-      plansByKey.set(k, p)
-      bundles[k] = toBundle(p)
-      tiers.push(toTier(p, key))
-    }
+    options.push({ connectionId: g.connectionId, provider: g.provider, name: g.name, tiers })
   }
 
   const budget = scale.monthlyBudgetUsd
-  const within = [...byTier.entries()].filter(([, p]) => planCost(p) <= budget)
-  const pick =
-    within.find(([, p]) => p.variables.recommended === true) ?? within.sort((a, b) => planCost(a[1]) - planCost(b[1]))[0]
+  const within = cells.filter((c) => planCost(c.plan) <= budget)
+  // 기본은 AWS 계획. 월 예산 안에 드는 AWS 계획이 없을 때만 추가 비용이 없는 온프레미스를 추천
+  const awsExists = cells.some((c) => !isLocal(c.plan))
+  const awsWithin = within.filter((c) => !isLocal(c.plan))
+  const pool = awsWithin.length ? awsWithin : within
+  const pick = pool.find((c) => c.plan.variables.recommended === true) ?? [...pool].sort((a, b) => planCost(a.plan) - planCost(b.plan))[0]
+  const cheapest = Math.min(...cells.map((c) => planCost(c.plan)))
 
-  const pricing = plans.find((p) => p.cost_estimate)?.cost_estimate?.pricing_as_of
+  const pricing = plans.find((p) => !isLocal(p) && p.cost_estimate)?.cost_estimate?.pricing_as_of
+  const assumptions = [`월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`]
+  if (awsExists) assumptions.push(pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음', '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인')
+  if (cells.some((c) => isLocal(c.plan)))
+    assumptions.push('온프레미스(로컬 Docker)의 추가 비용 0에는 전기·회선·PC 사용 비용이 들어 있지 않고, 이 PC의 HTTP 주소로만 접속합니다(도메인·HTTPS 없음)')
+  const fallback = pick && awsExists && !awsWithin.length
   return {
-    recommended: pick ? { connectionId, tier: pick[0] } : null,
+    recommended: pick ? pick.choice : null,
     reason: pick
-      ? str(pick[1].variables.reason) || pick[1].summary
-      : `월 예산 ${usd(budget)} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 ${usd(planCost(sorted[0]))}입니다. 예산을 늘려 주세요.`,
-    // 연결이 없으면 worker가 쓰는 운영자 AWS (관리형 배포)
-    options: [{ connectionId, provider: 'aws', name: aws?.name ?? '관리형 AWS', tiers }],
-    assumptions: [
-      `월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`,
-      pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음',
-      '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인',
-    ],
+      ? (fallback ? `월 예산 ${usd(budget)} 안에 드는 AWS 계획이 없어 추가 비용이 없는 온프레미스를 추천합니다. ` : '') +
+        (str(pick.plan.variables.reason) || pick.plan.summary)
+      : `월 예산 ${usd(budget)} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 ${usd(cheapest)}입니다. 예산을 늘려 주세요.`,
+    options,
+    assumptions,
     bundles,
   }
 }
@@ -523,7 +597,7 @@ async function domainReq<T>(path: string, init?: RequestInit & { timeoutMs?: num
     return await req<T>(path, init)
   } catch (e) {
     if (e instanceof ApiError && (e.status === 404 || e.status === 405))
-      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소)로 배포합니다. 도메인은 연결되지 않습니다.')
+      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소 또는 이 PC의 로컬 주소)로 배포합니다. 도메인은 연결되지 않습니다.')
     throw e
   }
 }

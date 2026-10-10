@@ -5,7 +5,7 @@ import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
 import InstallCommand from '../components/InstallCommand'
 import LoadError from '../components/LoadError'
-import { CONSOLE_HOSTS, ENABLED_PROVIDERS, EXTERNAL_ID, ONPREM_ENABLED, PROVIDERS, isEnabled } from '../providers'
+import { CONNECTABLE_PROVIDERS, CONSOLE_HOSTS, EXTERNAL_ID, PROVIDERS, isEnabled } from '../providers'
 import type { Connection, Provider } from '../types'
 
 interface Draft {
@@ -37,7 +37,7 @@ interface Props {
 
 export default function Connections({ connections, loadError, onReload, onChange }: Props) {
   const list = connections ?? []
-  const [draft, setDraft] = useState<Draft>(() => emptyDraft(ENABLED_PROVIDERS[0], 0))
+  const [draft, setDraft] = useState<Draft>(() => emptyDraft(CONNECTABLE_PROVIDERS[0] ?? 'aws', 0))
   const [saving, setSaving] = useState(false)
   const [checking, setChecking] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -134,6 +134,44 @@ export default function Connections({ connections, loadError, onReload, onChange
     }
   }
 
+  // 등록할 수 있는 연결이 없는 경우: 실제 백엔드에서 로컬 Docker(온프레미스)만 켠 때. AWS 연결 폼을 보여 주면 틀린 안내가 된다
+  if (CONNECTABLE_PROVIDERS.length === 0) {
+    return (
+      <div className="page">
+        <div className="page-head">
+          <div>
+            <h1>연결 관리</h1>
+            <p className="readonly-note">
+              새 배포에는 연결이 필요 없습니다. 앱은 플랫폼 worker가 실행 중인 PC의 Docker(온프레미스)에 배포됩니다. 등록할 연결이 없습니다.
+            </p>
+          </div>
+        </div>
+        <section className="panel">
+          <header className="list-head">
+            <h2>배포 위치</h2>
+          </header>
+          <div className="panel-body stack">
+            <dl className="plan-info">
+              <div>
+                <dt>대상</dt>
+                <dd>이 PC의 Docker (worker를 --targets local_docker 로 실행)</dd>
+              </div>
+              <div>
+                <dt>접속 주소</dt>
+                <dd>http://localhost:&lt;포트&gt; (HTTP, 도메인·HTTPS 없음)</dd>
+              </div>
+              <div>
+                <dt>비용</dt>
+                <dd>추가 비용 없음 (전기·회선·PC 사용 비용 제외)</dd>
+              </div>
+            </dl>
+            <p className="hint">원격 서버나 AWS 계정을 연결하는 기능은 이 모드에 없습니다. AWS 배포도 함께 쓰려면 VITE_PROVIDERS 에 aws 를 더하세요.</p>
+          </div>
+        </section>
+      </div>
+    )
+  }
+
   return (
     <div className="page">
       <div className="page-head">
@@ -142,9 +180,10 @@ export default function Connections({ connections, loadError, onReload, onChange
           <p className="readonly-note">
             새 배포에는 연결이 필요 없습니다. 앱은 플랫폼 운영자가 준비한 AWS에 배포됩니다. 이 화면은 운영자가 AWS 계정을
             역할 위임으로 연결할 때 씁니다.
+            {isEnabled('onprem') && !CONNECTABLE_PROVIDERS.includes('onprem') && ' 온프레미스(이 PC의 Docker)는 연결 없이 worker가 실행 중인 PC에 배포됩니다.'}
           </p>
           <p>
-            {ONPREM_ENABLED
+            {CONNECTABLE_PROVIDERS.includes('onprem')
               ? 'AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할 위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.'
               : 'AWS 계정을 등록해 두면 분석할 때 구성과 비용을 비교합니다. 액세스 키 대신 역할 위임으로 연결합니다.'}
           </p>
@@ -277,9 +316,9 @@ export default function Connections({ connections, loadError, onReload, onChange
             )}
           </header>
           <div className="panel-body stack">
-            {ENABLED_PROVIDERS.length > 1 && (
+            {CONNECTABLE_PROVIDERS.length > 1 && (
             <div className="kind-grid" role="radiogroup" aria-label="종류">
-              {ENABLED_PROVIDERS.map((p) => (
+              {CONNECTABLE_PROVIDERS.map((p) => (
                 <button
                   key={p}
                   role="radio"

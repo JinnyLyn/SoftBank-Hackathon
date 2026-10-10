@@ -11,6 +11,7 @@ module "app" {
   database_url_parameter_arn   = var.platform.database_url_parameter_arn
   health_check_grace_seconds   = var.platform.health_check_grace_seconds
   deregistration_delay_seconds = var.platform.deregistration_delay_seconds
+  secret_parameter_arns        = var.platform.secret_parameter_arns
 
   # LLM 입력 (승인된 값)
   container_port    = var.app.container_port

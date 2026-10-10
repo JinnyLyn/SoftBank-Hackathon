@@ -1,4 +1,4 @@
-import { ONPREM_ENABLED } from '../providers'
+import { ONPREM_ENABLED, isEnabled } from '../providers'
 import type { ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
 
 const USERS: { value: ExpectedUsers; note: string }[] = [
@@ -97,7 +97,7 @@ export default function ScaleStep({ scale, locked, onChange }: Props) {
         </div>
         <p className={budgetValid(scale.monthlyBudgetUsd) ? 'hint' : 'conn-error'}>
           {budgetValid(scale.monthlyBudgetUsd)
-            ? `이 금액을 넘는 구성은 추천하지 않고 고를 수도 없습니다.${ONPREM_ENABLED ? ' 사내 서버는 추가 비용 0으로 계산합니다.' : ''}`
+            ? `이 금액을 넘는 구성은 추천하지 않고 고를 수도 없습니다.${ONPREM_ENABLED ? ' 온프레미스(로컬 Docker)는 추가 비용 0으로 계산합니다.' : ''}`
             : '1 이상의 금액을 넣어 주세요.'}
         </p>
       </div>
@@ -118,8 +118,20 @@ export default function ScaleStep({ scale, locked, onChange }: Props) {
 
       <div className="compare-note">
         <div>
-          <strong>운영자가 준비한 AWS에 배포합니다</strong>
-          <span className="hint">AWS 계정이나 키가 없어도 됩니다. 플랫폼 운영자가 준비해 둔 AWS 환경에 앱을 올립니다.</span>
+          {isEnabled('aws') ? (
+            <>
+              <strong>운영자가 준비한 AWS에 배포합니다</strong>
+              <span className="hint">
+                AWS 계정이나 키가 없어도 됩니다. 플랫폼 운영자가 준비해 둔 AWS 환경에 앱을 올립니다.
+                {ONPREM_ENABLED && ' 이 PC의 Docker(온프레미스)로 올리는 안도 함께 비교해 보여 줍니다.'}
+              </span>
+            </>
+          ) : (
+            <>
+              <strong>이 PC의 Docker에 배포합니다</strong>
+              <span className="hint">클라우드 계정이 없어도 됩니다. 플랫폼 worker가 실행 중인 PC의 Docker에 앱을 올립니다(온프레미스).</span>
+            </>
+          )}
         </div>
       </div>
     </div>

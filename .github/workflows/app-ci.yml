@@ -115,6 +115,8 @@ jobs:
           cache: npm
           cache-dependency-path: front/package-lock.json
       - run: npm ci --prefix front
+      - name: 승인 파일 API 어댑터 회귀 (HTTP 대역)
+        run: node scripts/ci/test_platform_front.mjs
       - name: MOCK 설정 타입 검사·빌드
         env:
           VITE_USE_MOCK: 'true'
