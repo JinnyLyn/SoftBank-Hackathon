@@ -145,6 +145,11 @@ export default function Connections({ connections, loadError, onReload, onChange
                 <div className="conn-main">
                   <strong>{c.name}</strong>
                   <span className="mono small muted">{c.detail}</span>
+                  {c.roleArn && (
+                    <span className="mono small muted conn-role" title={c.roleArn}>
+                      역할 {c.roleArn}
+                    </span>
+                  )}
                   {c.status === 'error' && <span className="conn-error">{c.error}</span>}
                   {c.status === 'pending' && c.provider === 'onprem' && (
                     <span className="conn-pending">
@@ -154,7 +159,12 @@ export default function Connections({ connections, loadError, onReload, onChange
                       </button>
                     </span>
                   )}
-                  {c.status === 'pending' && c.provider !== 'onprem' && (
+                  {c.status === 'pending' && c.provider !== 'onprem' && c.roleArn && (
+                    <span className="conn-pending">
+                      스택이 역할을 만들었습니다. 플랫폼이 이 역할로 접속되는지 확인하는 중입니다 → 잠시 뒤 "다시 확인"
+                    </span>
+                  )}
+                  {c.status === 'pending' && c.provider !== 'onprem' && !c.roleArn && (
                     <span className="conn-pending">
                       {c.setupUrl && isSafeRedirect(c.setupUrl, CONSOLE_HOSTS) ? (
                         <a href={c.setupUrl} target="_blank" rel="noreferrer noopener">

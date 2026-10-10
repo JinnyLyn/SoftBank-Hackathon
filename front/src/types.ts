@@ -18,6 +18,10 @@ export interface Connection {
   checkedAt: string
   /** 폼에 입력한 원본 값. 비밀 값은 서버가 돌려주지 않음 */
   fields: Record<string, string>
+  /** (AWS) CloudFormation 스택이 백엔드에 알려 준 계정 ID. 스택을 만들기 전에는 없음 */
+  accountId?: string | null
+  /** (AWS) 스택이 만든 IAM 역할 ARN. 값이 와도 worker가 AssumeRole로 확인하기 전까지는 pending */
+  roleArn?: string | null
 }
 
 export interface ConnectionInput {

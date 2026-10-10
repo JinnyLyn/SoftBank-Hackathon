@@ -41,6 +41,8 @@ let connections: Connection[] = [
     detail: '계정 123456789012',
     checkedAt: '2026-10-07 13:40',
     fields: {},
+    accountId: '123456789012',
+    roleArn: 'arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole',
   },
   {
     id: 'c2',
@@ -111,7 +113,15 @@ export async function checkConnection(id: string): Promise<Connection> {
   let next: Connection = { ...c, checkedAt: now() }
   if (c.status === 'pending' && c.provider === 'aws') {
     // mock: 스택을 만들었다고 보고 연결 완료 처리
-    next = { ...next, status: 'connected', detail: '계정 ' + String(100000000000 + Math.floor(Math.random() * 9e11)), setupUrl: undefined }
+    const accountId = String(100000000000 + Math.floor(Math.random() * 9e11))
+    next = {
+      ...next,
+      status: 'connected',
+      detail: '계정 ' + accountId,
+      setupUrl: undefined,
+      accountId,
+      roleArn: `arn:aws:iam::${accountId}:role/PavedCloudsReadOnlyRole`,
+    }
   }
   if (c.status === 'pending' && c.provider === 'onprem' && Date.now() - (installIssuedAt.get(id) ?? Date.now()) > 6000) {
     // mock: 설치 스크립트가 서버 사양을 보고했다고 처리
