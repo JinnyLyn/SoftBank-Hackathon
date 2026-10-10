@@ -52,6 +52,14 @@ export interface Finding {
   detail: string
 }
 
+/** Dockerfile이 없을 때 분석기가 만든 초안 (사용자가 저장소에 넣는 제안) */
+export interface DockerfileDraft {
+  content: string
+  port: number
+  /** 초안을 만들 때 본 근거 (파일:줄) */
+  basedOn: string[]
+}
+
 export interface Analysis {
   projectId: string
   /** 코드에서 읽어낸 스택 정보 (프레임워크, 포트 등) */
@@ -64,6 +72,8 @@ export interface Analysis {
    * 하나라도 있으면 worker가 계획을 만들지 않으므로 기다리지 않고 이유를 보여 줌
    */
   blockers?: string[]
+  /** 있으면 저장소에 Dockerfile을 넣어야 배포할 수 있음 (worker는 소스 안의 Dockerfile로만 빌드) */
+  dockerfileDraft?: DockerfileDraft
 }
 
 export type TierKey = 'lean' | 'balanced' | 'roomy'
@@ -90,6 +100,15 @@ export interface Tier {
    * (리소스별 금액은 참고용이라 합계가 달라도 총액은 이 값)
    */
   totalUsd?: number
+  /** 평소(최소 태스크 수) 월 비용. 있으면 부하 최대 비용(totalUsd)과 같이 보여 줌 */
+  usualUsd?: number
+  /** worker가 매긴 금액 순위: 최저·평균·최대 */
+  rankLabel?: string
+  /**
+   * 이 안의 Terraform 계획이 있는지. false 면 비교용(예상 비용만 있음)이라 고를 수 없음.
+   * 다른 안으로 다시 계획하는 경로가 생기면 고를 수 있게 바꿈
+   */
+  planned?: boolean
 }
 
 /** 연결된 배포 대상 하나에서 가능한 구성들 */

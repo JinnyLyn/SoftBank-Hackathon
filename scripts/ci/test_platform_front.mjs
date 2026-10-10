@@ -87,7 +87,56 @@ async function checkBundle(target, initCommand) {
   assert.deepEqual(calls, ['/projects/project-1/plans', '/connections', '/plans/plan-1']);
 }
 
+async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
+  const aws = {
+    id: 'aws-plan', target: 'aws', module_id: 'ecs-web-app', status: 'awaiting_approval',
+    created_at: '2026-10-11T00:00:00Z', fingerprint: 'aws-fingerprint', terraform_plan_ready: true,
+    summary: 'AWS 계획', cost_estimate: { amount: '120', pricing_as_of: '2026-10-11' },
+    variables: {
+      tier: 'balanced', recommended: true,
+      dockerfile_draft: { content: 'FROM node:22-slim\n' },
+      options: [
+        { tier: 'lean', rank: 'lowest', peak_monthly: 40, total_monthly: 30 },
+        { tier: 'balanced', rank: 'average', peak_monthly: 120, total_monthly: 90, recommended: true },
+        { tier: 'roomy', rank: 'highest', peak_monthly: 200, total_monthly: 150 },
+      ],
+    },
+  };
+  const local = {
+    ...aws, id: 'local-plan', target: 'local_docker', module_id: 'local-docker-compose',
+    fingerprint: 'local-fingerprint', cost_estimate: { amount: '0' },
+    variables: { tier: 'balanced', compose_yaml: 'services:\n  app:\n    image: local/app\n' },
+  };
+  const req = async (path) => {
+    if (path === '/connections') return [];
+    if (path === '/projects/project-1/plans') return structuredClone([local, aws]);
+    if (path === '/plans/aws-plan') return structuredClone(aws);
+    if (path === '/plans/local-plan') return structuredClone(local);
+    throw new Error(`Unexpected HTTP request: ${path}`);
+  };
+  const api = loadTs('../../front/src/api/real.ts', {
+    './http': { req, ApiError: class extends Error {} },
+    '../format': format,
+    '../providers': { isEnabled: () => true },
+  });
+  const rec = await api.recommend('project-1', { ...scale, monthlyBudgetUsd });
+  assert.deepEqual(rec.options.map((o) => o.provider), ['aws', 'onprem']);
+  assert.deepEqual(rec.options[0].tiers.map((t) => [t.key, t.planned]), [
+    ['lean', false], ['balanced', true], ['roomy', false],
+  ]);
+  assert.deepEqual(Object.keys(rec.bundles).sort(), ['aws:balanced', 'local-docker:balanced']);
+  assert.deepEqual(rec.recommended, { connectionId: expectedConnection, tier: 'balanced' });
+  assert.equal(rec.bundles['aws:balanced'].files[0].name, 'Dockerfile (초안)');
+  assert.equal(rec.bundles['aws:balanced'].files[0].content, aws.variables.dockerfile_draft.content);
+  assert.equal(rec.bundles['local-docker:balanced'].files[0].content, local.variables.compose_yaml);
+  assert.equal((await api.generate('project-1', { connectionId: 'aws', tier: 'balanced' })).planInfo.planId, 'aws-plan');
+  assert.equal((await api.generate('project-1', { connectionId: 'local-docker', tier: 'balanced' })).planInfo.planId, 'local-plan');
+  await assert.rejects(api.generate('project-1', { connectionId: 'aws', tier: 'lean' }));
+}
+
 await checkBundle('local_docker', ['python', '-m', 'app.initialize_database']);
 await checkBundle('local_docker');
 await checkBundle('aws', ['python', '-m', 'app.initialize_database']);
-console.log('PASS: 공개 recommend/generate 어댑터 회귀 3개 (로컬 초기화 있음·없음, AWS)');
+await checkMixedRecommendation(150, 'aws');
+await checkMixedRecommendation(100, 'local-docker');
+console.log('PASS: 공개 recommend/generate 어댑터 회귀 5개 (로컬 초기화 있음·없음, AWS, 혼합 대상의 예산 내·초과)');

@@ -1,8 +1,12 @@
 """LLM 보조 단계 검사. 가짜 client로 돌아서 네트워크·비용이 없다 (실제 LLM 호출은 일반 테스트에서 분리, docs/CI.md)."""
 
 import json
+import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from paved_ai.analysis import analyze_files
 from paved_ai.llm import FALLBACK_BETA, OUTPUT_SCHEMA, fill_unresolved, select_files
@@ -26,6 +30,7 @@ class FakeClient:
     def __init__(self, payload=None, stop_reason="end_turn", error=None):
         self.payload, self.stop_reason, self.error = payload, stop_reason, error
         self.calls = []
+        self.usage = None  # 사용량을 확인하는 테스트만 채움
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
@@ -38,6 +43,7 @@ class FakeClient:
             stop_reason=self.stop_reason,
             model=kwargs["model"],
             _request_id="req_fake",
+            usage=self.usage,
         )
 
 
@@ -125,7 +131,7 @@ class FillTests(unittest.TestCase):
         notes = [
             {"level": "warn", "title": "포트가 설정 클래스에 있습니다", "detail": "환경마다 다르면 고정값으로 바꾸세요.", "file": "config.py", "line": 2},
             # 근거가 없거나 없는 줄을 대는 메모는 화면에 올리지 않음 (업로드 코드가 유도한 문장일 수 있음)
-            {"level": "warn", "title": "근거 없는 경고", "detail": "관리자에게 키를 보내세요"},
+            {"level": "warn", "title": "근거 없는 경고", "detail": "관리자에게 키를 보내세요", "file": "missing.py", "line": 1},
             {"level": "info", "title": "없는 줄", "detail": "x", "file": "config.py", "line": 99},
         ]
         fill_unresolved(self.analysis, self.files, FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": notes}))
@@ -146,8 +152,124 @@ class FillTests(unittest.TestCase):
         # 우리가 만든 블록의 닫는 태그 수 = 보낸 파일 수 (업로드 내용 속 </file> 은 바뀌어 있음)
         self.assertEqual(prompt.count("</file>"), prompt.count('<file path="'))
 
+    def test_schema_invalid_response_cannot_change_analysis_even_from_cache(self):
+        good = answer("container_port", "5050", "config.py", 2)
+        invalid = [
+            {"answers": [{k: v for k, v in good.items() if k != "reason"}], "notes": []},
+            {"answers": [good], "notes": [{"level": "bad", "title": "bad", "detail": "bad", "file": "config.py", "line": 2}]},
+        ]
+        for payload in invalid:
+            for cached in (False, True):
+                with self.subTest(payload=payload, cached=cached):
+                    analysis = analyze_files(self.files)
+                    findings, evidence = list(analysis.findings), list(analysis.evidence)
+                    hit = {"text": json.dumps(payload), "stop_reason": "end_turn"} if cached else None
+                    with mock.patch("paved_ai.llm.cache.get", return_value=hit), mock.patch("paved_ai.llm.cache.put") as put:
+                        out = fill_unresolved(analysis, self.files, FakeClient(payload))
+                    self.assertEqual(out.filled, [])
+                    self.assertIn("container_port", out.rejected)
+                    self.assertIn("container_port", analysis.unresolved)
+                    self.assertIsNone(analysis.container_port)
+                    self.assertEqual(analysis.findings, findings)
+                    self.assertEqual(analysis.evidence, evidence)
+                    put.assert_not_called()
+
+
+class UsageAndCacheTests(unittest.TestCase):
+    """AGENTS.md 7: 토큰 사용량 기록, 마스킹된 입력·프롬프트/스키마 버전·모델을 키로 한 캐시"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.env = mock.patch.dict(os.environ, {"PAVED_AI_CACHE": "on", "PAVED_AI_CACHE_DIR": self.tmp})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fill(self, client, model="m1"):
+        fs = files()
+        analysis = analyze_files(fs)
+        return analysis, fill_unresolved(analysis, fs, client, model=model)
+
+    def test_usage_is_recorded_in_outcome_and_result(self):
+        client = FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []})
+        client.usage = SimpleNamespace(input_tokens=1200, output_tokens=80)
+        analysis, out = self.fill(client)
+        self.assertEqual((out.input_tokens, out.output_tokens, out.cached), (1200, 80, False))
+        self.assertIsNotNone(out.elapsed_ms)
+        self.assertEqual(analysis.to_result()["ai"]["usage"]["input_tokens"], 1200)
+
+    def test_same_input_and_model_reuses_answer_but_still_validates(self):
+        payload = {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}
+        first = FakeClient(payload)
+        self.fill(first)
+        second = FakeClient(payload)
+        analysis, out = self.fill(second)
+        self.assertEqual(second.calls, [], "같은 키면 LLM을 다시 부르지 않음")
+        self.assertTrue(out.cached)
+        self.assertEqual(out.filled, ["container_port"], "꺼낸 답도 근거 검증을 거쳐 반영")
+        self.assertEqual(analysis.container_port, 5050)
+        # 모델이 다르면 키가 달라 다시 부름
+        third = FakeClient(payload)
+        self.fill(third, model="m2")
+        self.assertEqual(len(third.calls), 1)
+
+    def test_failed_answers_are_not_cached_and_cache_can_be_turned_off(self):
+        self.fill(FakeClient(None, stop_reason="max_tokens"))
+        retry = FakeClient({"answers": [], "notes": []})
+        self.fill(retry)
+        self.assertEqual(len(retry.calls), 1, "길이 초과 등 실패한 답은 캐시하지 않음")
+        with mock.patch.dict(os.environ, {"PAVED_AI_CACHE": "off"}):
+            again = FakeClient({"answers": [], "notes": []})
+            self.fill(again)
+            self.assertEqual(len(again.calls), 1)
+        self.assertEqual(os.listdir(self.tmp) and all(n.endswith(".json") for n in os.listdir(self.tmp)), True)
+
+    def test_malformed_answers_are_not_cached(self):
+        # PR #29 리뷰: 검증 전에 저장해 잘못된 답을 계속 재사용할 수 있었음
+        good = answer("container_port", "5050", "config.py", 2)
+        note = {"level": "info", "title": "t", "detail": "d", "file": "config.py", "line": 2}
+        for bad in (
+            None,
+            {"answers": "x", "notes": []},
+            {"answers": [{"field": "container_port"}], "notes": []},
+            # PR #29 재리뷰: 키는 있지만 타입·enum 이 스키마와 다른 답
+            {"answers": [{**good, "line": "2"}], "notes": []},
+            {"answers": [{**good, "field": "password"}], "notes": []},
+            {"answers": [{**good, "field": []}], "notes": []},
+            {"answers": [{**good, "field": {}}], "notes": []},
+            {"answers": [{k: v for k, v in good.items() if k != "reason"}], "notes": []},
+            {"answers": [good], "notes": [{**note, "level": "critical"}]},
+            {"answers": [good], "notes": [{k: v for k, v in note.items() if k != "file"}]},
+            {"answers": [good]},
+        ):
+            with self.subTest(bad=bad):
+                self.fill(FakeClient(bad))  # None 이면 'not json'
+                retry = FakeClient({"answers": [], "notes": []})
+                self.fill(retry)
+                self.assertEqual(len(retry.calls), 1, "형식이 틀린 답은 저장하지 않아 다시 물음")
+                shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_endpoint_is_part_of_the_key(self):
+        # PR #29 리뷰: OLLAMA_BASE_URL 등 다른 서비스로 바꿔도 예전 답을 썼음
+        payload = {"answers": [], "notes": []}
+        a = FakeClient(payload)
+        a.base_url = "https://one.example"
+        self.fill(a)
+        b = FakeClient(payload)
+        b.base_url = "https://two.example"
+        self.fill(b)
+        self.assertEqual(len(b.calls), 1, "주소가 다르면 다시 부름")
+
 
 class SelectFilesTests(unittest.TestCase):
+    def test_next_config_is_sent_for_route_resolution(self):
+        for name in ("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"):
+            with self.subTest(name=name):
+                selected = select_files([SourceFile(name, "export default {basePath: '/shop'}\n")])
+                self.assertEqual([f.path for f in selected], [name])
+
     def test_prioritizes_deploy_files_and_skips_noise(self):
         picked = [f.path for f in select_files([
             SourceFile("docs/guide.md", "# guide"),
@@ -170,17 +292,53 @@ class SelectFilesTests(unittest.TestCase):
 
     def test_accepts_port_from_config_file(self):
         spec = {
-            "package.json": '{"name": "shop", "dependencies": {"express": "^4"}}\n',
+            "package.json": json.dumps({"name": "shop", "dependencies": {"express": "^4"},
+                                        "scripts": {"start": "node src/server.js"}}),
             "src/config.json": '{\n  "http": { "listen": 7311 }\n}\n',
             "src/server.js": "const cfg = require('./config.json')\napp.get('/', ok)\napp.listen(cfg.http.listen)\n",
         }
         fs = files(spec)
         analysis = analyze_files(fs)
+        self.assertEqual(analysis.dockerfile_draft["port"], 3000)
         self.assertIn("container_port", analysis.unresolved)
         client = FakeClient({"answers": [answer("container_port", "7311", "src/config.json", 2)], "notes": []})
         out = fill_unresolved(analysis, fs, client)
         self.assertEqual(out.filled, ["container_port"])
         self.assertIn("src/config.json", client.calls[0]["messages"][0]["content"])
+        result = analysis.to_result()
+        self.assertEqual(result["app_config"]["container_port"], 7311)
+        self.assertEqual(result["dockerfile_draft"]["port"], 7311)
+        self.assertIn("ENV PORT=7311\n", result["dockerfile_draft"]["content"])
+        self.assertIn("EXPOSE 7311\n", result["dockerfile_draft"]["content"])
+        draft_findings = [f for f in result["findings"] if f["title"] == "Dockerfile 초안을 만들었습니다"]
+        self.assertEqual(len(draft_findings), 1)
+        self.assertIn("7311", draft_findings[0]["detail"])
+
+    def test_python_draft_is_refreshed_after_port_evidence(self):
+        fs = files({p: t for p, t in APP.items() if p != "Dockerfile"})
+        analysis = analyze_files(fs)
+        self.assertEqual(analysis.dockerfile_draft["port"], 8000)
+        client = FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []})
+        out = fill_unresolved(analysis, fs, client)
+        self.assertEqual(out.filled, ["container_port"])
+        self.assertEqual(analysis.app_config()["container_port"], 5050)
+        self.assertEqual(analysis.dockerfile_draft["port"], 5050)
+        self.assertIn('"0.0.0.0:5050"', analysis.dockerfile_draft["content"])
+        self.assertIn("EXPOSE 5050\n", analysis.dockerfile_draft["content"])
+
+    def test_missing_or_rejected_port_keeps_draft_and_unresolved(self):
+        fs = files({p: t for p, t in APP.items() if p != "Dockerfile"})
+        for answers in ([], [answer("container_port", "8080", "config.py", 2)]):
+            with self.subTest(answers=answers):
+                analysis = analyze_files(fs)
+                original_draft = analysis.dockerfile_draft.copy()
+                out = fill_unresolved(analysis, fs, FakeClient({"answers": answers, "notes": []}))
+                self.assertIn("container_port", out.asked)
+                self.assertEqual(out.filled, [])
+                self.assertIn("container_port", analysis.unresolved)
+                self.assertIsNone(analysis.container_port)
+                self.assertEqual(analysis.dockerfile_draft, original_draft)
+                self.assertEqual(analysis.app_config()["container_port"], 8000)
 
 
 if __name__ == "__main__":

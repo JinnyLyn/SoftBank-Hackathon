@@ -79,14 +79,22 @@ LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 
 | 항목 | 값 |
 |---|---|
 | 묻는 것 | `unresolved` 중 `container_port`, `health_check_path`, `dockerfile`, `framework` 만. 규칙이 찾은 값은 덮어쓰지 않음 |
-| 기본 | Ollama 클라우드 `glm-5.3` (`ollama.py`, 표준 라이브러리로 `POST https://ollama.com/api/chat`). `OLLAMA_API_KEY` 가 있으면 이것을 씀 |
+| 기본 | Ollama 클라우드 `gemma4:31b` (`ollama.py`, 표준 라이브러리로 `POST https://ollama.com/api/chat`). `OLLAMA_API_KEY` 가 있으면 이것을 씀 |
 | 대안 | Anthropic `claude-opus-5-5`, effort `medium`, SDK 필요. `PAVED_AI_PROVIDER=anthropic` 이거나 Ollama 키가 없을 때 |
-| 모델 변경 | `PAVED_AI_MODEL` 또는 `--model` (예: `glm-5.3-flash`) |
-| 출력 | JSON 스키마 (`answers`, `notes`). Ollama는 `format` 에 스키마를 주지만 강제되지 않아(코드 블록으로 감싸거나 필드를 빼먹음) 코드 블록을 벗기고 필드가 빠진 답은 버림. Anthropic은 `output_config.format` 으로 강제, 거절 시 `fallbacks: "default"` |
+| 모델 변경 | `PAVED_AI_MODEL` 또는 `--model` (예: `glm-5.3`) |
+| 모델 비교 (10/11) | 시험 앱 2개(숨은 포트 Flask·설정 파일 포트 Express) × 3회, 캐시 끔. 중간값: gemma4:31b 1.2초, deepseek-v4.1-flash 2.1초, kimi-k2.7-code 5.0초, glm-5.3 5.6초, kimi-k3 8.3초, deepseek-v4-pro:0813 8.5초. 모두 정답 6/6 → 가장 빠른 gemma4:31b 를 기본으로 |
+| 출력 | JSON 스키마 (`answers`, `notes`). Ollama는 `format` 에 스키마를 주지만 강제되지 않아(코드 블록으로 감싸거나 필드를 빼먹음) 코드 블록을 벗긴 뒤 전체 스키마가 틀리면 결과를 반영하지 않음. Anthropic은 `output_config.format` 으로 강제, 거절 시 `fallbacks: "default"` |
 | 검증 | 근거 파일·줄이 실제로 있고 그 줄에 값이 들어 있어야 받아들임. 아니면 버리고 `unresolved` 유지 |
 | 비밀값 | 보내기 직전에 다시 가림. 업로드 코드 속 문장은 지시가 아니라 데이터라고 프롬프트에 밝힘 |
 | 표시 | 결과의 `ai.filled` 에 LLM이 채운 값 이름, `findings` 에 "AI가 채운 값" 안내 |
 | 실패 | 키 없음·인증·한도·연결 오류는 규칙 결과만 기록 (`findings` 에 이유) |
+| 사용량 | 호출마다 입력·출력 토큰과 걸린 시간을 runner 로그와 결과 `ai.usage` 에 기록 (AGENTS.md §7) |
+| 캐시 | 가린 뒤의 프롬프트·프롬프트/스키마 버전(`PROMPT_VERSION`)·제공자·모델이 같으면 예전 답을 다시 씀. 꺼낸 답도 근거 검증을 다시 함. 정상 종료한 답만 저장. 저장소 밖 `~/.cache/paved-ai/llm` (`PAVED_AI_CACHE_DIR`), `PAVED_AI_CACHE=off` 로 끔 |
+| Dockerfile 초안 | Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 `dockerfile_draft` 로 전달 (LLM 미사용, `paved_ai/dockerfile.py`). 진입점을 확정 못 하면 만들지 않음 |
+
+초안의 기본 포트는 코드에서 확인한 값이 아니므로 `unresolved.container_port`를 유지한다. LLM이 근거로 포트를 확인하면 초안의 실행 명령·`ENV PORT`·`EXPOSE`와 `app_config`를 같은 포트로 갱신한다. LLM을 사용하지 않거나 답을 채택하지 못하면 기본 포트는 제안으로 남으며 실제 앱의 응답을 확인한 결과가 아니다. Python 초안은 중첩 `-r`·`-c` 파일과 로컬 의존성이 설치 전에 존재하도록 전체 소스를 먼저 복사한다.
+
+LLM 응답은 캐시에서 가져온 경우에도 전체 스키마를 통과해야 값·메모에 반영한다. Node 초안은 빌드 스크립트가 없어도 `start`가 tsx·ts-node 등을 사용할 수 있으므로 개발 의존성을 유지한다. Next.js 설정 파일이 있으면 `basePath`·rewrite·외부 설정을 실행해서 평가하지 않고 헬스체크 경로를 미해결로 남기며, 해당 설정 파일을 LLM 분석에 포함한다. 설정 파일이 있으나 기본 경로를 그대로 쓰는 앱도 규칙 분석만으로 경로를 확정하지 않는 제한이 있다.
 
 설치 (Ollama는 설치할 것이 없음. `requirements.txt` 는 Anthropic을 쓸 때만):
 
@@ -103,6 +111,7 @@ copy .env.example .env                       # OLLAMA_API_KEY 채우기 (커밋 
 - `.env`·키 파일(`*.pem`, `id_rsa` 등)은 내용을 보내지 않는다. `.env` 는 변수 이름만 남긴다.
 - 주소 속 `아이디:비밀번호@`, AWS 키, `sk-ant-…`, `ghp_…`, Bearer 토큰, 개인 키 블록은 어디서든 가린다.
 - 설정 파일(`.env*`, YAML, compose 등)의 `비밀이름=값` 은 값만 가린다. 코드에서는 문자열로 박아 둔 값만 가린다(`os.getenv("SECRET_KEY")` 같은 줄은 그대로).
+- 비밀 이름의 `none`·`off`·`true` 등도 가린다. JSON의 `"private": true/false` 구조 필드만 유지하며, 비밀값을 가린 뒤에도 JSON 문법을 보존한다.
 - 원본은 바꾸지 않는다.
 - 결과를 백엔드에 기록하기 전, 백엔드의 비밀값 거절 규칙(`back/app/main.py`)과 같은 검사를 먼저 한다.
   백엔드는 "이름=값" 중 이름이 비밀스러운 것만 거절한다(`_contains_inline_secret`). `python:3.12` 같은 근거 문장은 그대로 기록된다.
@@ -119,6 +128,7 @@ python -m unittest discover -s tests -t . -v
 - 실제 샘플 앱(`sample-back` + `sample-front`)의 결과가 정답과 같고 인프라 스키마를 통과하는지
 - compose 파일의 비밀번호가 결과에 남지 않는지
 - 백엔드 비밀값 규칙이 바뀌면 깨지는지 (백엔드 소스의 정규식과 비교)
+- PR #29의 포트·마스킹·중첩 의존성 회귀: `uv run --no-project --python 3.13 python -m unittest tests.test_llm tests.test_masking tests.test_dockerfile -v`. 경계 사례는 `tests/edge_case/pr29-review.md` 참고(저장소 루트 기준).
 
 ## 환경
 

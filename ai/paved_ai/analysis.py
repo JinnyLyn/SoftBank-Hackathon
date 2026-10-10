@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .dockerfile import draft_dockerfile
 from .masking import MaskReport, backend_safe_text, mask_files
 from .source import SourceFile
 
@@ -75,6 +76,10 @@ class Analysis:
     # LLM이 채운 값 (규칙이 못 찾은 것만). 화면에서 근거 확인을 권함
     ai_filled: List[str] = field(default_factory=list)
     ai_model: Optional[str] = None
+    # LLM 사용량 {input_tokens, output_tokens, elapsed_ms, cached}. 부르지 않았으면 None
+    ai_usage: Optional[dict] = None
+    # Dockerfile이 없을 때 만든 초안 {path, content, port, based_on}. 사용자가 저장소에 넣고 다시 올리는 제안
+    dockerfile_draft: Optional[dict] = None
 
     def warn(self, title: str, detail: str) -> None:
         self.findings.append(Finding("warn", title, detail))
@@ -84,8 +89,12 @@ class Analysis:
 
     def app_config(self) -> dict:
         """worker가 읽는 앱 설정. 못 찾은 값이 있으면 None으로 두고 unresolved에 이유가 있음 → worker 검증에서 걸러짐"""
+        # 코드에서 포트를 못 찾았어도 Dockerfile 초안이 포트를 정하면(서버 바인드·PORT) 배포 설정에는 그 포트를 씀
+        port = self.container_port
+        if port is None and self.dockerfile_draft:
+            port = self.dockerfile_draft["port"]
         cfg: dict = {
-            "container_port": self.container_port,
+            "container_port": port,
             "health_check_path": self.health_check_path,
             "use_database": self.use_database,
             "environment": self.environment,
@@ -103,7 +112,8 @@ class Analysis:
         stack = [
             ("프레임워크", self.framework or "확인 안 됨"),
             ("런타임", self.runtime or "확인 안 됨"),
-            ("포트", str(self.container_port) if self.container_port else "확인 안 됨"),
+            ("포트", str(self.container_port) if self.container_port
+             else f"{self.dockerfile_draft['port']} (Dockerfile 초안)" if self.dockerfile_draft else "확인 안 됨"),
             ("DB", self.database or ("사용" if self.use_database else "사용 안 함" if self.use_database is False else "확인 안 됨")),
             ("헬스체크", self.health_check_path or "확인 안 됨"),
             ("환경 변수", f"{len(self.environment)}개" if self.environment else "없음"),
@@ -122,8 +132,12 @@ class Analysis:
             "unresolved": self.unresolved,
             "sizing_hints": self.sizing_hints,
             "has_dockerfile": self.has_dockerfile,
+            "dockerfile_draft": (
+                {**self.dockerfile_draft, "based_on": [backend_safe_text(b) for b in self.dockerfile_draft["based_on"]]}
+                if self.dockerfile_draft else None
+            ),
             "masking": {"withheld_files": self.withheld_files, "redactions": self.redactions},
-            "ai": {"model": self.ai_model, "filled": self.ai_filled},
+            "ai": {"model": self.ai_model, "filled": self.ai_filled, "usage": self.ai_usage},
         }
 
 
@@ -351,7 +365,35 @@ def _detect_health(a: Analysis, repo: Repo) -> None:
     if unsure:
         a.unresolved["health_check_path"] = "라우터가 다른 경로 아래에 붙어 있어 헬스체크의 전체 경로를 확정하지 못했습니다."
         return
+    if a.framework == "Next.js" and _next_health(a, repo):
+        return
     a.unresolved["health_check_path"] = "헬스체크로 쓸 경로(/health 또는 /)를 찾지 못했습니다."
+
+
+# Next.js 는 파일 경로가 곧 주소 (app 라우터·pages 라우터). 헬스체크 전용 경로가 있으면 그것, 없으면 첫 화면
+_NEXT_ROUTES = [
+    ("/api/health", re.compile(r"(^|/)(src/)?(app/api/health/route|pages/api/health)\.(t|j)sx?$")),
+    ("/", re.compile(r"(^|/)(src/)?(app/page|pages/index)\.(t|j)sx?$")),
+]
+
+
+def _next_health(a: Analysis, repo: Repo) -> bool:
+    configs = repo.named("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts")
+    if configs:
+        # 실행 가능한 설정에는 basePath·rewrite·외부 설정이 있을 수 있다. 파일 경로만으로 URL을 확정하지 않는다.
+        a.unresolved["health_check_path"] = "Next.js 설정이 있어 basePath 등 실제 라우팅을 확인해야 합니다. 파일 경로만으로 헬스체크 URL을 확정하지 않습니다."
+        a.evidence.append(Evidence(configs[0].path, 1, configs[0].text.splitlines()[0] if configs[0].text else ""))
+        return True
+    for path, pattern in _NEXT_ROUTES:
+        f = next((x for x in sorted(repo.files, key=lambda x: (x.path.count("/"), x.path)) if pattern.search(x.path)), None)
+        if f:
+            a.health_check_path = path
+            first = f.text.splitlines()[0] if f.text.strip() else f.path
+            a.evidence.append(Evidence(f.path, 1, first))
+            if path == "/":
+                a.info("헬스체크 전용 경로가 없어 / 를 씁니다", f"{f.path} 가 첫 화면입니다. 응답이 느리면 app/api/health/route.ts 같은 가벼운 경로를 추가하는 게 좋습니다.")
+            return True
+    return False
 
 
 # ORM·DATABASE_URL 만으로는 DB 종류를 모름. 주소 형식(postgresql://)·Prisma provider·ORM dialect 로 종류를 찾음
@@ -608,6 +650,27 @@ def _check_dockerfile_copies(a: Analysis, repo: Repo, dockerfile: str) -> None:
         )
 
 
+def suggest_dockerfile(a: Analysis, files: List[SourceFile]) -> None:
+    """Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 보여 줌. 배포는 여전히 Dockerfile이 저장소에 있어야 함"""
+    if a.has_dockerfile or not a.supported:
+        return
+    family = ("python" if a.framework in {name for _, name in PY_FRAMEWORKS}
+              else "node" if a.framework in {name for _, name in NODE_FRAMEWORKS} else None)
+    py = _python_deps(Repo(files))
+    draft, why = draft_dockerfile(files, family, a.framework, a.runtime, a.container_port, py)
+    a.dockerfile_draft = None
+    a.findings = [f for f in a.findings if f.title not in {"Dockerfile이 없습니다", "Dockerfile 초안을 만들었습니다"}]
+    if draft is None:
+        a.info("Dockerfile이 없습니다", f"배포하려면 Dockerfile이 필요합니다. 초안도 만들지 못했습니다: {why}")
+        return
+    a.dockerfile_draft = draft.as_dict()
+    # 초안의 기본 포트는 코드 근거가 아님. unresolved를 유지해 LLM이 간접 설정을 확인하게 하고,
+    # 포트 근거를 찾으면 초안도 다시 생성한다. 규칙 전용 결과에서는 초안 기본값을 제안으로 유지한다.
+    a.unresolved["dockerfile"] = "저장소에 Dockerfile이 없어 코드를 보고 초안을 만들었습니다. 초안을 확인한 뒤 그대로 쓰거나 저장소에 추가해 주세요."
+    a.info("Dockerfile 초안을 만들었습니다",
+           f"코드를 보고 {a.framework}용 초안을 만들었습니다(포트 {draft.port}). 비용 승인 화면에서 초안 내용을 확인할 수 있습니다.")
+
+
 def analyze_files(files: List[SourceFile]) -> Analysis:
     """원본 파일 목록 → 가린 뒤 규칙으로 분석. 원본은 바꾸지 않음."""
     report: MaskReport = mask_files(files)
@@ -627,6 +690,7 @@ def analyze_files(files: List[SourceFile]) -> Analysis:
     _detect_environment(a, repo)
     _detect_hints(a, repo, family, deps)
     _check_shape(a, repo, family)
+    suggest_dockerfile(a, report.files)
     if report.withheld:
         a.info("비밀 파일은 분석에서 뺐습니다", f"{', '.join(report.withheld)}: 변수 이름만 보고 값은 보내지 않았습니다.")
 

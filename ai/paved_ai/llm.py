@@ -7,7 +7,7 @@
 - 금액·구성 단계는 묻지 않는다 (인프라 worker의 cost.py가 계산).
 
 client를 밖에서 넘겨받으므로 테스트는 가짜 client로 돈다.
-- OllamaClient(ollama.py, 표준 라이브러리): 기본. Ollama 클라우드의 glm-5.3
+- OllamaClient(ollama.py, 표준 라이브러리): 기본. Ollama 클라우드의 gemma4:31b
 - Anthropic client(SDK): 실제로 부를 때만 SDK가 필요
 """
 
@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from .analysis import Analysis, Evidence
+from . import cache
+from .analysis import Analysis, Evidence, suggest_dockerfile
 from .masking import mask_files
 from .ollama import OllamaClient, OllamaError
 from .source import SourceFile
@@ -30,6 +32,8 @@ EFFORT = "medium"
 MAX_TOKENS = 16000
 MAX_PROMPT_CHARS = 120_000  # 보낼 파일 내용 상한 (대략 3만 토큰)
 MAX_NOTES = 5
+# 프롬프트·검증 규칙을 바꾸면 올림 → 캐시 키가 바뀌어 예전 답을 다시 쓰지 않음
+PROMPT_VERSION = "2026-10-11-schema-validation-v2"
 
 # LLM에 물어볼 수 있는 값. 금액·크기는 여기 없음
 FILLABLE = {
@@ -102,12 +106,22 @@ class LlmOutcome:
     model: Optional[str] = None
     request_id: Optional[str] = None
     stop_reason: Optional[str] = None
+    # 사용량 (AGENTS.md 7: 단계와 토큰 사용량을 기록). 캐시에서 꺼냈으면 cached=True, 토큰 0
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    elapsed_ms: Optional[int] = None
+    cached: bool = False
+
+    def usage(self) -> dict:
+        return {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
+                "elapsed_ms": self.elapsed_ms, "cached": self.cached}
 
 
 # ---------- 보낼 파일 고르기 ----------
 
 _MANIFESTS = {"requirements.txt", "pyproject.toml", "pipfile", "setup.py", "package.json", "go.mod", "pom.xml",
-              "build.gradle", "build.gradle.kts", ".env.example", ".env.sample", "procfile", "runtime.txt"}
+              "build.gradle", "build.gradle.kts", ".env.example", ".env.sample", "procfile", "runtime.txt",
+              "next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"}
 _ENTRY = re.compile(r"(?i)(^|/)(main|app|server|index|manage|wsgi|asgi|settings|config)\.(py|js|ts|mjs|cjs)$|application\.(properties|ya?ml)$")
 _HINTS = re.compile(r"(?i)\b(listen|port|route|@app\.|@router\.|app\.get|health|uvicorn|gunicorn)\b")
 _CODE = (".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".kt", ".go", ".rb")
@@ -256,13 +270,54 @@ def _parse_json(text: str):
         return json.loads(text[start:end + 1])
 
 
-def _ask(client, model: str, prompt: str):
-    """(답 텍스트, stop_reason, 응답 모델, request_id)"""
+def _system(client) -> str:
     if isinstance(client, OllamaClient):
         # 스키마를 강제하지 않으므로 형식을 시스템 프롬프트에도 적음
-        system = SYSTEM + "\n\n다른 말 없이 아래 JSON 스키마에 맞는 JSON 하나만 출력하세요.\n" + json.dumps(OUTPUT_SCHEMA, ensure_ascii=False)
-        reply = client.chat(model, system, prompt, OUTPUT_SCHEMA, MAX_TOKENS)
-        return reply.text, reply.stop_reason, reply.model, reply.request_id
+        return SYSTEM + "\n\n다른 말 없이 아래 JSON 스키마에 맞는 JSON 하나만 출력하세요.\n" + json.dumps(OUTPUT_SCHEMA, ensure_ascii=False)
+    return SYSTEM
+
+
+def _settings(client) -> str:
+    """답에 영향을 주는 호출 설정. 캐시 키에 넣어, 주소·설정이 바뀌면 예전 답을 쓰지 않게 함 (PR #29 리뷰)"""
+    if isinstance(client, OllamaClient):
+        s = {"endpoint": client.base_url.rstrip("/"), "max_tokens": MAX_TOKENS, "temperature": 0}
+    else:
+        s = {"endpoint": str(getattr(client, "base_url", "") or ""), "max_tokens": MAX_TOKENS, "effort": EFFORT,
+             "betas": [FALLBACK_BETA], "fallbacks": "default"}
+    return json.dumps(s, sort_keys=True)
+
+
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _well_formed(data: dict) -> bool:
+    """OUTPUT_SCHEMA 를 그대로 지켰는지: 필수 필드·타입·enum, 정의 밖 필드 없음.
+    지키지 않은 답은 캐시하지 않아 다음 분석에서 다시 물음 (PR #29 리뷰: 키만 보고 "line": "2" 같은 답을 캐시했음)"""
+    if set(data) != {"answers", "notes"}:
+        return False
+    answers, notes = data["answers"], data["notes"]
+    if not isinstance(answers, list) or not isinstance(notes, list):
+        return False
+    for a in answers:
+        if not (isinstance(a, dict) and set(a) == {"field", "value", "file", "line", "reason"}
+                and isinstance(a["field"], str) and a["field"] in FILLABLE
+                and all(isinstance(a[k], str) for k in ("value", "file", "reason"))
+                and _is_int(a["line"])):
+            return False
+    for n in notes:
+        if not (isinstance(n, dict) and set(n) == {"level", "title", "detail", "file", "line"}
+                and n["level"] in ("info", "warn") and all(isinstance(n[k], str) for k in ("title", "detail", "file"))
+                and _is_int(n["line"])):
+            return False
+    return True
+
+
+def _ask(client, model: str, prompt: str):
+    """(답 텍스트, stop_reason, 응답 모델, request_id, 입력 토큰, 출력 토큰)"""
+    if isinstance(client, OllamaClient):
+        reply = client.chat(model, _system(client), prompt, OUTPUT_SCHEMA, MAX_TOKENS)
+        return reply.text, reply.stop_reason, reply.model, reply.request_id, reply.input_tokens, reply.output_tokens
     response = client.beta.messages.create(
         model=model,
         max_tokens=MAX_TOKENS,
@@ -272,7 +327,9 @@ def _ask(client, model: str, prompt: str):
         system=SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
-    return _response_text(response), response.stop_reason, getattr(response, "model", model), getattr(response, "_request_id", None)
+    usage = getattr(response, "usage", None)
+    return (_response_text(response), response.stop_reason, getattr(response, "model", model), getattr(response, "_request_id", None),
+            getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None))
 
 
 def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: str = DEFAULT_MODEL) -> LlmOutcome:
@@ -289,10 +346,24 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
             outcome.rejected[t] = "LLM에 보낼 만한 파일이 없음"
         return outcome
 
-    try:
-        text, stop_reason, outcome.model, outcome.request_id = _ask(client, model, build_prompt(analysis, picked, targets))
-    except Exception as exc:  # API 오류만 LlmUnavailable로 바꾸고 나머지(코드 버그)는 그대로 올림
-        raise _as_unavailable(exc) from exc
+    prompt = build_prompt(analysis, picked, targets)
+    # 가린 뒤의 입력·프롬프트/스키마 버전·제공자·모델이 같으면 예전 답을 다시 씀. 꺼낸 답도 아래에서 다시 검증함
+    key = cache.cache_key(
+        version=PROMPT_VERSION, schema=json.dumps(OUTPUT_SCHEMA, sort_keys=True), provider=type(client).__name__,
+        model=model, system=_system(client), prompt=prompt, settings=_settings(client),
+    )
+    hit = cache.get(key)
+    started = time.monotonic()
+    if hit:
+        text, stop_reason, outcome.model = hit["text"], str(hit.get("stop_reason") or "end_turn"), hit.get("model") or model
+        outcome.cached, outcome.input_tokens, outcome.output_tokens = True, 0, 0
+    else:
+        try:
+            text, stop_reason, outcome.model, outcome.request_id, outcome.input_tokens, outcome.output_tokens = _ask(client, model, prompt)
+        except Exception as exc:  # API 오류만 LlmUnavailable로 바꾸고 나머지(코드 버그)는 그대로 올림
+            raise _as_unavailable(exc) from exc
+    outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+    analysis.ai_usage = outcome.usage()
 
     outcome.stop_reason = stop_reason
     if stop_reason != "end_turn":
@@ -309,6 +380,13 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
         for t in targets:
             outcome.rejected[t] = "LLM 답이 JSON이 아님"
         return outcome
+    # 캐시 여부와 관계없이 스키마 검증이 끝나기 전에는 값·메모를 적용하지 않는다.
+    if not _well_formed(data):
+        for t in targets:
+            outcome.rejected[t] = "LLM 답이 출력 스키마와 맞지 않음"
+        return outcome
+    if not outcome.cached:
+        cache.put(key, {"text": text, "stop_reason": stop_reason, "model": outcome.model})
 
     by_path = {f.path: f.text.splitlines() for f in masked}
     answers = data.get("answers") if isinstance(data.get("answers"), list) else []
@@ -330,6 +408,9 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
     for t in targets:
         if t not in outcome.filled and t not in outcome.rejected:
             outcome.rejected[t] = "LLM이 답하지 않음"
+
+    if "container_port" in outcome.filled and analysis.dockerfile_draft:
+        suggest_dockerfile(analysis, masked)
 
     notes = data.get("notes") if isinstance(data.get("notes"), list) else []
     for note in [n for n in notes if isinstance(n, dict)][:MAX_NOTES]:

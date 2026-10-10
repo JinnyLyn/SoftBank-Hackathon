@@ -1,6 +1,7 @@
 """비밀값 가리기 검사. 테스트용 값은 모두 가짜다."""
 
 import re
+import json
 import unittest
 from pathlib import Path
 
@@ -38,6 +39,16 @@ class MaskTextTests(unittest.TestCase):
         self.assertIn("JWT_SECRET=<가림>", out)
         self.assertIn("MYSQL_ROOT_PASSWORD=<가림>", out)
 
+    def test_json_config_stays_valid_json(self):
+        # 10/11 회귀: "private": true 를 "private": <가림> 으로 바꿔 package.json 이 깨지고 프레임워크를 못 찾았음
+        import json
+        pkg = '{\n  "name": "web",\n  "private": true,\n  "db_password": "hunter2",\n  "dependencies": {"next": "^15.1.6"}\n}\n'
+        out, n = mask_text(pkg, config_file=True)
+        data = json.loads(out)
+        self.assertIs(data["private"], True)
+        self.assertEqual(data["db_password"], "<가림>")
+        self.assertEqual(n, 1)
+
     def test_code_keeps_variable_names(self):
         code = 'SECRET_KEY = os.getenv("SECRET_KEY")\npassword = request.form["password"]\nSTRIPE_API_KEY = "sk_live_fakefake"\n'
         out, n = mask_text(code)
@@ -45,6 +56,25 @@ class MaskTextTests(unittest.TestCase):
         self.assertIn('password = request.form["password"]', out)
         self.assertIn('STRIPE_API_KEY = "<가림>"', out, "문자열로 박아 둔 값만 가림")
         self.assertEqual(n, 1)
+
+    def test_secret_named_scalar_literals_are_masked(self):
+        for value in ("true", "false", "null", "none", "yes", "no", "on", "off", "~"):
+            for key, separator in (("DB_PASSWORD", "="), ("password", ": "), ("api_key", ": "), ("PRIVATE", "=")):
+                with self.subTest(key=key, value=value):
+                    text = f"{key}{separator}{value}\n"
+                    out, count = mask_text(text, config_file=True)
+                    self.assertEqual(out, f"{key}{separator}<가림>\n")
+                    self.assertEqual(count, 1)
+
+    def test_json_secret_scalars_are_masked_while_private_stays_boolean(self):
+        for private in (True, False):
+            for value in (True, False, None):
+                for indent in (None, 2):
+                    with self.subTest(private=private, value=value, indent=indent):
+                        source = json.dumps({"private": private, "api_key": value}, indent=indent)
+                        out, count = mask_text(source, config_file=True)
+                        self.assertEqual(json.loads(out), {"private": private, "api_key": "<가림>"})
+                        self.assertEqual(count, 1)
 
 
     def test_short_secret_names_and_quoted_keys(self):

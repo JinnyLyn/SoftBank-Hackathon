@@ -140,10 +140,13 @@ class SmallAppTests(unittest.TestCase):
             "requirements.txt": "flask==3.0.0\n",
             "app.py": "from flask import Flask\napp = Flask(__name__)\n@app.route('/')\ndef index():\n    return 'hi'\n",
         }))
-        self.assertIsNone(a.container_port)
-        self.assertIn("container_port", a.unresolved)
+        self.assertIsNone(a.container_port, "코드에서 못 찾은 포트는 추측하지 않음")
         self.assertEqual(a.health_check_path, "/")
         self.assertIn("dockerfile", a.unresolved)
+        # Dockerfile이 없어 초안을 만들면, 초안이 정한 포트(gunicorn 바인드)를 배포 설정에만 씀
+        r = a.to_result()
+        self.assertEqual(r["app_config"]["container_port"], r["dockerfile_draft"]["port"])
+        self.assertIn("(Dockerfile 초안)", [s["value"] for s in r["stack"] if s["label"] == "포트"][0])
 
     def test_sqlite_warns_and_marks_stateful(self):
         a = analyze_files(files(**{

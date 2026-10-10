@@ -49,7 +49,7 @@ _PATTERNS: List[Tuple[re.Pattern, str]] = [
 
 # 설정 파일의 KEY=값, KEY: 값, - KEY=값, "KEY": 값 (env·yaml·ini·compose·json). 따옴표 문자열이거나 공백·쉼표 없는 값
 _ENV_ASSIGN = re.compile(
-    r"(?im)^(\s*(?:-\s*)?(?:export\s+)?[\"']?(" + _SECRET_NAME + r")[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#,\n]+)"
+    r"(?im)((?:^\s*(?:-\s*)?(?:export\s+)?|(?<=[{,])\s*)[\"']?(" + _SECRET_NAME + r")[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#,\n}\]]+)"
 )
 # 위 규칙을 적용할 설정 파일. 코드에는 적용하지 않음 (SECRET_KEY = os.getenv("SECRET_KEY") 같은 줄의 변수 이름을 지키려고)
 _CONFIG_FILE = re.compile(r"(?i)(^|/)(\.env(\.[\w-]+)?|[^/]+\.(ya?ml|ini|cfg|conf|toml|properties|json)|dockerfile)$")
@@ -93,10 +93,32 @@ def mask_text(text: str, config_file: bool = False) -> Tuple[str, int]:
         text, n = pattern.subn(repl, text)
         count += n
     if config_file:
-        text, n = _ENV_ASSIGN.subn(lambda m: m.group(1) + MASK, text)
-        count += n
-    text, n = _CODE_ASSIGN.subn(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{MASK}{m.group(4)}", text)
-    count += n
+        hits = [0]
+
+        def assign(m: re.Match) -> str:
+            value = m.group(3)
+            # package.json의 구조 필드만 예외. 비밀 이름의 true/none/off 등도 실제 값일 수 있다.
+            if re.fullmatch(r'\s*"private"\s*:\s*', m.group(1)) and value in {"true", "false"}:
+                return m.group(0)
+            hits[0] += 1
+            # JSON의 비문자열 비밀값도 유효한 JSON 문자열로 가린다.
+            quote = value[0] if value[:1] in "\"'" else ""
+            if not quote and re.search(r'"[^"\n]+"\s*:\s*$', m.group(1)):
+                quote = '"'
+            return m.group(1) + quote + MASK + quote
+
+        text = _ENV_ASSIGN.sub(assign, text)
+        count += hits[0]
+    code_hits = [0]
+
+    def code_assign(m: re.Match) -> str:
+        if m.group(5) == MASK:  # 설정 파일 규칙이 이미 가림
+            return m.group(0)
+        code_hits[0] += 1
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{MASK}{m.group(4)}"
+
+    text = _CODE_ASSIGN.sub(code_assign, text)
+    count += code_hits[0]
     return text, count
 
 

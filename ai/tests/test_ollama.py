@@ -30,10 +30,9 @@ class OllamaFillTests(unittest.TestCase):
         self.files = files()
         self.analysis = analyze_files(self.files)
 
-    def test_accepts_fenced_json_and_skips_answers_missing_fields(self):
-        # glm-5.3 실제 응답처럼 코드 블록으로 감싸고, 한 답은 근거 파일을 빼먹음
-        payload = {"answers": [answer("container_port", "5050", "config.py", 2), {"field": "framework", "value": "Flask"}],
-                   "notes": ["문자열 메모는 무시"]}
+    def test_accepts_schema_valid_fenced_json(self):
+        # 코드 블록으로 감싼 JSON도 전체 스키마를 통과하면 반영한다.
+        payload = {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}
         client = FakeOllama("```json\n" + json.dumps(payload) + "\n```")
         out = fill_unresolved(self.analysis, self.files, client, model="glm-5.3")
         self.assertEqual(out.filled, ["container_port"])
@@ -41,6 +40,19 @@ class OllamaFillTests(unittest.TestCase):
         self.assertEqual(out.model, "glm-5.3")
         self.assertIn("JSON 스키마", client.calls[0]["system"], "스키마를 강제하지 않으므로 형식을 프롬프트에도 적음")
         self.assertNotIn("FAKE-should-never-be-sent", client.calls[0]["user"])
+
+    def test_rejects_fenced_json_with_invalid_answer_or_note(self):
+        for payload in (
+            {"answers": [answer("container_port", "5050", "config.py", 2), {"field": "framework", "value": "Flask"}], "notes": []},
+            {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": ["문자열 메모"]},
+        ):
+            with self.subTest(payload=payload):
+                analysis = analyze_files(self.files)
+                client = FakeOllama("```json\n" + json.dumps(payload) + "\n```")
+                out = fill_unresolved(analysis, self.files, client)
+                self.assertEqual(out.filled, [])
+                self.assertIsNone(analysis.container_port)
+                self.assertIn("스키마", out.rejected["container_port"])
 
     def test_text_around_json_and_non_json(self):
         payload = {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}
@@ -91,9 +103,11 @@ class OllamaHttpTests(unittest.TestCase):
         _Handler.seen.clear()
 
     def test_request_shape_and_reply(self):
-        _Handler.status, _Handler.body = 200, {"model": "glm-5.3", "message": {"content": "{}", "thinking": "..."}, "done_reason": "length"}
+        _Handler.status, _Handler.body = 200, {"model": "glm-5.3", "message": {"content": "{}", "thinking": "..."}, "done_reason": "length",
+                                               "prompt_eval_count": 900, "eval_count": 120}
         reply = OllamaClient("k-test", base_url=self.url).chat("glm-5.3", "sys", "user", {"type": "object"}, 100)
         self.assertEqual((reply.text, reply.stop_reason, reply.model), ("{}", "max_tokens", "glm-5.3"))
+        self.assertEqual((reply.input_tokens, reply.output_tokens), (900, 120), "토큰 사용량을 읽음 (AGENTS.md 7)")
         sent = _Handler.seen[0]
         self.assertEqual(sent["path"], "/api/chat")
         self.assertEqual(sent["auth"], "Bearer k-test")
@@ -121,7 +135,7 @@ class ProviderChoiceTests(unittest.TestCase):
     def test_ollama_first_then_anthropic(self):
         client, model = self.pick({"OLLAMA_API_KEY": "x", "ANTHROPIC_API_KEY": "y"})
         self.assertIsInstance(client, OllamaClient)
-        self.assertEqual(model, "glm-5.3")
+        self.assertEqual(model, "gemma4:31b")
         self.assertEqual(self.pick({}), (None, None))
         client, _ = self.pick({"PAVED_AI_PROVIDER": "ollama"})
         self.assertIsNone(client, "Ollama를 고르고 키가 없으면 규칙 분석만")

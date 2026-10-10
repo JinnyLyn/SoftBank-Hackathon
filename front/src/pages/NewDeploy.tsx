@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, ApiError, sourceName } from '../api'
+import { api, ApiError, DRAFT_BUILD, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
@@ -354,7 +354,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
         setAnalysis(a)
         await saveDomain(a.projectId)
         // 배포할 수 없는 앱이면 worker가 계획을 만들지 않으므로 기다리지 않음 (PR #25 리뷰)
-        if (!a.blockers?.length) loadRec(a.projectId)
+        // 초안은 worker가 빌드에 쓸 수 있을 때(DRAFT_BUILD)만 계획을 기다림
+        if (!a.blockers?.length && (!a.dockerfileDraft || DRAFT_BUILD)) loadRec(a.projectId)
       }
       setStep(ANALYSIS)
     })
@@ -438,7 +439,11 @@ export default function NewDeploy({ onShowHistory }: Props) {
     }
   if (step === DOMAIN && locked) next = { label: '다음', onClick: () => setStep(ANALYSIS) }
   if (step === ANALYSIS && !locked) {
-    if (!rec) next = { label: recError ? '비용 승인' : '계획 준비 중…', onClick: () => {}, disabled: true }
+    if (!rec) {
+      // 배포할 수 없거나 Dockerfile을 넣어야 하면 계획을 기다리지 않으므로 '준비 중'으로 보이지 않게
+      const waiting = !recError && !analysis?.blockers?.length && (!analysis?.dockerfileDraft || DRAFT_BUILD)
+      next = { label: waiting ? '계획 준비 중…' : '비용 승인', onClick: () => {}, disabled: true }
+    }
     else if (codeState === 'error' && analysis && choice)
       next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
     else if (!choice) next = { label: '비용 승인', onClick: () => {}, disabled: true }
@@ -468,8 +473,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
         <StepRail items={railItems} onSelect={setStep} />
         {option && selectedTier && (
           <div className="cost-note">
-            <span>월 예상 비용</span>
+            <span>{selectedTier.usualUsd !== undefined ? '월 최대 예상 비용' : '월 예상 비용'}</span>
             <strong>{costText(tierTotal(selectedTier))}</strong>
+            {selectedTier.usualUsd !== undefined && <small>평소 {usd(selectedTier.usualUsd)} (부하가 늘면 최대까지)</small>}
             <small className="with-mark">
               <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
             </small>

@@ -16,7 +16,8 @@
 | ANTHROPIC_API_KEY            | Ollama 키가 없을 때, 또는 PAVED_AI_PROVIDER=anthropic 일 때 |
 | ANTHROPIC_WORKSPACE_ID       | 키가 워크스페이스에 묶여 있지 않을 때만 (anthropic-workspace-id 헤더) |
 | PAVED_AI_PROVIDER            | ollama / anthropic. 비우면 있는 키로 고름(Ollama 먼저). 둘 다 없으면 규칙 분석만 |
-| PAVED_AI_MODEL / --model     | Ollama glm-5.3, Anthropic claude-opus-5-5 |
+| PAVED_AI_MODEL / --model     | Ollama gemma4:31b, Anthropic claude-opus-5-5 |
+| PAVED_AI_CACHE / _CACHE_DIR  | LLM 답 캐시. 기본 켬, ~/.cache/paved-ai/llm (저장소 밖). off 로 끔 |
 | --no-llm                     | LLM을 부르지 않음 |
 
 백엔드로 옮길 때는 이 파일을 버리고 paved_ai 를 직접 부른다 (paved_ai 에는 HTTP 코드가 없음).
@@ -268,8 +269,9 @@ def analyze_project(
             outcome = fill_unresolved(analysis, files, llm, model)
             if outcome.asked:
                 log.info(
-                    "프로젝트 %s LLM 보조: 채움 %s, 버림 %s (모델 %s, 요청 %s)",
+                    "프로젝트 %s LLM 보조: 채움 %s, 버림 %s (모델 %s, 요청 %s, 토큰 입력 %s·출력 %s, %sms%s)",
                     project["id"], outcome.filled or "-", list(outcome.rejected) or "-", outcome.model, outcome.request_id,
+                    outcome.input_tokens, outcome.output_tokens, outcome.elapsed_ms, ", 캐시" if outcome.cached else "",
                 )
         except LlmUnavailable as e:
             log.warning("프로젝트 %s LLM 보조를 건너뜁니다: %s", project["id"], e)

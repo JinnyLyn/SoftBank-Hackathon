@@ -1,5 +1,7 @@
 import ProviderMark from '../components/ProviderMark'
 import WorkProgress from '../components/WorkProgress'
+import DockerfileDraft from '../components/DockerfileDraft'
+import { DRAFT_BUILD } from '../api'
 import { STAGE_SIZE } from '../progress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
@@ -49,6 +51,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
           <span>코드를 고친 뒤 처음 화면에서 다시 올려 주세요.</span>
         </div>
       )}
+      {analysis.dockerfileDraft && <DockerfileDraft draft={analysis.dockerfileDraft} />}
       <section>
         <h3 className="sub-title">코드에서 찾은 것</h3>
         <dl className="kv">
@@ -81,7 +84,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
         </details>
       </section>
 
-      {blockers.length > 0 ? null : rec ? (
+      {blockers.length > 0 || (analysis.dockerfileDraft && !DRAFT_BUILD) ? null : rec ? (
         <Plans rec={rec} {...plans} />
       ) : (
         <section>
@@ -188,12 +191,20 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
                         )
                       const on = choice?.connectionId === o.connectionId && choice?.tier === t.key
                       const over = tierTotal(t) > budget
+                      // 계획이 없는 비교용 안 (다시 계획하는 경로가 생기기 전까지 고를 수 없음)
+                      const compareOnly = t.planned === false
                       return (
                         <td key={t.key}>
                           <button
                             className={'cell' + (on ? ' is-on' : '') + (over ? ' is-over' : '')}
-                            disabled={locked || over}
-                            title={over ? `월 예산 $${budget}을 넘습니다` : undefined}
+                            disabled={locked || over || compareOnly}
+                            title={
+                              over
+                                ? `월 예산 $${budget}을 넘습니다`
+                                : compareOnly
+                                  ? '비교용 예상치입니다. 이 안으로 배포하는 계획은 아직 만들지 않았습니다.'
+                                  : undefined
+                            }
                             aria-pressed={on}
                             onClick={() => onChoice({ connectionId: o.connectionId, tier: t.key })}
                           >
@@ -203,8 +214,13 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
                                 <span className="tag-low">최저</span>
                               )}
                               {over && <span className="tag-over">예산 초과</span>}
+                              {t.rankLabel && <span className="tag-rank">{t.rankLabel}</span>}
+                              {compareOnly && !over && <span className="tag-rank">비교용</span>}
                             </span>
                             <strong>{costText(tierTotal(t))}</strong>
+                            {t.usualUsd !== undefined && t.usualUsd !== tierTotal(t) && (
+                              <small className="cell-usual">평소 {usd(t.usualUsd)} · 부하 최대 기준</small>
+                            )}
                             <small>{t.headline}</small>
                           </button>
                         </td>
