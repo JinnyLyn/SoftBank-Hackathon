@@ -109,6 +109,10 @@ _MANIFESTS = {"requirements.txt", "pyproject.toml", "pipfile", "setup.py", "pack
 _ENTRY = re.compile(r"(?i)(^|/)(main|app|server|index|manage|wsgi|asgi|settings|config)\.(py|js|ts|mjs|cjs)$|application\.(properties|ya?ml)$")
 _HINTS = re.compile(r"(?i)\b(listen|port|route|@app\.|@router\.|app\.get|health|uvicorn|gunicorn)\b")
 _CODE = (".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".kt", ".go", ".rb")
+# 포트·헬스체크가 코드 대신 설정 파일에 있는 경우 (예: config.json 의 "listen": 7311). 잠금 파일은 크고 단서가 없어 뺌
+_CONFIG = (".json", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties")
+_CONFIG_HINTS = re.compile(r"(?i)(listen|port|health|probe|readiness|liveness)")
+_LOCKS = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "composer.lock", "pipfile.lock"}
 
 
 def _rank(f: SourceFile) -> int:
@@ -121,6 +125,8 @@ def _rank(f: SourceFile) -> int:
         return 2
     if f.path.endswith(_CODE) and _HINTS.search(f.text):
         return 3
+    if name.endswith(_CONFIG) and name not in _LOCKS and _CONFIG_HINTS.search(f.text):
+        return 4
     return 9
 
 

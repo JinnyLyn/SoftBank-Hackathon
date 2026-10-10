@@ -140,6 +140,30 @@ class SelectFilesTests(unittest.TestCase):
         ])]
         self.assertEqual(picked, ["Dockerfile", "requirements.txt", "app.py"])
 
+    def test_sends_config_files_with_port_hints(self):
+        # 실제 glm-5.3 시험에서 포트가 config.json 에만 있어 근거를 못 댄 경우
+        picked = [f.path for f in select_files([
+            SourceFile("src/server.js", "app.listen(cfg.http.listen)"),
+            SourceFile("src/config.json", '{"http": {"listen": 7311}}'),
+            SourceFile("src/strings.json", '{"title": "shop"}'),
+            SourceFile("package-lock.json", '{"port": "ignored"}'),
+        ])]
+        self.assertEqual(picked, ["src/server.js", "src/config.json"])
+
+    def test_accepts_port_from_config_file(self):
+        spec = {
+            "package.json": '{"name": "shop", "dependencies": {"express": "^4"}}\n',
+            "src/config.json": '{\n  "http": { "listen": 7311 }\n}\n',
+            "src/server.js": "const cfg = require('./config.json')\napp.get('/', ok)\napp.listen(cfg.http.listen)\n",
+        }
+        fs = files(spec)
+        analysis = analyze_files(fs)
+        self.assertIn("container_port", analysis.unresolved)
+        client = FakeClient({"answers": [answer("container_port", "7311", "src/config.json", 2)], "notes": []})
+        out = fill_unresolved(analysis, fs, client)
+        self.assertEqual(out.filled, ["container_port"])
+        self.assertIn("src/config.json", client.calls[0]["messages"][0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
