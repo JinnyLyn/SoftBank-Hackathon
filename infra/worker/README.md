@@ -97,6 +97,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 예산만으로 `max_tasks`를 정하면 계정의 Fargate 할당량보다 큰 최대 구성이 나올 수 있다. AWS 문서의 기본 할당량("Fargate On-Demand vCPU resource count")은 **리전당 6 vCPU**라서, 예를 들어 월 $1000의 최대 안(medium 14개 = 14 vCPU)은 승인해도 최대 용량까지 늘지 못한다. 그래서 planner는 `foundation-info` 다음에 `fetch_fargate_capacity`로 한도를 읽고, 모든 안의 부하 최대 vCPU가 **남은 vCPU = 할당량 - 사용 중** 안에 들게 `max_tasks`를 줄인다(`cost.recommend(..., max_vcpu=)`).
 
 - 할당량: `aws service-quotas get-service-quota --service-code fargate --quota-code L-3032A538`. 적용된 값이 없는 계정은 `get-aws-default-service-quota`로 기본값을 읽는다.
+- 할당량은 계정마다 다르다. 기본은 6이지만 증설된 계정이 있다(개발 계정에서는 512 vCPU로 조회됐다). 코드는 값을 박지 않고 항상 읽는다.
 - 사용 중인 vCPU: CloudWatch `AWS/Usage`의 `ResourceCount`(차원 `Service=Fargate`, `Type=Resource`, `Resource=vCPU`, `Class=Standard/OnDemand`, 단위 vCPU)의 최근 30분 최댓값. 할당량 응답에 `UsageMetric`이 있으면 그 네임스페이스·차원을 우선한다. 데이터가 없으면 0으로 본다. 이 계정·리전의 모든 Fargate 작업(다른 앱 포함)이 포함된다.
 - 줄어든 안은 `options[].quota_limited=true`이고 이유 문구에 "Fargate 할당량(남은 N vCPU)"이 들어간다. 최소 구성도 못 담는 안은 빠지고, 가장 작은 안(0.25 vCPU)도 못 담으면 계획을 만들지 않고 이유와 함께 종료한다.
 - **읽지 못하면 멈춘다.** 한도를 모른 채 추천하지 않고 `PlanError`로 종료한다(`fetch_foundation`과 같은 원칙). 배포 계정에 `servicequotas:GetServiceQuota`, `servicequotas:GetAWSDefaultServiceQuota`, `cloudwatch:GetMetricStatistics` 권한이 필요하다. 권한이 없는 계정에서는 `--skip-quota-check`로 worker를 실행하면 조회를 건너뛰며(계획 요약에 "할당량 확인을 건너뜀"이 남는다) 이때는 할당량보다 큰 구성이 추천될 수 있다.

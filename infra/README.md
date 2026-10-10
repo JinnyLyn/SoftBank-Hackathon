@@ -367,7 +367,7 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - `db_multi_az`, `final_snapshot=true`로 삭제(스냅샷 남기기), `nat_high_availability=false`, `az_count=2`의 **실제 생성**(계획 내용만 회귀 시험으로 확인).
 - 두 배포를 정확히 동시에 `up`할 때의 포트 경합(문서에 한계를 적었다).
 - CPU 기반 오토스케일링(`max_tasks > min_tasks`)의 실제 증감, 부하 상황. 태스크 수 상한을 없앤 뒤 `max_tasks`가 4를 넘는 배포(예: 예산이 큰 경우)의 실제 생성과 공용 RDS 연결 수 한도.
-- worker의 Fargate vCPU 할당량 조회(`service-quotas get-service-quota`, CloudWatch `AWS/Usage`)를 **실제 AWS에서는 실행하지 않았다.** 가짜 `aws` CLI로 로직만 시험했다. 실제 응답 형식, 사용량 지표의 차원, 배포 계정의 `servicequotas:`·`cloudwatch:` 읽기 권한은 서버에서 확인해야 한다.
+- worker의 Fargate vCPU 할당량 조회(`service-quotas get-service-quota`, CloudWatch `AWS/Usage`)는 테스트에서 가짜 `aws` CLI로 시험하고, 읽기 전용 호출을 개발 PC의 자격 증명으로 실제 AWS(`sa-east-1`)에서 한 번 실행해 응답 형식(`Quota.Value`, `UsageMetric`의 네임스페이스·차원, `Datapoints[].Maximum`)과 사용량 지표의 차원이 맞는지 확인했다(그 계정은 할당량이 512 vCPU로 기본 6보다 컸다). **서버에서 worker가 쓰는 실행 역할의 `servicequotas:`·`cloudwatch:` 읽기 권한은 확인하지 못했다.** 권한이 부족한 경로(계획 중단과 안내 메시지)는 가짜 `aws`로만 시험했다.
 - `large`·`xlarge` 태스크 크기의 실제 배포(계획 입력 검증과 비용 계산만 시험했다).
 - AWS Budgets 알림(`budget_monthly_usd`)의 실제 생성과 메일 수신. 가짜 자격 증명으로 계획 내용(예산 1개, 알림 3건)만 확인했고 실제 계정·권한에서는 적용하지 않았다.
 - `cpu_architecture = ARM64` 이미지.
