@@ -22,6 +22,26 @@
 
 ## 실행과 결과
 
+### PR 보고 검사
+
+`Team Git Guard`의 `Git guard (ubuntu-latest)`·`Git guard (windows-latest)`에 PR 보고 검사를 포함한다. 기존 필수 check를 사용하므로 새 필수 검사 이름을 서버에 등록할 필요는 없다. 이 워크플로가 반영된 main을 기준으로 사용하며, 기존 PR도 최신 main과 동기화하고 보고 항목을 채운다.
+
+- main 대상 PR의 생성·본문/제목 수정·추가 push·재오픈에 실행한다(`opened`, `edited`, `synchronize`, `reopened`). 본문 수정은 이 워크플로를 재실행하며 앱 빌드 전체를 재실행하지 않는다. 같은 PR의 이전 실행은 취소하고 최신 실행을 판정한다.
+- 템플릿의 필수 제목이 하나 있고 `해당 없음`·`해당 있음` 중 하나만 체크됐는지 확인한다. `해당 있음`은 항목마다 관련 기준, 실제 변경, 이유, 영향, 문서 처리, 미결 사항을 작성해야 한다. 빈칸·TODO·TBD·이유 없는 `미정`은 실패한다. `TODO: 추후 작성`, `TBD - 담당자 확인`처럼 뒤에 설명을 붙인 미작성 표시도 상세 항목과 문서 처리 사유에서 거부한다. `해당 없음`이면 상세 항목은 남기거나 삭제할 수 있다.
+- 제목·항목 이름과 블록 순서는 템플릿을 유지한다. 상세 내용은 여러 줄로 쓸 수 있지만 주석·코드 블록만으로 대신하지 않는다. 설명의 사실성·충분성이나 숨겨진 우회는 자동 판정하지 않는다.
+- 실패 메시지에 나온 항목을 PR 본문에서 보완하면 새 실행으로 재검사한다. 이미 완료된 실행의 재실행은 당시 이벤트 본문을 사용하므로, 본문 변경 뒤 생성된 최신 실행을 확인한다.
+- 이벤트 파일 `GITHUB_EVENT_PATH`를 JSON 데이터로 읽는다. PR 본문을 셸 코드에 삽입하거나 로그에 출력하지 않고 추가 토큰·외부 호출을 사용하지 않는다.
+- main push와 수동 실행은 보고 검사 자체의 회귀 테스트만 실행하며 PR 본문을 요구하지 않는다.
+
+로컬에서 회귀 검사와 제출할 본문을 확인한다.
+
+```bash
+python3 -m unittest discover -s scripts/ci -p 'test_pr_report.py' -v
+python3 scripts/ci/check_pr_report.py --body-file /path/to/pr-body.md
+```
+
+### 앱 검사
+
 `.github/workflows/app-ci.yml`의 `Application CI`가 다음 경우 실행된다.
 
 - main 대상 PR 생성·갱신: GitHub의 기본 checkout으로 PR과 main의 가상 병합 결과 검사.
@@ -40,7 +60,7 @@
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
 | `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
-| `Platform backend (startup and API smoke)` | `back/` 구현 존재 | `.python-version`과 requirements 기반 설치, 의존성 호환성·문법, 실제 앱 기동·OpenAPI, `/health` 200, DB 미설정 `/ready` 503, 작업자 인증 없는 요청 401, 잘못된 plan 입력 422 | 실제 DB·migration·CRUD·승인 상태 전환, 프런트 연동, LLM·AWS 실행, Docker 이미지 빌드 |
+| `Platform backend (startup and API smoke)` | `back/` 구현 존재 | `.python-version`과 requirements 기반 설치, 의존성 호환성·문법, DB 없는 앱 기동·OpenAPI 및 오류 계약, MySQL 8.4 migration, 첫 실패 롤백 차단, 새 rollback plan/diff 승인, worker claim 계약 | 프런트 연동, LLM·AWS Terraform/ECS 실행, Docker 이미지 빌드 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
 10/10 확인한 main `432a52e`에는 샘플 프런트와 [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4)의 샘플 백엔드가 있다. 플랫폼 백엔드는 [PR #10](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/10) `147ad5e`, 인프라·플랫폼 프런트는 [#6](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/6)·[#7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7)의 파일 계약에 맞춘 조건부 검사다. 각 PR이 변경된 CI를 반영하면 해당 구현이 있는 검사만 활성화된다. 열린 PR 코드를 CI가 별도로 가져오거나 자동으로 합치지 않는다.
