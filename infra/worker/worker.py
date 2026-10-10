@@ -132,6 +132,7 @@ class Config:
     # 팀 결정이 아니라 발표자 PC 시연용 선택 기능이다(docs/OPEN_QUESTIONS.md)
     targets: tuple = ("aws",)
     local: local_docker.LocalConfig = field(default_factory=local_docker.LocalConfig)
+    progress: object = field(default=None, repr=False)  # Opt-in launcher observation only.
 
 
 def log(msg):
@@ -146,10 +147,11 @@ def redact(text):
 
 # --- 백엔드 API -------------------------------------------------------------------------------------
 class Api:
-    def __init__(self, base, token, timeout=30):
+    def __init__(self, base, token, timeout=30, progress=None):
         self.base = base.rstrip("/")
         self.token = token
         self.timeout = timeout
+        self.progress = progress
 
     def _call(self, method, path, body=None, raw=None):
         headers = {"Accept": "application/json"}
@@ -166,10 +168,17 @@ class Api:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as r:
                 text = r.read().decode("utf-8", "replace")
-                return r.status, (json.loads(text) if text.strip() else None)
+                result = json.loads(text) if text.strip() else None
+                if self.progress:
+                    self.progress.success()
+                return r.status, result
         except urllib.error.HTTPError as e:
+            if self.progress and (e.code in (401, 403, 429) or e.code >= 500):
+                self.progress.error()
             raise ApiError(e.code, e.read().decode("utf-8", "replace")) from None
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            if self.progress:
+                self.progress.error()
             raise ApiError(0, f"백엔드에 연결하지 못했습니다: {e}") from None
 
     def get(self, path):
@@ -1061,11 +1070,15 @@ def execute_local_job(api, cfg, job):
         job_sha = job.get("source_sha256")
         if not isinstance(src_expected, str) or not SHA256_RE.match(src_expected) or (job_sha and job_sha != src_expected):
             return fail_job(api, dep, *SOURCE_MISMATCH)
+        if cfg.progress:
+            cfg.progress.begin("source", min(3600, cfg.download_timeout * DOWNLOAD_RETRIES + 30))
         src_path, src_tmp, err = fetch_source(api, cfg, job, src_expected)
         if err:
             return fail_job(api, dep, *err)
 
         log(f"이미지 빌드(로컬 Docker): {deploy_id}")
+        if cfg.progress:
+            cfg.progress.begin("build", lc.build_timeout + 30)
         local_docker.build_image(lc, src_path, v.get("dockerfile", "Dockerfile"), params["image"])
 
         state = {"deploying": False}
@@ -1079,6 +1092,8 @@ def execute_local_job(api, cfg, job):
                 log(f"deploying 보고 실패(배포는 이어갑니다): {e}")
 
         log(f"적용(로컬 Docker): {deploy_id}")
+        if cfg.progress:
+            cfg.progress.begin("apply", lc.up_timeout + lc.init_timeout + lc.health_timeout + 30)
         local_docker.apply(lc, deploy_id, rendered, host_port=params["host_port"], health_path=health, bind=params["bind"], init_command=init,
                            use_database=params["use_database"], on_deploying=on_deploying)
         if not state["deploying"]:
@@ -1365,6 +1380,8 @@ def main(argv=None):
     p.add_argument("--deploy-sh", default=os.environ.get("DEPLOY_SH", str(INFRA / "scripts" / "deploy.sh")))
     p.add_argument("--poll", type=float, default=float(os.environ.get("POLL_SECONDS", "5")), help="점검 간격(초)")
     p.add_argument("--once", action="store_true", help="한 번만 점검하고 끝낸다")
+    p.add_argument("--progress-file", help="전용 실행기의 진행 상태 파일(옵션)")
+    p.add_argument("--run-id", help="전용 실행기 식별자(옵션)")
     p.add_argument("--arch", default=os.environ.get("TARGET_ARCH", ""), help="X86_64 또는 ARM64(기본: 이 PC의 docker)")
     p.add_argument("--skip-quota-check", action="store_true",
                    help="Fargate vCPU 할당량을 조회하지 않는다. 배포 계정에 servicequotas·cloudwatch 읽기 권한이 없을 때만 쓴다(할당량보다 큰 구성이 추천될 수 있다)")
@@ -1389,6 +1406,10 @@ def main(argv=None):
     cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll,
                  quota_check=not a.skip_quota_check, targets=targets)
     cfg.local = local_docker.LocalConfig(root=Path(a.local_dir), bind=a.local_bind, public_host=a.local_host)
+    if a.progress_file or a.run_id:
+        sys.path.insert(0, str(INFRA.parent / "scripts"))
+        from onprem_progress import from_args
+        cfg.progress = from_args(p, a)
     if local_docker.TARGET in targets and a.local_bind not in ("127.0.0.1", "localhost"):
         log(f"경고: 컨테이너 포트를 {a.local_bind}에 엽니다. 로그인이 없는 앱이면 같은 네트워크의 누구나 접속할 수 있습니다")
     raw_max = os.environ.get("MAX_SOURCE_BYTES", "")
@@ -1403,14 +1424,21 @@ def main(argv=None):
         rc, out, _ = run_capture(deploy(cfg, "detect-arch"), 30, env=child_env(cfg))
         arch = out.strip() if rc == 0 and out.strip() in ("X86_64", "ARM64") else "X86_64"
     arch = arch or "X86_64"   # 로컬 Docker만 다루면 쓰지 않는 값이다
-    api = Api(cfg.api_url, cfg.token)
+    api = Api(cfg.api_url, cfg.token, progress=cfg.progress)
     state = State()
     log(f"worker 시작: {cfg.api_url} (대상 {','.join(targets)}, 아키텍처 {arch})")
     while True:
+        if cfg.progress:
+            cfg.progress.begin("polling")
         try:
             tick(api, cfg, state, arch=arch)
         except ApiError as e:
+            if cfg.progress:
+                cfg.progress.error()
             log(f"백엔드 오류: {e}")
+        finally:
+            if cfg.progress:
+                cfg.progress.idle()
         if a.once:
             return 0
         time.sleep(cfg.poll_seconds)

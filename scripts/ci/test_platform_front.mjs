@@ -140,3 +140,102 @@ await checkBundle('aws', ['python', '-m', 'app.initialize_database']);
 await checkMixedRecommendation(150, 'aws');
 await checkMixedRecommendation(100, 'local-docker');
 console.log('PASS: 공개 recommend/generate 어댑터 회귀 5개 (로컬 초기화 있음·없음, AWS, 혼합 대상의 예산 내·초과)');
+
+// Dedicated local service: immutable identity, no global provider/connection/domain requests.
+const localPlan = () => ({
+  id: 'local-1', project_id: 'project-1', analysis_id: 'analysis-1', target: 'local_docker',
+  module_id: 'local-docker-compose', variables: { compose_yaml: 'services:\n  app:\n    image: local/app\n' },
+  summary: '로컬 계획', fingerprint: 'reviewed-fingerprint', status: 'awaiting_approval',
+  cost_estimate: { amount: '0' }, terraform_plan_ready: true,
+  created_at: '2026-10-11T00:00:00Z',
+});
+function localAdapter(handler) {
+  const http = { req: handler, send: (method, body) => ({ method, body: JSON.stringify(body) }), ApiError: class extends Error { constructor(status, message) { super(message); this.status = status; } } };
+  const real = loadTs('../../front/src/api/real.ts', {
+    './http': http, '../format': format, '../providers': { isEnabled: (provider) => provider === 'aws' },
+  });
+  return { local: loadTs('../../front/src/onprem/api.ts', { '../api/http': http, '../api/real': real }), real };
+}
+{
+  const calls = [];
+  const { local, real } = localAdapter(async (path, init) => {
+    calls.push([path, init]);
+    if (path === '/projects/project-1/plans') return [localPlan(), { ...localPlan(), id: 'aws', target: 'aws' }];
+    if (path === '/projects/aws-project/plans') return [{ ...localPlan(), id: 'aws', target: 'aws', variables: { tier: 'balanced' } }];
+    if (path === '/connections') return [];
+    if (path === '/plans/local-1') return localPlan();
+    if (path.startsWith('/deployments?')) return [];
+    if (path === '/plans/local-1/approve') return { ...localPlan(), status: 'approved' };
+    if (path === '/deployments') return {};
+    throw new Error(`Unexpected request ${path}`);
+  });
+  const reviewed = await local.recommendLocal('project-1');
+  assert(Object.isFrozen(reviewed.reference));
+  assert.deepEqual(reviewed.reference, { projectId: 'project-1', planId: 'local-1', fingerprint: 'reviewed-fingerprint', target: 'local_docker' });
+  assert.equal(reviewed.bundle.tool, 'compose');
+  assert.deepEqual(calls.map(([path]) => path), ['/projects/project-1/plans']);
+  // Replacing the existing AWS cache cannot affect the local review.
+  await real.recommend('aws-project', scale);
+  calls.length = 0;
+  await local.approveLocal(reviewed.reference);
+  assert.deepEqual(calls.filter(([, init]) => init).map(([path, init]) => [path, JSON.parse(init.body)]), [
+    ['/plans/local-1/approve', { expected_fingerprint: 'reviewed-fingerprint' }],
+    ['/deployments', { plan_id: 'local-1', expected_fingerprint: 'reviewed-fingerprint' }],
+  ]);
+  assert(!calls.some(([path]) => /connections|domain/.test(path)));
+}
+for (const mutation of [
+  { id: 'different-plan' }, { target: 'aws' }, { project_id: 'other-project' },
+  { fingerprint: 'changed' }, { status: 'superseded' }, { terraform_plan_ready: false },
+]) {
+  const calls = [];
+  const { local } = localAdapter(async (path, init) => {
+    calls.push([path, init]);
+    if (path.startsWith('/deployments?')) return [];
+    return { ...localPlan(), ...mutation };
+  });
+  await assert.rejects(local.approveLocal({ projectId: 'project-1', planId: 'local-1', fingerprint: 'reviewed-fingerprint', target: 'local_docker' }));
+  assert(!calls.some(([, init]) => init), `Mutation ${JSON.stringify(mutation)} must never write`);
+}
+{
+  const { local } = localAdapter(async () => [{ ...localPlan(), target: 'aws' }, { ...localPlan(), project_id: 'other-project' }]);
+  assert.equal(await local.recommendLocal('project-1'), null, 'AWS/other-project plans never satisfy a local wait');
+}
+{
+  let resumeFirst;
+  let count = 0;
+  const { local } = localAdapter(async () => {
+    if (++count === 1) return new Promise((resolve) => { resumeFirst = resolve; });
+    return [{ ...localPlan(), id: 'new-plan' }];
+  });
+  const operations = new local.Operations();
+  let visible;
+  const firstCurrent = operations.next();
+  const first = local.recommendLocal('project-1').then((review) => { if (firstCurrent()) visible = review; });
+  const secondCurrent = operations.next();
+  const second = await local.recommendLocal('project-1');
+  if (secondCurrent()) visible = second;
+  resumeFirst([localPlan()]); await first;
+  assert.equal(visible.reference.planId, 'new-plan', 'Same-project late response must not replace the new review');
+  const beforeReset = operations.next();
+  operations.invalidate();
+  assert.equal(beforeReset(), false, 'Reset must invalidate late file/review responses');
+}
+console.log('PASS: local-only selection, immutable approval, AWS cache isolation, 6 changed-plan rejections, same-project late response/reset');
+{
+  let called;
+  const { local } = localAdapter(async (path, init) => { called = [path, init]; return {}; });
+  await local.readiness();
+  assert.deepEqual(called, ['/onprem/readiness', { timeoutMs: 3000 }]);
+}
+{
+  const calls = [];
+  const { local } = localAdapter(async (path, init) => {
+    calls.push([path, init]);
+    if (path.startsWith('/deployments?')) return [];
+    return { ...localPlan(), ...(path.endsWith('/approve') ? { target: 'aws', status: 'approved' } : {}) };
+  });
+  await assert.rejects(local.approveLocal({ projectId: 'project-1', planId: 'local-1', fingerprint: 'reviewed-fingerprint', target: 'local_docker' }));
+  assert(!calls.some(([path, init]) => path === '/deployments' && init), 'Changed approval response cannot deploy');
+}
+console.log('PASS: readiness 3-second timeout and changed approval response rejected');

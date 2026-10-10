@@ -52,6 +52,16 @@ then
 fi
 echo 'PASS: 모든 마이그레이션 이력이 두 차례 실행 후 확인됨'
 
+echo '기존 API의 on-prem 미설정 상태 (DB 정상과 별도 판정)'
+timeout 15 "${compose[@]}" exec -T api python - <<'PY'
+import json, urllib.request
+with urllib.request.urlopen('http://127.0.0.1:8000/api/onprem/readiness', timeout=5) as response:
+    data = json.load(response)
+assert data['status'] == 'unconfigured', data
+assert data['components']['db']['status'] == 'ready', data
+print('PASS: legacy API readiness is not on-prem service readiness')
+PY
+
 echo '실제 DB/API 롤백 계약 검사 (AWS/LLM 실행 없음)'
 timeout 180 "${compose[@]}" exec -T api python /ci/test_platform_back_rollbacks.py
 

@@ -1,0 +1,45 @@
+# on-prem 전용 서비스. 사용자 앱은 별도 Compose project로 유지된다.
+services:
+  db:
+    image: mysql:8.4.11
+    environment:
+      MYSQL_DATABASE: paved_onprem
+      MYSQL_USER: paved_onprem
+      MYSQL_PASSWORD: ${ONPREM_DB_PASSWORD:?}
+      MYSQL_ROOT_PASSWORD: ${ONPREM_DB_ROOT_PASSWORD:?}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+      start_period: 20s
+  api:
+    build:
+      context: ../back
+    environment:
+      DATABASE_URL: mysql://paved_onprem:${ONPREM_DB_PASSWORD:?}@db:3306/paved_onprem
+      WORKER_API_TOKEN: ${WORKER_API_TOKEN:?}
+      UPLOAD_DIR: /var/lib/paved-clouds/uploads
+      PLAN_ARTIFACT_DIR: /var/lib/paved-clouds/plans
+      WORKER_ARTIFACT_DOWNLOADS_ENABLED: 'true'
+      AWS_EC2_METADATA_DISABLED: 'true'
+      ONPREM_STATUS_FILE: /onprem-status/status.json
+      ONPREM_RUN_ID: ${ONPREM_RUN_ID:?}
+    ports:
+      - '127.0.0.1:${ONPREM_API_PORT:?}:8000'
+    volumes:
+      - ${ONPREM_STATE_DIR:?}/uploads:/var/lib/paved-clouds/uploads
+      - ${ONPREM_STATE_DIR:?}/plans:/var/lib/paved-clouds/plans
+      - ${ONPREM_STATE_DIR:?}/status:/onprem-status:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+volumes:
+  mysql_data:

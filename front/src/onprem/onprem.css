@@ -1,0 +1,36 @@
+/* Existing Paved Clouds tokens; isolated from the AWS route. */
+.onprem-header { background: var(--asphalt); color: white; }
+.onprem-header > div { max-width: 1040px; margin: auto; padding: 16px 24px; display: flex; gap: 24px; align-items: center; }
+.onprem-header span { color: var(--marking); }
+.onprem-main { max-width: 1040px; margin: auto; padding: 32px 24px 64px; display: grid; gap: 24px; }
+.onprem-intro { display: grid; gap: 8px; max-width: 80ch; }
+.onprem h1 { font-size: 28px; letter-spacing: -.025em; }
+.onprem h2 { font-size: 19px; margin-bottom: 16px; }
+.onprem h2 span { font-size: 14px; margin-left: 12px; color: var(--ink-2); }
+.onprem-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; min-width: 0; }
+.onprem-panel p + p { margin-top: 8px; }
+.onprem-components { display: flex; flex-wrap: wrap; padding: 0; list-style: none; gap: 12px 28px; margin-bottom: 16px; }
+.onprem-components li { display: grid; gap: 2px; }
+.onprem-components span { color: var(--ink-2); }
+.onprem-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 24px; margin-bottom: 16px; }
+.onprem-fields label { display: grid; gap: 6px; }
+.onprem-fields input, .onprem-fields select, .onprem-fields textarea { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); }
+.onprem textarea { min-height: 80px; resize: vertical; }
+.onprem button { margin-top: 16px; }
+.onprem button:focus-visible, .onprem input:focus-visible, .onprem select:focus-visible, .onprem textarea:focus-visible, .onprem summary:focus-visible { outline: 3px solid var(--marking-ink); outline-offset: 3px; }
+.onprem-error { color: var(--fail); padding: 16px; border: 1px solid var(--fail); border-radius: 6px; overflow-wrap: anywhere; }
+.onprem details { margin: 16px 0; min-width: 0; }
+.onprem summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
+.onprem .code { max-height: 360px; overflow: auto; }
+.onprem-identity { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.onprem-consent { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; }
+.onprem-consent input { margin-top: 4px; }
+.onprem dl > div { display: grid; grid-template-columns: minmax(120px, 1fr) 3fr; gap: 16px; }
+.onprem dd { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .onprem-main { padding: 24px 16px 48px; gap: 16px; }
+  .onprem-panel { padding: 16px; }
+  .onprem-fields { grid-template-columns: 1fr; }
+  .onprem h1 { font-size: 24px; }
+  .onprem-header > div { padding: 14px 16px; gap: 12px; flex-wrap: wrap; }
+}

@@ -125,6 +125,20 @@ jobs:
         env:
           VITE_USE_MOCK: 'false'
         run: npm run build --prefix front
+      - name: on-prem 전용 화면 준비·승인 회귀 (HTTP 대역, Docker 배포 아님)
+        env:
+          VITE_USE_MOCK: 'false'
+        run: |
+          node front/node_modules/vite/bin/vite.js front --host 127.0.0.1 --port 15173 --strictPort > "$RUNNER_TEMP/onprem-front.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --max-time 2 http://127.0.0.1:15173/onprem > /dev/null; then ready=true; break; fi
+            sleep 0.2
+          done
+          test "$ready" = true
+          node scripts/ci/test_onprem_front.mjs --url http://127.0.0.1:15173
 
   back:
     name: Platform backend (API smoke and MySQL contracts)
@@ -148,6 +162,11 @@ jobs:
         run: python scripts/ci/test_platform_back.py
       - name: 비밀 마스킹 회귀 검사
         run: python -m unittest discover -s scripts/ci -p 'test_platform_back_secrets.py' -v
+      - name: on-prem 실행기·진행 관측·준비 상태 회귀 (외부 배포 없음)
+        run: |
+          python -m unittest discover -s scripts -p 'test_onprem_*.py' -v
+          PYTHONPATH=back python -m unittest discover -s back/tests -p 'test_onprem_readiness.py' -v
+          bash -n scripts/run_onprem.sh
       - name: 격리 MySQL·마이그레이션 재실행·롤백 API 계약
         run: bash scripts/ci/run_platform_stack.sh
 

@@ -65,13 +65,17 @@ python3 scripts/ci/check_pr_report.py --body-file /path/to/pr-body.md
 | `CI coverage` | 항상 | 파일 계약·검사 판정·실패 진단의 회귀 테스트 | 플랫폼 동작 |
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
-| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, `node scripts/ci/test_platform_front.mjs`의 승인 파일 어댑터 회귀(HTTP 대역), TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
-| `Platform backend (API smoke and MySQL contracts)` | `back/` 구현 존재 | `.python-version`·requirements 기반 설치, 문법·DB 없는 smoke, 마스킹 회귀, 백엔드 Docker 빌드, 격리 MySQL 8.4 migration·재실행, 첫 실패 롤백 차단, 새 plan/diff 승인·claim, 오래된 승인·동시 등록 차단, 실제 API의 비밀 저장 거부·로그 마스킹 | 프런트 연동, LLM·AWS Terraform/ECS 실행, 업로드 앱 이미지 빌드 |
+| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, `node scripts/ci/test_platform_front.mjs`의 승인 파일·on-prem immutable 승인 어댑터 회귀(HTTP 대역), TypeScript/Vite의 MOCK·실제 API 설정 빌드, Chrome의 on-prem 준비 실패·입력 보존·승인·조회 회귀 | 실제 API/분석/승인/배포 흐름 |
+| `Platform backend (API smoke and MySQL contracts)` | `back/` 구현 존재 | `.python-version`·requirements 기반 설치, 문법·DB 없는 smoke, 마스킹 회귀, on-prem 실행기·진행 관측·readiness 단위 검사, 백엔드 Docker 빌드, 격리 MySQL 8.4 migration·재실행, 기존 API의 on-prem 미설정 응답, 첫 실패 롤백 차단, 새 plan/diff 승인·claim, 오래된 승인·동시 등록 차단, 실제 API의 비밀 저장 거부·로그 마스킹 | 프런트 연동, LLM·AWS Terraform/ECS 실행, 업로드 앱 이미지 빌드 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
 10/10 확인한 main `432a52e`에는 샘플 프런트와 [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4)의 샘플 백엔드가 있다. 플랫폼 백엔드는 [PR #10](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/10) `147ad5e`, 인프라·플랫폼 프런트는 [#6](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/6)·[#7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7)의 파일 계약에 맞춘 조건부 검사다. 각 PR이 변경된 CI를 반영하면 해당 구현이 있는 검사만 활성화된다. 열린 PR 코드를 CI가 별도로 가져오거나 자동으로 합치지 않는다.
 
 PR #10에서 실패했던 `back/` 존재 자체의 차단 가드는 제거하고 위의 기본 검사를 연결했다. 아직 없는 프런트·LLM·배포 worker 완성을 요구하지 않는다. 단, DB 없는 smoke는 DB 준비나 실제 배포가 된다는 증거가 아니며 결과 요약에도 이 제한을 표시한다.
+
+### on-prem 전용 서비스 검사
+
+[실행 안내](ONPREM.md)와 [경계 테스트](../tests/edge_case/onprem-service.md)를 따른다. `test_onprem_front.mjs`는 실제 Docker 성공을 흉내 내는 HTTP 대역 회귀다. 실제 샘플 배포는 새 실행기와 `test_onprem_deploy.mjs`, 최종 URL의 `test_sample_front.mjs --mode real`을 별도로 실행해야 한다. 원격 서버·HTTPS·AWS·유료 LLM 검증은 이 경로의 범위가 아니다. 기존 AWS 화면을 바꾸거나 기존 AWS CI 판정을 전체 배포 성공으로 확대하지 않는다.
 
 `infra/scripts/test_infra.py --skip-aws` 전체를 CI에 연결하지 않았다. 확인한 버전은 foundation 실조회만 건너뛰고 다른 plan은 일반 AWS provider를 사용한다. 인증 없는 환경의 전체 회귀 검사라는 근거가 부족하다. 격리된 provider mock을 갖춘 뒤 별도 검사로 추가한다.
 

@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 // A single owned Chrome process and tab; no npm/browser driver dependency.
-export async function launchBrowser() {
+export async function launchBrowser({ timeoutMs = 120000 } = {}) {
   const profile = await mkdtemp(join(tmpdir(), 'launchpad-ci-'));
   let child;
   let socket;
@@ -23,7 +23,7 @@ export async function launchBrowser() {
   const terminate = () => { void stop('Browser smoke interrupted (SIGTERM)', 143); };
   process.once('SIGINT', interrupt);
   process.once('SIGTERM', terminate);
-  const overallDeadline = setTimeout(() => { void stop('Browser smoke exceeded 120 seconds', 1); }, 120000);
+  const overallDeadline = setTimeout(() => { void stop(`Browser smoke exceeded ${timeoutMs / 1000} seconds`, 1); }, timeoutMs);
   function close() {
     closing ??= cleanup();
     return closing;
