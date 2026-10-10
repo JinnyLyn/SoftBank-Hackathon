@@ -312,28 +312,39 @@ def app_config_from_analysis(result, tier, tier_cfg=None):
     return app, dockerfile
 
 
-def scale_from_analysis(result):
-    """사용 규모·예산. 백엔드 API에 받는 곳이 없어서 분석 결과의 scale 필드에서 읽는다(없으면 기본값)."""
+def scale_from_analysis(result, project=None):
+    """사용 규모·예산을 (expected_users, traffic_pattern, monthly_budget_usd)로 돌려준다.
+
+    프로젝트 API의 값(사용자가 프로젝트를 등록할 때 입력해 백엔드가 저장한 ProjectOut.expected_users·traffic_pattern·monthly_budget_usd)을
+    우선 읽고, 프로젝트에 값이 없을 때만 분석 결과의 scale 필드(백엔드에 저장 필드가 없던 때의 호환용)에서 읽는다. 항목마다 따로 대체한다.
+    둘 다 없으면 기본값(None)이다. 분석기가 프로젝트 값을 scale에 복사해 주지 않아도 사용자가 입력한 예산이 적용돼야 한다."""
     s = result.get("scale") if isinstance(result, dict) else None
     s = s if isinstance(s, dict) else {}
-    # 분석 결과는 외부 모듈이 만든 값이라 타입을 믿지 않는다. 리스트·객체가 들어오면 cost.recommend의 딕셔너리 조회가
+    p = project if isinstance(project, dict) else {}
+
+    def pick(key):
+        """(값, 오류 문구에 쓸 출처). 프로젝트 값이 None이 아니면 그것을, 아니면 분석 결과의 scale 값을 쓴다."""
+        return (p[key], f"프로젝트 {key}") if p.get(key) is not None else (s.get(key), f"scale.{key}")
+
+    # 프로젝트 값도 분석 결과의 값도 타입을 믿지 않는다. 리스트·객체가 들어오면 cost.recommend의 딕셔너리 조회가
     # 처리되지 않은 TypeError를 내서 worker 전체가 멈췄다(프로젝트 하나의 잘못된 입력은 그 프로젝트의 오류로만 처리한다)
-    users, pattern = s.get("expected_users"), s.get("traffic_pattern")
-    for name, value in (("expected_users", users), ("traffic_pattern", pattern)):
+    users, users_src = pick("expected_users")
+    pattern, pattern_src = pick("traffic_pattern")
+    for src, value in ((users_src, users), (pattern_src, pattern)):
         if value is not None and not isinstance(value, str):
-            raise PlanError(f"scale.{name}는 문자열이어야 합니다: {type(value).__name__}")
-    budget = s.get("monthly_budget_usd")
+            raise PlanError(f"{src}는 문자열이어야 합니다: {type(value).__name__}")
+    budget, src = pick("monthly_budget_usd")
     if budget is not None:
         if isinstance(budget, bool):   # float(True) == 1.0 이라 숫자처럼 통과해 버린다
-            raise PlanError("scale.monthly_budget_usd가 숫자가 아닙니다: bool")
+            raise PlanError(f"{src}가 숫자가 아닙니다: bool")
         try:
-            budget = float(budget)
+            budget = float(budget)   # 프로젝트 API는 예산을 "30.0000" 같은 문자열로 돌려준다
         except (TypeError, ValueError):
-            raise PlanError(f"scale.monthly_budget_usd가 숫자가 아닙니다: {type(budget).__name__}") from None
+            raise PlanError(f"{src}가 숫자가 아닙니다: {type(budget).__name__}") from None
         if not math.isfinite(budget):   # NaN·inf는 예산 비교를 모두 거짓으로 만든다
-            raise PlanError("scale.monthly_budget_usd는 유한한 숫자여야 합니다")
+            raise PlanError(f"{src}는 유한한 숫자여야 합니다")
         if budget < 0:
-            raise PlanError("scale.monthly_budget_usd는 0 이상이어야 합니다")
+            raise PlanError(f"{src}는 0 이상이어야 합니다")
     return users, pattern, budget
 
 
@@ -497,7 +508,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     if not isinstance(src_sha, str) or not SHA256_RE.match(src_sha):
         raise PlanError("프로젝트의 source_sha256을 읽지 못했습니다(승인한 소스를 배포 직전에 확인하려면 필요합니다)")
     result = analysis.get("result", {})
-    users, pattern, budget = scale_from_analysis(result)   # 입력 검증을 먼저 한다(잘못된 입력에 deploy.sh를 부르지 않는다)
+    users, pattern, budget = scale_from_analysis(result, project)   # 입력 검증을 먼저 한다(잘못된 입력에 deploy.sh를 부르지 않는다)
     app_config_from_analysis(result, "lean")   # 앱 설정도 검증만 먼저 한다. 단계별 크기는 아래에서 고른 단계로 다시 정한다
     env = child_env(cfg)
     foundation = fetch_foundation(cfg, env)   # 비용을 확정하기 전에 최신 foundation 구성을 읽는다

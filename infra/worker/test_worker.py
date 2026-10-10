@@ -743,6 +743,58 @@ class PlannerTests(Base):
         self.assertEqual(body["variables"]["app"]["max_tasks"], 14)   # 할당량으로 줄이지 않는다
         self.assertIn("할당량 확인을 건너뜀", body["summary"])
 
+    def plan_with_project(self, project_fields, scale=None):
+        """분석 결과의 scale을 바꿔 프로젝트 API 필드(project_fields)와의 우선순위를 시험한다. scale을 주지 않으면(None) 분석 결과에서 scale을 뺀다."""
+        res = json.loads(json.dumps(GOOD_RESULT))
+        if scale is None:
+            del res["scale"]
+        else:
+            res["scale"] = scale
+        return worker.plan_project(self.api, self.cfg, {**PROJECT, **project_fields}, self.analysis(res))
+
+    def test_project_api_fields_are_used_when_the_analysis_has_no_scale(self):
+        # 분석기가 프로젝트 입력을 scale에 복사하지 않아도 사용자가 프로젝트에 입력한 월 예산이 적용돼야 한다.
+        # 백엔드는 예산을 "120.0000" 같은 문자열로 돌려준다
+        self.plan_with_project({"expected_users": "~10,000", "traffic_pattern": "steady", "monthly_budget_usd": "120.0000"})
+        v = self.backend.created_plans[0]["variables"]
+        self.assertEqual(v["cost"]["budget_usd"], 120.0)
+        self.assertLessEqual(v["cost"]["peak_monthly"], 120)
+        self.assertEqual((v["tier"], v["app"]["max_tasks"]), ("balanced", 1))   # roomy(약 $200)는 예산을 넘어 낮췄다. 예산을 무시했다면 roomy 프리셋이었다
+        self.assertIn("월 예산 $120.00 이내", self.backend.created_plans[0]["summary"])
+
+    def test_project_api_fields_win_over_the_analysis_scale_per_field(self):
+        # 분석 scale은 월 $120, ~1,000명. 프로젝트는 예산만 $100을 입력했다 → 예산은 프로젝트 값, 사용자 수는 분석 값으로 대체한다
+        self.plan_with_project({"monthly_budget_usd": "100.0000", "expected_users": None, "traffic_pattern": None},
+                               scale={"expected_users": "~1,000", "traffic_pattern": "steady", "monthly_budget_usd": 120})
+        v = self.backend.created_plans[0]["variables"]
+        self.assertEqual(v["cost"]["budget_usd"], 100.0)
+        self.assertEqual([o["tier"] for o in v["options"]], ["lean"])   # $100에는 최저 안만 들어간다(권장 안은 $106.87)
+        self.assertIn("~1,000명", v["reason"])
+
+    def test_analysis_scale_is_the_fallback_when_the_project_has_no_values(self):
+        # 프로젝트 값이 모두 비어 있으면 분석 결과의 scale(GOOD_RESULT: 월 $120)을 쓴다
+        self.plan_with_project({"monthly_budget_usd": None, "expected_users": None, "traffic_pattern": None}, scale=dict(GOOD_RESULT["scale"]))
+        self.assertEqual(self.backend.created_plans[0]["variables"]["cost"]["budget_usd"], 120.0)
+
+    def test_scale_priority_unit(self):
+        sa = worker.scale_from_analysis
+        self.assertEqual(sa({}, {"expected_users": "~100", "traffic_pattern": "peak", "monthly_budget_usd": "30.0000"}), ("~100", "peak", 30.0))
+        self.assertEqual(sa({"scale": {"expected_users": "~1,000", "monthly_budget_usd": 120}},
+                            {"expected_users": "~100", "traffic_pattern": None, "monthly_budget_usd": None}), ("~100", None, 120.0))
+        self.assertEqual(sa({"scale": {"monthly_budget_usd": 120}}, {"monthly_budget_usd": "0.0000"})[2], 0.0)   # 0을 입력했으면 0이 우선이다(None이 아니다)
+        self.assertEqual(sa({"scale": {"monthly_budget_usd": 120}}, None)[2], 120.0)   # project를 안 주는 호출은 이전과 같다
+        self.assertEqual(sa({}, {}), (None, None, None))
+
+    def test_invalid_project_values_are_plan_errors_that_name_the_project_field(self):
+        for key, bad in [("monthly_budget_usd", "abc"), ("monthly_budget_usd", True), ("monthly_budget_usd", "-1"),
+                         ("monthly_budget_usd", "nan"), ("expected_users", 123), ("traffic_pattern", [])]:
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(worker.PlanError) as cm:
+                    self.plan_with_project({key: bad})
+                self.assertIn(f"프로젝트 {key}", str(cm.exception))
+        self.assertEqual(self.backend.created_plans, [])
+        self.assertEqual(self.calls(), [])   # 잘못된 입력에는 deploy.sh를 부르지 않는다
+
     def test_plan_without_budget_uses_presets_and_says_so(self):
         res = json.loads(json.dumps(GOOD_RESULT))
         del res["scale"]["monthly_budget_usd"]
