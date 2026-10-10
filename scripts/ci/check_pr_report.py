@@ -15,6 +15,14 @@ FIELDS = (
 PLACEHOLDERS = {"", "-", "—", "...", "…", "todo", "tbd", "작성 필요", "미정"}
 
 
+def is_placeholder(value):
+    value = value.strip().strip("*` ").strip()
+    # TODO.md 같은 파일명은 허용하고 TODO: 설명·TBD - 설명은 미작성으로 본다.
+    return value.casefold() in PLACEHOLDERS or bool(
+        re.match(r"^(?:todo|tbd)[*`]*(?=$|[\s:：—–-])", value, flags=re.I)
+    )
+
+
 def visible_lines(body):
     # 주석과 코드 블록에 복사된 템플릿을 실제 보고로 인정하지 않는다.
     body = re.sub(r"<!--.*?(?:-->|\Z)", "", body, flags=re.S)
@@ -83,13 +91,13 @@ def validate(body):
     for number, report in enumerate(reports, 1):
         for field in FIELDS:
             value = report.get(field, "").strip().strip("*` ").strip()
-            if value.casefold() in PLACEHOLDERS:
+            if is_placeholder(value):
                 errors.append(f"상세 보고 {number}: '{field}' 항목을 작성하세요.")
             elif field == "문서 처리":
                 treatment = re.match(r"^(이 PR에서 갱신|JinnyLyn 갱신 요청|변경 불필요)(?=\s|$|[—–:：-])(.*)$",
                                      value.replace("**", "").replace("`", ""), flags=re.S)
                 reason = treatment[2].strip(" \t\r\n—–:：-") if treatment else ""
-                if not treatment or reason.casefold() in PLACEHOLDERS or "중 선택하고" in value:
+                if not treatment or is_placeholder(reason) or "중 선택하고" in value:
                     errors.append(f"상세 보고 {number}: '문서 처리'에서 처리 방법 하나와 수정 위치·내용 또는 이유를 적으세요.")
     return errors
 

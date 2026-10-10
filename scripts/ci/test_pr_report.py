@@ -67,6 +67,31 @@ class ReportTests(unittest.TestCase):
             with self.subTest(placeholder=placeholder):
                 self.assertTrue(validate(YES.replace("사용자 요청", placeholder)))
 
+    def test_leading_todo_or_tbd_cannot_fill_any_detail(self):
+        placeholders = ("TODO: 추후 작성", "TBD - 담당자 확인", "todo： 추후 작성",
+                        "TbD—담당자 확인", "**TODO**: 추후 작성", "`TBD` - 담당자 확인",
+                        "\n  TODO: 추후 작성", "TODO\n담당자 확인")
+        for line in DETAILS.splitlines():
+            label, _ = line.split(":", 1)
+            for placeholder in placeholders:
+                with self.subTest(field=label, placeholder=placeholder):
+                    self.assertTrue(validate(YES.replace(line, label + ": " + placeholder)))
+
+    def test_document_treatment_reason_rejects_leading_placeholder(self):
+        original = "이 PR에서 갱신 — WORKFLOW.md와 docs/CI.md에 실행 방법 반영"
+        for treatment in ("이 PR에서 갱신", "JinnyLyn 갱신 요청", "변경 불필요"):
+            for placeholder in ("TODO: 추후 작성", "TBD - 담당자 확인", "**TODO**: 추후 작성"):
+                with self.subTest(treatment=treatment, placeholder=placeholder):
+                    self.assertTrue(validate(YES.replace(original, treatment + " — " + placeholder)))
+
+    def test_placeholder_mentions_and_similar_filenames_remain_valid(self):
+        for explanation in ("기존 TODO 항목을 해결한 변경", "TODO.md의 실행 방법 수정",
+                            "TODOS 목록 정리", "TBD_POLICY 설정 변경", "미정: API 담당자 확인이 필요함"):
+            with self.subTest(explanation=explanation):
+                self.assertEqual(validate(YES.replace("사용자 요청", explanation)), [])
+                original = "이 PR에서 갱신 — WORKFLOW.md와 docs/CI.md에 실행 방법 반영"
+                self.assertEqual(validate(YES.replace(original, "이 PR에서 갱신 — " + explanation)), [])
+
     def test_each_repeated_report_must_be_complete(self):
         self.assertEqual(validate(YES + "\n" + DETAILS), [])
         incomplete = DETAILS.replace("- 문서 처리: 이 PR에서 갱신 — WORKFLOW.md와 docs/CI.md에 실행 방법 반영\n", "")
