@@ -140,6 +140,30 @@ class DraftTests(unittest.TestCase):
                     self.assertIsNone(analysis.health_check_path)
                     self.assertIn("basePath", analysis.unresolved["health_check_path"])
 
+    def test_next_config_without_routing_keeps_file_route(self):
+        # 헤더·트랜스파일 같은 설정만 있으면 주소가 바뀌지 않음 → 파일 경로로 정함
+        pkg = json.dumps({"dependencies": {"next": "^15"}, "scripts": {"start": "next start"}})
+        config = ('import type { NextConfig } from "next";\nconst nextConfig: NextConfig = {\n  transpilePackages: ["@x/shared"],\n'
+                  '  async headers() { return [{ source: "/(.*)", headers: [] }]; },\n};\nexport default nextConfig;\n')
+        a = analyze_files(files(**{"apps/web/package.json": pkg, "apps/web/next.config.ts": config, "apps/web/src/app/page.tsx": "x\n"}))
+        self.assertEqual(a.health_check_path, "/")
+        self.assertNotIn("health_check_path", a.unresolved)
+
+    def test_next_routing_that_may_move_paths_stays_unresolved(self):
+        pkg = json.dumps({"dependencies": {"next": "^15"}, "scripts": {"start": "next start"}})
+        cases = {
+            "rewrites": {"next.config.js": "module.exports = { async rewrites() { return [] } }\n"},
+            "local import": {"next.config.mjs": "import base from './config/base.mjs'\nexport default base\n"},
+            "spread": {"next.config.js": "const shared = require('@x/config')\nmodule.exports = { ...shared }\n"},
+            "plugin wrapper": {"next.config.mjs": "import withIntl from 'next-intl/plugin'\nexport default withIntl()({})\n"},
+            "middleware": {"next.config.js": "module.exports = {}\n", "src/middleware.ts": "export function middleware() {}\n"},
+        }
+        for name, extra in cases.items():
+            with self.subTest(name=name):
+                a = analyze_files(files(**{"package.json": pkg, "app/page.tsx": "x\n", **extra}))
+                self.assertIsNone(a.health_check_path)
+                self.assertIn("basePath", a.unresolved["health_check_path"])
+
     def test_next_health_path_from_file_routes(self):
         pkg = json.dumps({"private": True, "dependencies": {"next": "^15"}, "scripts": {"build": "next build", "start": "next start"}})
         app_router = analyze_files(files(**{"package.json": pkg, "src/app/page.tsx": "export default function P() {}\n"}))

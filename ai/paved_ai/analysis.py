@@ -377,12 +377,33 @@ _NEXT_ROUTES = [
 ]
 
 
+# 설정·미들웨어가 주소를 바꿀 수 있는 경우. 이때는 파일 경로만으로 헬스체크 URL을 확정하지 않는다
+_NEXT_ROUTING = re.compile(r"\b(basePath|rewrites|redirects|i18n)\b")
+# 다른 파일의 설정을 가져오거나 플러그인으로 감싸면 그 안에서 basePath 등을 넣을 수 있어 내용을 다 볼 수 없음
+_NEXT_INDIRECT = re.compile(r"""require\(\s*['"]\.|\bfrom\s+['"]\.|\.\.\.\s*[A-Za-z_$]|(?:export\s+default|module\.exports\s*=)\s*[A-Za-z_$][\w$.]*\s*\(""")
+_NEXT_MIDDLEWARE = re.compile(r"(^|/)(src/)?middleware\.(t|j)s$")
+
+
+def _next_routing_unclear(repo: Repo) -> Optional[Tuple[SourceFile, int]]:
+    """주소를 바꿀 수 있는 설정·미들웨어가 있으면 그 파일과 줄 번호"""
+    for f in repo.named("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"):
+        for n, line in enumerate(f.text.splitlines(), 1):
+            if _NEXT_ROUTING.search(line) or _NEXT_INDIRECT.search(line):
+                return f, n
+    m = next((x for x in repo.files if _NEXT_MIDDLEWARE.search(x.path)), None)
+    return (m, 1) if m else None
+
+
 def _next_health(a: Analysis, repo: Repo) -> bool:
-    configs = repo.named("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts")
-    if configs:
-        # 실행 가능한 설정에는 basePath·rewrite·외부 설정이 있을 수 있다. 파일 경로만으로 URL을 확정하지 않는다.
-        a.unresolved["health_check_path"] = "Next.js 설정이 있어 basePath 등 실제 라우팅을 확인해야 합니다. 파일 경로만으로 헬스체크 URL을 확정하지 않습니다."
-        a.evidence.append(Evidence(configs[0].path, 1, configs[0].text.splitlines()[0] if configs[0].text else ""))
+    unclear = _next_routing_unclear(repo)
+    if unclear:
+        f, n = unclear
+        a.unresolved["health_check_path"] = (
+            f"Next.js 설정·미들웨어({f.path}:{n})가 주소를 바꿀 수 있어 basePath 등 실제 라우팅을 확인해야 합니다. "
+            "파일 경로만으로 헬스체크 URL을 확정하지 않습니다."
+        )
+        lines = f.text.splitlines()
+        a.evidence.append(Evidence(f.path, n, lines[n - 1].strip() if len(lines) >= n else ""))
         return True
     for path, pattern in _NEXT_ROUTES:
         f = next((x for x in sorted(repo.files, key=lambda x: (x.path.count("/"), x.path)) if pattern.search(x.path)), None)
