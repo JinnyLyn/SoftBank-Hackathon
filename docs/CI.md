@@ -28,7 +28,7 @@
 
 ### PR 보고 검사
 
-`Team Git Guard`의 `Git guard (ubuntu-latest)`·`Git guard (windows-latest)`에 PR 보고 검사를 포함한다. 기존 필수 check를 사용하므로 새 필수 검사 이름을 서버에 등록할 필요는 없다. 이 워크플로가 반영된 main을 기준으로 사용하며, 기존 PR도 최신 main과 동기화하고 보고 항목을 채운다.
+`Team Git Guard`의 `Git guard (ubuntu-latest)`·`Git guard (windows-latest)`에 PR 보고 검사를 포함한다. 2026-10-10 재조회한 서버 필수 check는 `Available app checks` 하나이며, Git guard 두 작업은 서버 필수 목록에 없다([현재 설정](GITHUB_SETUP.md)). 머지 담당자는 두 작업의 최신 실행 성공을 직접 확인하고 실패·진행 중·미실행이면 머지하지 않는다. `Available app checks` 성공이나 GitHub의 머지 가능 상태가 보고 검사 성공을 대신하지 않는다. 이 워크플로가 반영된 main을 기준으로 사용하며, 기존 PR도 최신 main과 동기화하고 보고 항목을 채운다.
 
 - main 대상 PR의 생성·본문/제목 수정·추가 push·재오픈에 실행한다(`opened`, `edited`, `synchronize`, `reopened`). 본문 수정은 이 워크플로를 재실행하며 앱 빌드 전체를 재실행하지 않는다. 같은 PR의 이전 실행은 취소하고 최신 실행을 판정한다.
 - 템플릿의 필수 제목이 하나 있고 `해당 없음`·`해당 있음` 중 하나만 체크됐는지 확인한다. `해당 있음`은 항목마다 관련 기준, 실제 변경, 이유, 영향, 문서 처리, 미결 사항을 작성해야 한다. 빈칸·TODO·TBD·이유 없는 `미정`은 실패한다. `TODO: 추후 작성`, `TBD - 담당자 확인`처럼 뒤에 설명을 붙인 미작성 표시도 상세 항목과 문서 처리 사유에서 거부한다. `해당 없음`이면 상세 항목은 남기거나 삭제할 수 있다.
