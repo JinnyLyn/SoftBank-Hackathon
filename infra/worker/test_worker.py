@@ -67,7 +67,8 @@ case "${FAKE_AWS_MODE:-ok}" in
   ok) echo "${FAKE_AWS_ARN:-arn:aws:sts::123456789012:assumed-role/PavedCloudsReadOnlyRole/paved-clouds-verify}" ;;
   denied) echo "An error occurred (AccessDenied) when calling the AssumeRole operation: User: arn:aws:iam::999999999999:user/operator is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole" >&2; exit 254 ;;
   expired) echo "An error occurred (ExpiredToken) when calling the AssumeRole operation: The security token included in the request is expired" >&2; exit 254 ;;
-  hang) sleep 30 ;;
+  invalid) echo "An error occurred (ValidationError) when calling the AssumeRole operation: 1 validation error detected" >&2; exit 254 ;;
+  hang) exec sleep 30 ;;
 esac
 '''
 
@@ -95,6 +96,7 @@ class FakeBackend:
         self.conn_posts = []          # (경로, 본문, X-Worker-Token) — 연결 complete·fail 보고
         self.conn_post_code = 200     # complete·fail 보고에 돌려줄 코드
         self.conn_post_failures = 0   # 앞으로 몇 번의 연결 보고를 503으로 거절할지
+        self.order = []               # worker 경로 호출 순서: "claim", "event", "pending", "conn"
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -117,6 +119,7 @@ class FakeBackend:
                 outer.headers_seen.append((self.path, self.headers.get("X-Worker-Token")))
                 p = self.path
                 if p == "/api/worker/connections/pending":
+                    outer.order.append("pending")
                     if self.headers.get("X-Worker-Token") != TOKEN:
                         return self._send(401, {"error": "인증 실패"})
                     if outer.pending_status != 200:
@@ -171,9 +174,11 @@ class FakeBackend:
                     if outer.conn_post_failures > 0:
                         outer.conn_post_failures -= 1
                         return self._send(503, {"error": "일시 오류"})
+                    outer.order.append("conn")
                     outer.conn_posts.append((p, json.loads(body), self.headers.get("X-Worker-Token")))
                     return self._send(outer.conn_post_code, {})
                 if p == "/api/worker/deployments/claim":
+                    outer.order.append("claim")
                     if self.headers.get("X-Worker-Token") != TOKEN:
                         return self._send(401, {"error": "인증 실패"})
                     return self._send(200, {"job": outer.claims.pop(0) if outer.claims else None})
@@ -181,6 +186,7 @@ class FakeBackend:
                     if outer.event_failures > 0:
                         outer.event_failures -= 1
                         return self._send(503, {"error": "일시 오류"})
+                    outer.order.append("event")
                     outer.events.append((p.split("/")[4], json.loads(body)))
                     return self._send(200, {})
                 return self._send(404, {"error": "없음"})
@@ -1021,6 +1027,7 @@ class ConnectionTests(Base):
 
     def test_denied_role_is_retried_then_fails_with_a_message_that_leaks_nothing(self):
         os.environ["FAKE_AWS_MODE"] = "denied"
+        self.state.assume_proven = True   # worker 권한이 증명된 뒤라면 AccessDenied는 사용자 쪽 거부다(증명 전의 동작은 아래 시험)
         self.state.conn_max_tries = 3
         self.check()
         self.check()
@@ -1103,9 +1110,81 @@ class ConnectionTests(Base):
         self.assertEqual([e[1]["status"] for e in self.backend.events], ["deploying", "healthy"])
         self.assertTrue(self.state.conn_warned)
 
-    def test_tick_checks_connections_before_claiming_a_job(self):
-        self.assertFalse(worker.tick(self.api, self.cfg, self.state))
+    def test_deployments_are_claimed_and_run_before_connections_are_checked(self):
+        # 연결 확인은 호환용이라 승인된 배포를 기다리게 하면 안 된다
+        ex = ExecutorTests("test_success_reports_deploying_then_healthy_with_url")
+        ex.tmp, ex.cfg = self.tmp, self.cfg
+        self.backend.claims.append(ExecutorTests.make_job(ex))
+        self.assertTrue(worker.tick(self.api, self.cfg, self.state))
+        order = self.backend.order
+        self.assertEqual(order[0], "claim")
+        self.assertGreater(order.index("pending"), max(i for i, o in enumerate(order) if o == "event"))
         self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/complete"])
+
+    def test_idle_tick_still_checks_connections(self):
+        self.assertFalse(worker.tick(self.api, self.cfg, self.state))
+        self.assertEqual(self.backend.order[:2], ["claim", "pending"])
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/complete"])
+
+    def test_access_denied_is_not_a_user_failure_until_assume_role_has_succeeded(self):
+        # AccessDenied는 사용자 스택의 문제일 수도, worker 주체의 sts:AssumeRole 권한 누락일 수도 있다. 권한이 증명되기 전에는 사용자 연결을 실패로 확정하지 않는다
+        os.environ["FAKE_AWS_MODE"] = "denied"
+        self.state.conn_max_tries = 2
+        for _ in range(6):
+            self.check()
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.state.conn_tries[CID][0], 0)   # 횟수도 올리지 않는다
+        self.assertIn(CID, self.state.conn_warned_ids)       # 대신 운영자가 볼 로그를 남긴다(연결마다 한 번)
+        self.assertFalse(self.state.assume_proven)
+        # 다른 연결의 AssumeRole이 성공하면 worker 권한이 증명된다
+        other = "33333333-3333-3333-3333-333333333333"
+        self.backend.connections = [pending_conn(id=other)]
+        os.environ["FAKE_AWS_MODE"] = "ok"
+        os.environ["FAKE_AWS_ARN"] = "arn:aws:sts::123456789012:assumed-role/PavedCloudsReadOnlyRole/paved-clouds-verify"
+        self.check()
+        self.assertTrue(self.state.assume_proven)
+        # 이제 같은 AccessDenied는 사용자 쪽 거부라 횟수를 세고, 이어지면 실패로 보고한다
+        self.backend.connections = [pending_conn()]
+        os.environ["FAKE_AWS_MODE"] = "denied"
+        self.check()
+        self.assertEqual(self.state.conn_tries[CID][0], 1)
+        self.check()
+        self.assertEqual([p for p, _ in self.posts()][-1], f"/api/worker/connections/{CID}/fail")
+
+    def test_validation_errors_are_role_side_even_before_permission_is_proven(self):
+        os.environ["FAKE_AWS_MODE"] = "invalid"
+        self.state.conn_max_tries = 2
+        self.check()
+        self.check()
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/fail"])
+
+    def test_worker_side_error_retries_also_wait_between_attempts(self):
+        os.environ["FAKE_AWS_MODE"] = "expired"
+        self.state.conn_retry_after = 3600.0
+        self.check()
+        self.check()
+        self.assertEqual(len(self.aws_calls()), 1)   # 횟수가 0이어도 매 점검마다 AWS를 부르지 않는다
+
+    def test_connection_checks_have_a_time_budget_and_take_turns(self):
+        # AWS CLI가 멈춰도(연결마다 제한 시간만큼 걸림) 한 점검이 연결 수만큼 길어지면 안 된다
+        old_timeout = worker.ASSUME_ROLE_TIMEOUT
+        worker.ASSUME_ROLE_TIMEOUT = 1
+        self.addCleanup(setattr, worker, "ASSUME_ROLE_TIMEOUT", old_timeout)
+        os.environ["FAKE_AWS_MODE"] = "hang"
+        self.state.conn_budget = 1.0
+        self.state.conn_retry_after = 3600.0   # 멈춘 연결은 한동안 건너뛰어 다음 연결에 차례를 준다
+        ids = [f"4444444{i}-4444-4444-4444-444444444444" for i in range(4)]
+        self.backend.connections = [pending_conn(id=i, external_id="pc-" + str(n) * 32) for n, i in enumerate(ids)]
+        t0 = time.monotonic()
+        self.check()
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 4.0)   # 4개를 모두 기다렸다면 4초 이상이다
+        first = len(self.aws_calls())
+        self.assertTrue(1 <= first <= 2, first)
+        self.check()
+        self.check()
+        seen = {line.split("--external-id ")[1].split()[0] for line in self.aws_calls()}
+        self.assertGreater(len(seen), first)   # 다음 점검에서는 앞서 멈춘 연결을 건너뛰고 다른 연결을 확인한다
 
     def test_one_failing_connection_does_not_stop_the_others(self):
         other_id = "33333333-3333-3333-3333-333333333333"

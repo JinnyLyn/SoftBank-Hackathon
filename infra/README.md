@@ -231,7 +231,7 @@ worker ─ GET /api/worker/connections/pending ─▶ sts:AssumeRole(ExternalId)
 
 - **템플릿 호스팅**: 파일을 공개 HTTPS 주소(S3 객체 URL)에 올리고 백엔드 환경 변수 `AWS_CONNECTION_TEMPLATE_URL`로 지정한다. 백엔드의 `PLATFORM_AWS_ACCOUNT_ID`는 worker가 쓰는 **운영자 계정 ID**, `PUBLIC_API_BASE_URL`은 스택이 부를 수 있는 백엔드의 공개 HTTPS 주소다(없으면 콜백 없이 역할만 만들고 연결은 `pending`으로 남는다). 이 설정과 업로드는 운영자가 직접 한다.
 - **운영자 권한**: worker가 쓰는 AWS 자격 증명은 사용자 역할을 맡을 수 있어야 한다. 예) `sts:AssumeRole`을 `arn:aws:iam::*:role/PavedCloudsReadOnlyRole`에 허용하는 정책. 사용자 역할의 신뢰 정책은 `PlatformAccountId`의 계정과 연결별 `ExternalId`만 허용한다. 권한을 넓히거나 신뢰 정책을 바꾸는 것은 [OPERATOR_AWS.md](../docs/OPERATOR_AWS.md)의 운영자 실행 범위다.
-- **worker**: 콜백으로 역할 정보가 도착한 대기 연결만 확인한다(도착 전에는 기다린다). 확인은 `aws sts assume-role`로 하며 임시 자격 증명은 출력하지 않는다. 성공하면 `complete`, 역할 쪽 거부(`AccessDenied` 등)가 약 2분(8회) 이어지면 `fail`을 보고한다. 만료된 운영자 자격 증명이나 네트워크 오류는 사용자의 잘못이 아니므로 실패로 만들지 않고 다시 시도한다. 자세한 내용은 [worker/README.md](worker/README.md#connector-사용자-aws-연결-확인).
+- **worker**: 콜백으로 역할 정보가 도착한 대기 연결만 확인한다(도착 전에는 기다린다). 확인은 `aws sts assume-role`로 하며 임시 자격 증명은 출력하지 않는다. 성공하면 `complete`, 사용자 쪽 거부가 약 2분(8회) 이어지면 `fail`을 보고한다. `AccessDenied`는 신뢰 정책 문제와 운영자 권한 누락을 구분할 수 없어, worker에서 `AssumeRole`이 한 번이라도 성공한 뒤에만 사용자 쪽 거부로 센다(그 전에는 `fail` 없이 경고 로그만 남기고 다시 시도한다). 만료된 운영자 자격 증명이나 네트워크 오류도 실패로 만들지 않는다. 연결 확인은 배포 작업보다 뒤에, 점검당 15초 예산 안에서만 한다. 자세한 내용은 [worker/README.md](worker/README.md#connector-사용자-aws-연결-확인).
 - 이 역할은 **읽기 전용**(`ReadOnlyAccess`)이다. 사용자 계정에 앱을 배포하는 흐름(관리형 배포가 아닌 방식)은 이 템플릿 범위가 아니며, 구현하려면 권한 범위·승인 방식을 팀에서 먼저 정한다.
 - Windows의 AWS CLI로 `--template-body file://…`를 쓰면 한글 주석 때문에 `text contents could not be decoded` 오류가 난다. `AWS_CLI_FILE_ENCODING=UTF-8`을 지정한다(S3 주소로 만드는 빠른 생성 링크는 영향이 없다).
 - 틀린 ExternalId와 존재하지 않는 역할은 AWS가 같은 `AccessDenied` 문구로 응답한다. worker는 둘을 구분하지 못하고 둘 다 "역할 쪽 거부"로 센다.
@@ -305,7 +305,7 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 
 사용자 AWS 연결 확인은 가짜 `aws` CLI와 시험용 백엔드로, 연결 템플릿은 YAML 구조 검사와 내장 Lambda 코드의 로컬 실행(가짜 `cfnresponse`, 로컬 HTTP 서버)으로만 시험했다. `cfn-lint`는 돌리지 않았다.
 
-2026-10-10에 시험 계정(sa-east-1)에서 실제로 확인한 것: 템플릿으로 스택 생성(역할 `PavedCloudsReadOnlyRole`, 운영자 계정 `root` 신뢰 + `sts:ExternalId` 조건, `ReadOnlyAccess`), 콜백 Lambda를 python3.12에서 실행해 콜백 주소에 닿지 못하면 `FAILED`(`Paved Clouds callback failed: URLError`)로 응답하고 스택이 롤백되는 것, 맞는 ExternalId로 `sts assume-role`이 성공하고 틀린 ExternalId는 `AccessDenied`(종료 코드 254)인 것, `worker.py`가 실제 AWS와 로컬 Docker 백엔드(PR #23)로 연결을 `connected`(계정 ID·역할 ARN 저장)로 만들고 거부가 이어지면 `error`로 만드는 것. 시험 스택·로그 그룹은 모두 지웠다.
+2026-10-10에 시험 계정(sa-east-1)에서 실제로 확인한 것: 템플릿으로 스택 생성(역할 `PavedCloudsReadOnlyRole`, 운영자 계정 `root` 신뢰 + `sts:ExternalId` 조건, `ReadOnlyAccess`), 콜백 Lambda를 python3.12에서 실행해 콜백 주소에 닿지 못하면 `FAILED`(`Paved Clouds callback failed: URLError`)로 응답하고 스택이 롤백되는 것, 맞는 ExternalId로 `sts assume-role`이 성공하고 틀린 ExternalId는 `AccessDenied`(종료 코드 254)인 것, `worker.py`가 실제 AWS와 로컬 Docker 백엔드(PR #23)로 연결을 `connected`(계정 ID·역할 ARN 저장)로 만드는 것, 그리고 당시 코드(커밋 3cc7369)에서 거부가 이어지면 `error`로 만드는 것. 시험 스택·로그 그룹은 모두 지웠다. 이후 리뷰 지적으로 `AccessDenied`는 worker 권한이 증명된 뒤에만 `fail`로 확정하도록 바꿨고(위 worker 설명), 그 변경은 가짜 `aws`로만 시험했다 — 실제 AWS에서 다시 확인하지 않았다.
 
 **확인하지 못한 것**: 콜백 Lambda의 **성공 경로**(공개 HTTPS 수신 지점을 만들 수 없어 백엔드의 `role-callback`은 같은 본문을 직접 POST해 대신했다), 공개 S3 템플릿 주소와 콘솔 빠른 생성 링크, 공개 주소로 배포된 백엔드, 사용자 계정이 운영자 계정과 다른 교차 계정 구성(시험은 같은 계정에서 했다).
 

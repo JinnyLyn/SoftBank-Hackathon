@@ -102,19 +102,20 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 백엔드(PR #23)에는 사용자가 CloudFormation 스택으로 만든 AWS 역할을 확인하는 worker 경로가 있다([back/API.md](../../back/API.md)). 사용자 AWS 연결은 기본 제품 흐름이 아니므로([PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)) 기존 연결 화면·API와의 호환을 위한 부분이다. 템플릿과 운영자 준비는 [infra/README.md](../README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용)를 따른다.
 
-매 점검의 **맨 앞**(배포 작업을 가져오기 전)에 `GET /api/worker/connections/pending`을 읽고 연결마다 다음을 한다.
+매 점검에서 **배포 작업을 가져와 실행한 뒤**(계획 만들기 전)에 `GET /api/worker/connections/pending`을 읽고 연결마다 다음을 한다. 호환용 일이 승인된 배포를 기다리게 하지 않도록 배포가 먼저다.
 
 1. `account_id`·`role_arn`이 아직 `null`이면(CloudFormation 콜백 전) **아무것도 하지 않고 기다린다.**
 2. 역할 ARN·계정 ID·`external_id`의 형식을 백엔드와 같은 규칙으로 확인한다. 어긋나면 AWS를 부르지 않고 건너뛴다.
 3. `aws sts assume-role --role-arn … --external-id …`로 실제로 맡아 본다. 임시 자격 증명은 출력하지 않고(`--query AssumedRoleUser.Arn`) 맡은 역할의 계정이 보고된 계정과 같은지만 본다.
 4. 성공하면 `POST /api/worker/connections/{id}/complete`에 `account_id`·`role_arn`만 보낸다.
-5. **역할 쪽 거부**(`AccessDenied`·`ValidationError`·`RegionDisabledException`, 다른 계정의 역할)가 `conn_max_tries`(8회, 시도 간격 15초 ≈ 2분) 이어지면 `POST …/fail`로 보고한다. 방금 만든 역할은 IAM 전파 전에 잠깐 거부될 수 있어 바로 실패로 만들지 않는다.
-   사용자에게 보이는 오류에는 AWS 원문(운영자 계정의 IAM 주체 이름 포함)과 ExternalId를 넣지 않고 오류 코드와 역할 ARN, 확인할 곳만 적는다.
-6. **worker 쪽 문제**(만료된 자격 증명, 네트워크, CLI 없음, 60초 시간 초과)는 연결을 실패로 만들지 않고 횟수도 올리지 않는다. 복구되면 이어서 확인한다.
+5. **사용자 쪽 거부**(`ValidationError`·`RegionDisabledException`, 다른 계정의 역할, 그리고 아래 조건을 만족한 `AccessDenied`)가 `conn_max_tries`(8회, 시도 간격 15초 ≈ 2분) 이어지면 `POST …/fail`로 보고한다. 방금 만든 역할은 IAM 전파 전에 잠깐 거부될 수 있어 바로 실패로 만들지 않는다.
+   **`AccessDenied`는 worker 권한이 증명된 뒤에만 사용자 쪽 거부로 센다.** AWS는 신뢰 정책·ExternalId 불일치, 없는 역할, worker 주체의 `sts:AssumeRole` 권한 누락에 같은 `AccessDenied`를 돌려줘 구분할 수 없다. 그래서 이 프로세스에서 `AssumeRole`이 한 번이라도 성공하기 전에는 `fail`을 보내지 않고 횟수도 올리지 않으며, 연결마다 한 번 운영자가 볼 경고 로그만 남기고 계속 다시 시도한다. 올바른 스택까지 영구 오류로 만드는 것을 막기 위해서다. 대신 worker 권한이 없는 채로 잘못된 스택 하나만 있으면 그 연결은 `pending`으로 남는다(운영자가 로그로 확인한다).   사용자에게 보이는 오류에는 AWS 원문(운영자 계정의 IAM 주체 이름 포함)과 ExternalId를 넣지 않고 오류 코드와 역할 ARN, 확인할 곳만 적는다.
+6. **worker 쪽 문제**(만료된 자격 증명, 네트워크, CLI 없음, 15초 시간 초과)는 연결을 실패로 만들지 않고 횟수도 올리지 않는다. 복구되면 이어서 확인한다. 거부·오류 모두 같은 연결은 15초 간격을 두고 다시 확인한다.
+7. **시간 예산**: 한 점검에서 연결 확인에 쓰는 시간은 15초(`conn_budget`)로 묶는다. AWS CLI·네트워크가 멈춰도 연결 수만큼 배포가 밀리지 않고, 예산을 넘으면 남은 연결은 다음 점검으로 미룬다. 멈춘 연결은 재시도 간격 동안 건너뛰어 다른 연결이 차례를 얻는다.
 
 - 보고가 연결 실패·5xx면 최대 4번 다시 보내고, 4xx(저장된 콜백 값과 불일치 등)는 다시 보내도 같아서 이 프로세스에서 그 연결을 더 다루지 않는다. 사람이 백엔드의 값을 확인한다.
 - 대기 연결 목록을 읽지 못해도(연결 API가 없는 백엔드, 일시 오류) 배포 작업 가져오기와 계획 만들기는 계속한다. 처음 한 번만 로그로 알린다.
-- worker의 AWS 자격 증명은 사용자 역할에 대한 `sts:AssumeRole` 권한이 있어야 한다. 없으면 모든 연결이 역할 쪽 거부로 보여 `fail`이 된다. 운영자는 연결을 켜기 전에 `aws sts get-caller-identity`와 권한을 먼저 확인한다.
+- worker의 AWS 자격 증명은 사용자 역할에 대한 `sts:AssumeRole` 권한이 있어야 한다. 없으면 `AssumeRole`이 한 번도 성공하지 못해 모든 연결이 `pending`으로 남고 로그에 경고가 찍힌다(`fail`로 확정하지 않는다). 운영자는 연결을 켜기 전에 `aws sts get-caller-identity`와 권한을 먼저 확인한다.
 - 연결 ID·계정 ID·역할 ARN은 로그에 남지만 `external_id`와 임시 자격 증명은 남기지 않는다. 단, `aws` 명령 인자에는 `external_id`가 들어가므로 worker를 도는 PC의 프로세스 목록에서는 보인다.
 
 ## 지키는 규칙
@@ -135,6 +136,6 @@ python infra/worker/worker.py --once             # 한 번만 점검
 ## 시험
 
 ```bash
-python infra/worker/test_worker.py      # 101개(약 2.5분). 실제 AWS·Docker 없이 돈다
+python infra/worker/test_worker.py      # 106개(약 2.5분). 실제 AWS·Docker 없이 돈다
 python infra/scripts/test_infra.py      # deploy.sh와 Terraform 모듈 시험
 ```

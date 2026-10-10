@@ -56,10 +56,13 @@ ASSUMED_ARN_RE = re.compile(rf"^arn:(aws|aws-us-gov|aws-cn):sts::(\d{{12}}):assu
 EXTERNAL_ID_RE = re.compile(r"^pc-[0-9a-f]{32}\Z")
 ACCOUNT_ID_RE = re.compile(r"^\d{12}\Z")
 AWS_ERROR_RE = re.compile(r"An error occurred \((\w+)\) when calling the AssumeRole operation")
-# 역할 쪽 문제로 볼 오류 코드(신뢰 정책·ExternalId 불일치, 없는 역할, 비활성 리전). 그 밖의 오류(만료된 자격 증명·네트워크)는 worker 쪽 문제라 연결을 실패로 만들지 않는다
-ROLE_SIDE_ERRORS = {"AccessDenied", "ValidationError", "RegionDisabledException"}
+# 역할 쪽 문제로 볼 오류 코드(잘못된 요청, 비활성 리전). 그 밖의 오류(만료된 자격 증명·네트워크)는 worker 쪽 문제라 연결을 실패로 만들지 않는다
+ROLE_SIDE_ERRORS = {"ValidationError", "RegionDisabledException"}
+# AWS는 신뢰 정책·ExternalId 불일치, 없는 역할, worker 주체의 sts:AssumeRole 권한 누락에 같은 AccessDenied를 돌려준다. 구분할 수 없어서
+# 이 프로세스에서 AssumeRole이 한 번이라도 성공한 뒤(= worker 권한이 증명된 뒤)에만 사용자 쪽 거부로 센다
+AMBIGUOUS_ERRORS = {"AccessDenied"}
 VERIFY_SESSION_NAME = "paved-clouds-verify"
-ASSUME_ROLE_TIMEOUT = 60   # 초. 시험에서는 줄인다
+ASSUME_ROLE_TIMEOUT = 15   # 초. aws sts assume-role 한 번의 제한 시간. 시험에서는 줄인다
 # 로그를 백엔드로 보내기 전에 한 번 더 가린다(백엔드도 가리지만 호출 측에서도 비밀을 보내지 않아야 한다)
 REDACT_RES = [
     re.compile(r"(?i)\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -643,9 +646,11 @@ def post_retry(api, path, body):
 def check_role(cfg, env, role_arn, external_id, account_id):
     """사용자 역할을 실제로 AssumeRole 해 본다. (결과, 설명)을 돌려준다. 설명은 로그용이고 사용자에게 보이는 오류에는 쓰지 않는다.
 
-    결과: "ok"      역할을 맡을 수 있고, 맡은 역할이 보고된 계정의 것이다
-          "denied"  역할 쪽 문제(신뢰 정책·ExternalId 불일치, 없는 역할, 다른 계정의 역할). 방금 만든 역할은 IAM 전파 때문에 잠깐 실패할 수 있다
-          "error"   worker 쪽 문제(만료된 자격 증명, 네트워크, CLI 없음). 연결을 실패로 만들지 않는다
+    결과: "ok"         역할을 맡을 수 있고, 맡은 역할이 보고된 계정의 것이다
+          "mismatch"  역할은 맡았지만(= worker 권한이 증명됨) 맡은 역할의 계정이 보고된 계정과 다르다
+          "denied"    역할 쪽 문제로 확실한 오류(ValidationError 등). 방금 만든 역할은 IAM 전파 때문에 잠깐 실패할 수 있다
+          "ambiguous" AccessDenied. 신뢰 정책·ExternalId 불일치, 없는 역할, worker 권한 누락을 구분할 수 없다
+          "error"     worker 쪽 문제(만료된 자격 증명, 네트워크, CLI 없음). 연결을 실패로 만들지 않는다
     임시 자격 증명은 출력하지 않는다: --query 로 AssumedRoleUser.Arn 만 읽는다."""
     cmd = [*cfg.aws_cmd, "sts", "assume-role", "--role-arn", role_arn, "--role-session-name", VERIFY_SESSION_NAME,
            "--external-id", external_id, "--duration-seconds", "900", "--query", "AssumedRoleUser.Arn", "--output", "text"]
@@ -658,12 +663,13 @@ def check_role(cfg, env, role_arn, external_id, account_id):
     if rc != 0:
         m = AWS_ERROR_RE.search(err)
         code = m.group(1) if m else "unknown"
-        return ("denied" if code in ROLE_SIDE_ERRORS else "error"), f"{code}: {redact((err or out).strip())[-300:]}"
+        kind = "denied" if code in ROLE_SIDE_ERRORS else "ambiguous" if code in AMBIGUOUS_ERRORS else "error"
+        return kind, f"{code}: {redact((err or out).strip())[-300:]}"
     m = ASSUMED_ARN_RE.match(out.strip())
     if not m:
         return "error", "AssumeRole 결과의 ARN을 해석하지 못했습니다"
     if m.group(2) != account_id:
-        return "denied", f"맡은 역할의 계정({m.group(2)})이 보고된 계정과 다릅니다"
+        return "mismatch", f"맡은 역할의 계정({m.group(2)})이 보고된 계정과 다릅니다"
     return "ok", ""
 
 
@@ -679,9 +685,13 @@ def verify_connection(api, cfg, state, env, conn):
         state.conn_blocked.add(cid)
         return
     tries, last = state.conn_tries.get(cid, (0, 0.0))
-    if tries and time.time() - last < state.conn_retry_after:
-        return
+    if cid in state.conn_tries and time.time() - last < state.conn_retry_after:
+        return   # 거부·오류 어느 쪽이든 기록이 있으면 간격을 둔다(오류는 횟수가 0이어도 매 점검마다 AWS를 부르지 않는다)
     result, why = check_role(cfg, env, role_arn, external_id, account_id)
+    if result in ("ok", "mismatch"):
+        state.assume_proven = True   # AssumeRole 호출이 성공했다: worker 주체에 권한이 있다
+    if result == "ambiguous" and state.assume_proven:
+        result = "denied"
     if result == "ok":
         try:
             post_retry(api, f"/api/worker/connections/{cid}/complete", {"account_id": account_id, "role_arn": role_arn})
@@ -698,6 +708,15 @@ def verify_connection(api, cfg, state, env, conn):
     if result == "error":
         # worker 쪽 문제다. 횟수를 올리지 않아 사용자의 연결이 실패로 끝나지 않는다
         log(f"연결 {cid}: 역할을 확인하지 못했습니다(worker 환경 문제일 수 있어 다시 시도합니다): {why}")
+        state.conn_tries[cid] = (tries, time.time())
+        return
+    if result == "ambiguous":
+        # 아직 AssumeRole이 한 번도 성공하지 못했다. worker 주체의 sts:AssumeRole 권한 누락일 수 있어 사용자의 잘못으로 확정하지 않는다.
+        # 올바른 스택까지 영구 오류로 만들면 사용자가 스택을 다시 만들어야 한다. 횟수를 올리지 않고 backend에도 보고하지 않는다
+        if cid not in state.conn_warned_ids:
+            state.conn_warned_ids.add(cid)
+            log(f"연결 {cid}: AccessDenied. 이 worker의 AWS 자격 증명에 사용자 역할에 대한 sts:AssumeRole 권한이 있는지 확인하세요"
+                f"(AssumeRole이 한 번이라도 성공하기 전에는 사용자 쪽 실패로 확정하지 않고 계속 다시 시도합니다): {why}")
         state.conn_tries[cid] = (tries, time.time())
         return
     tries += 1
@@ -721,7 +740,10 @@ def verify_connection(api, cfg, state, env, conn):
 
 
 def verify_connections(api, cfg, state):
-    """백엔드의 대기 중인 AWS 연결을 확인한다. 이 일이 실패해도 배포 작업(claim·계획)은 계속한다."""
+    """백엔드의 대기 중인 AWS 연결을 확인한다. 이 일이 실패해도 배포 작업(claim·계획)은 계속한다.
+
+    한 점검에서 쓰는 시간은 state.conn_budget(기본 15초)으로 묶는다. AWS CLI·네트워크가 멈추면 연결마다 제한 시간(ASSUME_ROLE_TIMEOUT)만큼
+    걸리므로, 예산을 넘으면 남은 연결은 다음 점검으로 미룬다(멈춘 연결은 재시도 간격 동안 건너뛰어 다른 연결이 차례를 얻는다)."""
     try:
         pending = api.get("/api/worker/connections/pending") or []
     except ApiError as e:
@@ -733,14 +755,14 @@ def verify_connections(api, cfg, state):
     if not isinstance(pending, list):
         return
     env = child_env(cfg)
-    live = set()
+    live = {c["id"] for c in pending if isinstance(c, dict) and isinstance(c.get("id"), str)}   # 예산 때문에 멈춰도 기록 정리는 전체 목록 기준이다
+    start = time.monotonic()
     for conn in pending:
         cid = conn.get("id") if isinstance(conn, dict) else None
-        if not isinstance(cid, str):
+        if not isinstance(cid, str) or cid in state.conn_blocked:
             continue
-        live.add(cid)
-        if cid in state.conn_blocked:
-            continue
+        if time.monotonic() - start >= state.conn_budget:
+            break
         try:
             verify_connection(api, cfg, state, env, conn)
         except Exception as e:  # noqa: BLE001 - 연결 하나의 예상 못 한 오류가 다른 연결과 배포 작업을 멈추지 않게 한다
@@ -750,6 +772,7 @@ def verify_connections(api, cfg, state):
     for k in [k for k in state.conn_tries if k not in live]:
         del state.conn_tries[k]
     state.conn_blocked &= live
+    state.conn_warned_ids &= live
 
 
 # --- 반복 ------------------------------------------------------------------------------------------
@@ -761,11 +784,14 @@ class State:
     recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
     retry_after: float = 120.0
     max_tries: int = 3
-    conn_tries: dict = field(default_factory=dict)   # 연결 id → (AssumeRole 거부 횟수, 마지막 시도 시각)
+    conn_tries: dict = field(default_factory=dict)   # 연결 id → (사용자 쪽 거부 횟수, 마지막 시도 시각). 오류·미증명 거부는 횟수 0으로 시각만 남긴다
     conn_blocked: set = field(default_factory=set)   # 형식 오류·4xx로 이 프로세스에서 더 다루지 않는 연결
     conn_warned: bool = False                        # 대기 연결 목록 조회 실패를 이미 알렸는지
     conn_retry_after: float = 15.0                   # 같은 연결을 다시 확인하기까지의 간격(초)
-    conn_max_tries: int = 8                          # 역할 쪽 거부가 이만큼 이어지면 실패로 보고한다(약 2분)
+    conn_max_tries: int = 8                          # 사용자 쪽 거부가 이만큼 이어지면 실패로 보고한다(약 2분)
+    conn_budget: float = 15.0                        # 한 점검에서 연결 확인에 쓸 수 있는 시간(초). 넘으면 남은 연결은 다음 점검으로 미룬다
+    assume_proven: bool = False                      # 이 프로세스에서 AssumeRole이 한 번이라도 성공했는가(= worker 권한이 증명됐는가)
+    conn_warned_ids: set = field(default_factory=set)   # 권한 미증명 AccessDenied를 이미 로그로 알린 연결
 
 
 def list_projects(api, max_pages=10):
@@ -819,14 +845,14 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
 
 
 def tick(api, cfg, state, prices=None, arch="X86_64"):
-    """한 번 점검한다: 대기 중인 연결을 확인하고, 승인된 작업이 있으면 실행하고, 계획이 없는 프로젝트가 있으면 계획을 만든다.
-    연결 확인은 몇 초면 끝나므로 길게 걸리는 배포 작업보다 먼저 한다."""
-    verify_connections(api, cfg, state)
+    """한 번 점검한다: 승인된 작업이 있으면 먼저 실행하고, 대기 중인 연결을 확인하고, 계획이 없는 프로젝트가 있으면 계획을 만든다.
+    연결 확인은 기본 제품 흐름이 아닌 호환용이라 배포 작업을 가져오는 일보다 뒤에 두고, 시간 예산(state.conn_budget)을 둔다."""
     got = api.post("/api/worker/deployments/claim")
     job = (got or {}).get("job")
     if job:
         log(f"작업 시작: 배포 {job['deployment_id']}")
         execute_job(api, cfg, job)
+    verify_connections(api, cfg, state)
     plan_pending(api, cfg, state, prices, arch)
     return bool(job)
 
