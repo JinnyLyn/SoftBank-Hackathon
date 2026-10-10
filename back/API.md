@@ -196,15 +196,16 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/connections/{connection_id}/check`: 저장된 연결 상태 조회. 현재 AWS 자격 증명을 직접 호출해 실시간 검증하는 endpoint는 아닙니다.
 - `DELETE /api/connections/{connection_id}`: 연결 삭제
 
-연결 생성 결과에는 `status: "pending"`과 설정용 `setupUrl`이 포함될 수 있습니다. 공개 HTTPS 템플릿 주소는 `AWS_CONNECTION_TEMPLATE_URL`, worker의 운영자 계정 ID는 `PLATFORM_AWS_ACCOUNT_ID`, CloudFormation 콘솔 리전은 `AWS_REGION` 환경 변수로 받습니다. 현재 로컬 `back/.env`에는 운영자 계정 ID와 리전 `sa-east-1`이 설정되어 있습니다. 해당 `.env`는 Git에서 제외됩니다. 링크에는 `param_PlatformAccountId`와 연결별 `param_ExternalId`를 추가합니다.
+연결 생성 결과에는 `status: "pending"`과 설정용 `setupUrl`이 포함될 수 있습니다. 공개 HTTPS 템플릿 주소는 `AWS_CONNECTION_TEMPLATE_URL`, worker의 운영자 계정 ID는 `PLATFORM_AWS_ACCOUNT_ID`, CloudFormation 콘솔 리전은 `AWS_REGION` 환경 변수로 받습니다. `PUBLIC_API_BASE_URL`이 설정되면 연결별 `param_RoleCallbackUrl`도 CloudFormation 링크에 추가합니다. 해당 템플릿은 이 URL을 호출해 생성한 AWS 계정 ID와 IAM role ARN을 전달하도록 별도로 구현되어야 합니다. 링크에는 `param_PlatformAccountId`와 연결별 `param_ExternalId`도 추가합니다.
 
-worker 경로는 다음과 같습니다.
+CloudFormation callback과 worker 경로는 다음과 같습니다.
 
-- `GET /api/worker/connections/pending`: 인증된 worker가 대기 연결 목록(ID, `external_id`, 입력 필드)을 조회합니다.
+- `POST /api/connections/{connection_id}/role-callback`: CloudFormation 템플릿이 `{ "external_id": "...", "account_id": "12자리 계정 ID", "role_arn": "arn:aws:iam::...:role/..." }`을 전달합니다. worker token 대신 연결별 무작위 `external_id`를 capability로 검증합니다. 반복 호출은 같은 값이면 멱등이고, 다른 역할은 409입니다. 이 콜백은 ARN을 저장할 뿐 AWS 역할의 실제 유효성은 검증하지 않습니다.
+- `GET /api/worker/connections/pending`: 인증된 worker가 대기 연결 목록(ID, `external_id`, 입력 필드, 콜백으로 받은 `account_id`·`role_arn`)을 조회합니다. 콜백 전에는 두 역할 필드가 `null`이므로 worker는 역할 정보가 도착할 때까지 처리를 보류해야 합니다.
 - `POST /api/worker/connections/{connection_id}/fail`: `{ "error": "실패 원인" }`으로 실패를 보고합니다. 오류는 저장 전에 민감값을 마스킹하며 같은 실패 재시도는 멱등 처리합니다.
-- `POST /api/worker/connections/{connection_id}/complete`: `{ "account_id": "<사용자 AWS 계정 ID>", "role_arn": "arn:aws:iam::<같은 사용자 계정 ID>:role/PavedCloudsReadOnlyRole" }` 형식으로 완료를 보고합니다. 계정 ID와 IAM role ARN의 계정 부분이 일치해야 하며 값은 `connections.aws_account_id`, `connections.role_arn`에 저장됩니다. 같은 완료 재시도는 멱등 처리합니다. `PLATFORM_AWS_ACCOUNT_ID`는 이와 별개로 사용자 역할의 trust policy가 신뢰할 worker 운영 계정입니다.
+- `POST /api/worker/connections/{connection_id}/complete`: `{ "account_id": "<사용자 AWS 계정 ID>", "role_arn": "arn:aws:iam::<같은 사용자 계정 ID>:role/PavedCloudsReadOnlyRole" }` 형식으로 완료를 보고합니다. 콜백에 저장된 값과 일치해야 하며, worker는 먼저 AWS에서 AssumeRole 등 실제 검증을 수행해야 합니다. 콜백 없이 만들어진 기존 연결도 worker가 값을 직접 보고할 수 있습니다. `008` 이전부터 `connected`였고 두 역할 컬럼이 모두 `NULL`인 기존 행은 최초 한 번 완료 보고로 원자적으로 보완됩니다. 일부 값만 비어 있거나 저장된 값과 다르면 409입니다. `PLATFORM_AWS_ACCOUNT_ID`는 이와 별개로 사용자 역할의 trust policy가 신뢰할 worker 운영 계정입니다.
 
-이 API는 ARN 구문과 계정 ID만 대조하며 AWS STS로 역할 존재나 실제 권한을 검증하지 않습니다. worker가 AssumeRole/GetCallerIdentity 등 AWS 검증에 성공한 뒤 보고해야 합니다. 템플릿이 공개 HTTPS 주소에 올라가 `AWS_CONNECTION_TEMPLATE_URL`이 설정되기 전에는 setup 링크가 만들어지지 않습니다.
+백엔드는 ARN 구문과 계정 ID만 대조하며 AWS STS로 역할 존재나 실제 권한을 검증하지 않습니다. worker가 AssumeRole/GetCallerIdentity 등 AWS 검증에 성공한 뒤 완료를 보고해야 합니다. CloudFormation 템플릿이 callback parameter를 받아 역할 정보를 POST하는 기능은 인프라 템플릿 쪽 연동이 필요합니다. 템플릿이 공개 HTTPS 주소에 올라가 `AWS_CONNECTION_TEMPLATE_URL`이 설정되기 전에는 setup 링크가 만들어지지 않습니다.
 
 ## Worker 전용 API
 

@@ -120,6 +120,32 @@ def run() -> None:
 
             account_id = "123456789012"
             role_arn = f"arn:aws:iam::{account_id}:role/PavedCloudsReadOnlyRole"
+            callback_path = f"/api/connections/{connected['id']}/role-callback"
+            _call(
+                base_url, callback_path, method="POST", expected=404,
+                payload={"external_id": "pc-" + "0" * 32, "account_id": account_id, "role_arn": role_arn},
+            )
+            callback = {
+                "external_id": row["external_id"],
+                "account_id": account_id,
+                "role_arn": role_arn,
+            }
+            callback_result = _call(
+                base_url, callback_path, method="POST", payload=callback,
+            )
+            assert callback_result is not None and callback_result["roleArn"] == role_arn
+            _call(base_url, callback_path, method="POST", payload=callback)  # callback retry is idempotent
+            callback_conflict = {**callback, "role_arn": f"arn:aws:iam::{account_id}:role/Other"}
+            _call(base_url, callback_path, method="POST", expected=409, payload=callback_conflict)
+            pending = _call(base_url, "/api/worker/connections/pending", headers=worker_headers)
+            row = next(item for item in pending if item["id"] == connected["id"])
+            assert row["account_id"] == account_id and row["role_arn"] == role_arn
+
+            _call(
+                base_url, f"/api/worker/connections/{connected['id']}/complete", method="POST",
+                headers=worker_headers, expected=409,
+                payload={"account_id": account_id, "role_arn": f"arn:aws:iam::{account_id}:role/Other"},
+            )
             _call(
                 base_url, f"/api/worker/connections/{connected['id']}/complete", method="POST",
                 headers=worker_headers, expected=422,
@@ -148,6 +174,32 @@ def run() -> None:
                 payload={"account_id": account_id, "role_arn": f"arn:aws:iam::{account_id}:role/Other"},
             )
 
+            legacy = _call(
+                base_url, "/api/connections", method="POST", expected=201,
+                payload={"provider": "aws", "name": "legacy-connected-row-test", "fields": {}},
+            )
+            assert legacy is not None
+            created_ids.append(legacy["id"])
+            _call(
+                base_url, f"/api/worker/connections/{legacy['id']}/complete", method="POST",
+                headers=worker_headers, payload={"account_id": account_id, "role_arn": role_arn},
+            )
+            # Reproduce rows that were connected before migration 008 added ARN columns.
+            sys.path.insert(0, str(BACK_DIR))
+            from app.database import connect
+            with connect() as db, db.cursor() as cursor:
+                cursor.execute(
+                    "UPDATE connections SET aws_account_id = NULL, role_arn = NULL WHERE id = %s",
+                    (legacy["id"],),
+                )
+                db.commit()
+            repaired = _call(
+                base_url, f"/api/worker/connections/{legacy['id']}/complete", method="POST",
+                headers=worker_headers, payload={"account_id": account_id, "role_arn": role_arn},
+            )
+            assert repaired is not None and repaired["status"] == "connected"
+            assert repaired["accountId"] == account_id and repaired["roleArn"] == role_arn
+
             failed_connection = _call(
                 base_url, "/api/connections", method="POST", expected=201,
                 payload={"provider": "aws", "name": "local-mysql-connection-failure-test", "fields": {}},
@@ -172,7 +224,7 @@ def run() -> None:
                 headers=worker_headers, expected=409, payload={"error": "different failure"},
             )
 
-            print("PASS: 로컬 MySQL 연결·worker 인증·대기 조회·ARN 계정 검증·동시 완료·멱등 재시도·실패 마스킹")
+            print("PASS: 로컬 MySQL 연결·콜백·pending 역할 전달·기존 connected 행 보완·worker 검증·동시 완료·실패 마스킹")
         finally:
             for connection_id in created_ids:
                 try:

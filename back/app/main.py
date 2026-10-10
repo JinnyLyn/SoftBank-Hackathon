@@ -30,6 +30,7 @@ from app.schemas import (
     ConnectionOut,
     ConnectionCompleteIn,
     ConnectionFailIn,
+    ConnectionRoleCallbackIn,
     PendingConnectionOut,
     DeploymentCreateIn,
     DeploymentDetailOut,
@@ -140,7 +141,7 @@ def list_pending_connections(
     _require_worker(x_worker_token)
     with connect() as connection, connection.cursor() as cursor:
         cursor.execute(
-            "SELECT id, provider, name, external_id, fields, created_at "
+            "SELECT id, provider, name, external_id, fields, created_at, aws_account_id, role_arn "
             "FROM connections WHERE status = 'pending' ORDER BY created_at, id"
         )
         return [
@@ -148,6 +149,7 @@ def list_pending_connections(
                 id=UUID(row["id"]), provider=row["provider"], name=row["name"],
                 external_id=row["external_id"], fields=_json_value(row["fields"]),
                 created_at=_as_utc(row["created_at"]),
+                account_id=row.get("aws_account_id"), role_arn=row.get("role_arn"),
             )
             for row in cursor.fetchall()
         ]
@@ -161,7 +163,7 @@ def create_connection(body: ConnectionIn) -> ConnectionOut:
     _reject_secret_fields(body.fields)
     connection_id = uuid4()
     external_id = f"pc-{os.urandom(16).hex()}"
-    setup_url = _aws_setup_url(external_id)
+    setup_url = _aws_setup_url(external_id, connection_id)
     with connect() as connection, connection.cursor() as cursor:
         cursor.execute(
             """INSERT INTO connections (id, provider, name, status, detail, setup_url, external_id, fields)
@@ -187,7 +189,7 @@ def update_connection(connection_id: UUID, body: ConnectionIn) -> ConnectionOut:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "연결을 찾을 수 없습니다.")
         external_id = row["external_id"]
         status_value = "connected" if row["status"] == "connected" else "pending"
-        setup_url = row["setup_url"] if status_value == "connected" else _aws_setup_url(external_id)
+        setup_url = row["setup_url"] if status_value == "connected" else _aws_setup_url(external_id, connection_id)
         detail = row["detail"] if status_value == "connected" else "AWS CloudFormation 연결을 기다리는 중입니다."
         cursor.execute(
             """UPDATE connections SET name = %s, status = %s, detail = %s, error = NULL,
@@ -208,6 +210,42 @@ def check_connection(connection_id: UUID) -> ConnectionOut:
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "연결을 찾을 수 없습니다.")
     return _connection_out(row)
+
+
+@app.post("/api/connections/{connection_id}/role-callback", response_model=ConnectionOut, tags=["connections"])
+def connection_role_callback(connection_id: UUID, body: ConnectionRoleCallbackIn) -> ConnectionOut:
+    """Accept the capability-authenticated CloudFormation output callback.
+
+    The ExternalId is an unguessable per-connection capability. The actual AWS
+    role validation remains the worker's responsibility before /complete.
+    """
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM connections WHERE id = %s FOR UPDATE", (str(connection_id),))
+        row = cursor.fetchone()
+        if row is None or row["provider"] != "aws" or not hmac.compare_digest(
+            str(row["external_id"]), body.external_id
+        ):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AWS 연결을 찾을 수 없습니다.")
+        stored_account = row.get("aws_account_id")
+        stored_role = row.get("role_arn")
+        if stored_account is not None or stored_role is not None:
+            if stored_account == body.account_id and stored_role == body.role_arn:
+                return _connection_out(row)
+            raise HTTPException(status.HTTP_409_CONFLICT, "다른 AWS 역할이 이미 보고된 연결입니다.")
+        if row["status"] not in {"pending", "connected"}:
+            raise HTTPException(status.HTTP_409_CONFLICT, "오류 상태의 연결에는 역할을 등록할 수 없습니다.")
+        cursor.execute(
+            "UPDATE connections SET aws_account_id = %s, role_arn = %s WHERE id = %s "
+            "AND aws_account_id IS NULL AND role_arn IS NULL",
+            (body.account_id, body.role_arn, str(connection_id)),
+        )
+        if cursor.rowcount != 1:
+            connection.rollback()
+            raise HTTPException(status.HTTP_409_CONFLICT, "역할 정보가 동시에 변경되었습니다. 다시 조회해 주세요.")
+        connection.commit()
+        cursor.execute("SELECT * FROM connections WHERE id = %s", (str(connection_id),))
+        updated = cursor.fetchone()
+    return _connection_out(updated)
 
 
 @app.delete("/api/connections/{connection_id}", status_code=status.HTTP_204_NO_CONTENT, tags=["connections"])
@@ -261,9 +299,25 @@ def complete_connection(
         if row["status"] == "connected":
             if row.get("aws_account_id") == body.account_id and row.get("role_arn") == body.role_arn:
                 return _connection_out(row)
+            if row.get("aws_account_id") is None and row.get("role_arn") is None:
+                cursor.execute(
+                    "UPDATE connections SET aws_account_id = %s, role_arn = %s "
+                    "WHERE id = %s AND status = 'connected' "
+                    "AND aws_account_id IS NULL AND role_arn IS NULL",
+                    (body.account_id, body.role_arn, str(connection_id)),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    raise HTTPException(status.HTTP_409_CONFLICT, "기존 연결 정보가 동시에 변경되었습니다.")
+                connection.commit()
+                cursor.execute("SELECT * FROM connections WHERE id = %s", (str(connection_id),))
+                return _connection_out(cursor.fetchone())
             raise HTTPException(status.HTTP_409_CONFLICT, "이미 다른 AWS 역할로 연결된 항목입니다.")
         if row["status"] != "pending":
             raise HTTPException(status.HTTP_409_CONFLICT, "대기 중인 연결만 완료 처리할 수 있습니다.")
+        if row.get("aws_account_id") is not None or row.get("role_arn") is not None:
+            if row.get("aws_account_id") != body.account_id or row.get("role_arn") != body.role_arn:
+                raise HTTPException(status.HTTP_409_CONFLICT, "CloudFormation이 보고한 역할 정보와 일치하지 않습니다.")
         cursor.execute(
             """UPDATE connections SET status = 'connected', detail = %s, setup_url = NULL,
                       error = NULL, aws_account_id = %s, role_arn = %s WHERE id = %s""",
@@ -1350,7 +1404,7 @@ def _connection_out(row: dict[str, Any]) -> ConnectionOut:
     )
 
 
-def _aws_setup_url(external_id: str) -> str | None:
+def _aws_setup_url(external_id: str, connection_id: UUID | None = None) -> str | None:
     template_url = os.getenv("AWS_CONNECTION_TEMPLATE_URL", "").strip()
     if not template_url:
         return None
@@ -1362,6 +1416,15 @@ def _aws_setup_url(external_id: str) -> str | None:
         "stackName": "PavedCloudsConnection",
         "param_ExternalId": external_id,
     }
+    public_api_base_url = os.getenv("PUBLIC_API_BASE_URL", "").strip().rstrip("/")
+    if public_api_base_url:
+        callback_base = urlsplit(public_api_base_url)
+        if (callback_base.scheme != "https" or not callback_base.hostname or callback_base.username
+                or callback_base.password or callback_base.query or callback_base.fragment):
+            raise ConfigurationError("PUBLIC_API_BASE_URL must be a credential-free HTTPS origin or base path")
+        if connection_id is None:
+            raise ConfigurationError("connection_id is required when PUBLIC_API_BASE_URL is configured")
+        params["param_RoleCallbackUrl"] = f"{public_api_base_url}/api/connections/{connection_id}/role-callback"
     platform_account_id = os.getenv("PLATFORM_AWS_ACCOUNT_ID", "").strip()
     if platform_account_id:
         if not re.fullmatch(r"\d{12}", platform_account_id):
