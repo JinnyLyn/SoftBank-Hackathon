@@ -196,8 +196,13 @@ class Api:
             if length is not None and length > max_bytes:
                 raise ApiError(413, f"파일이 크기 한도({max_bytes}바이트)를 넘습니다")
             while True:
+                # 읽기 전에 검사한다: 느리게 이어지는 응답은 소켓 무활동 제한에 걸리지 않으므로 전체 제한 시간은 여기서만 지킨다
+                if time.monotonic() - started > deadline:
+                    raise ApiError(0, f"내려받는 시간이 제한({deadline:g}초)을 넘었습니다")
                 try:
-                    chunk = resp.read(DOWNLOAD_CHUNK)
+                    # read(n)은 n바이트를 다 채울 때까지 막혀서 아주 느린 응답이 제한 시간을 무력화한다. read1은 데이터가 오는 대로 돌려주므로
+                    # 한 번의 대기가 소켓 무활동 제한(timeout)을 넘지 않고, 위 검사가 매번 돈다
+                    chunk = resp.read1(DOWNLOAD_CHUNK)
                 except (TimeoutError, OSError, http.client.HTTPException) as e:
                     raise ApiError(0, f"내려받는 중 연결이 끊겼습니다: {type(e).__name__}") from None
                 if not chunk:
@@ -205,8 +210,6 @@ class Api:
                 size += len(chunk)
                 if size > max_bytes:
                     raise ApiError(413, f"파일이 크기 한도({max_bytes}바이트)를 넘습니다")
-                if time.monotonic() - started > deadline:
-                    raise ApiError(0, f"내려받는 시간이 제한({deadline}초)을 넘었습니다")
                 digest.update(chunk)
                 out.write(chunk)
         if length is not None and size != length:
@@ -792,10 +795,16 @@ def fetch_source(api, cfg, job, expected):
     tmp = Path(tempfile.mkdtemp(prefix="paved-src-"))
     dest = tmp / "source.zip"
     ok = False
+    started = time.monotonic()
     try:
         for attempt in range(DOWNLOAD_RETRIES):
+            # 제한 시간은 재시도를 모두 합쳐서 하나다(시도마다 새로 주면 최악의 경우 시도 횟수만큼 늘어나 worker가 오래 멈춘다)
+            remaining = cfg.download_timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                return None, None, ("source_download_failed",
+                                    f"소스(ZIP)를 내려받는 시간이 제한({cfg.download_timeout}초)을 넘었습니다. 빌드하지 않았습니다")
             try:
-                size, digest = api.download(path, dest, cfg.max_source_bytes, cfg.download_timeout)
+                size, digest = api.download(path, dest, cfg.max_source_bytes, remaining)
                 break
             except ApiError as e:
                 transient = e.status == 0 or e.status >= 500

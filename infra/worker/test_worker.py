@@ -129,6 +129,7 @@ class FakeBackend:
         self.source_redirect = None   # 지정하면 소스 요청을 이 주소로 302 리다이렉트한다
         self.source_truncate = 0      # 앞으로 몇 번의 소스 응답을 "Content-Length만큼 보내지 않고 연결을 닫는" 방식으로 처리할지
         self.source_no_length = False   # True면 Content-Length 없이 보내고 연결을 닫아 끝을 알린다(길이를 미리 알 수 없는 응답)
+        self.source_trickle = 0         # 0보다 크면 소스를 한 바이트씩 이 간격(초)으로 보낸다(연결은 살아 있고 느리게 진행되는 응답)
         self.source_gets = 0          # 소스 요청을 받은 횟수
         outer = self
 
@@ -198,6 +199,15 @@ class FakeBackend:
                         outer.source_truncate -= 1
                         self.wfile.write(data[: len(data) // 2])
                         self.close_connection = True   # 약속한 길이를 채우지 못하고 끊는다
+                        return
+                    if outer.source_trickle > 0:
+                        try:
+                            for i in range(len(data)):
+                                self.wfile.write(data[i:i + 1])
+                                self.wfile.flush()
+                                time.sleep(outer.source_trickle)
+                        except OSError:
+                            pass   # 받는 쪽이 먼저 끊었다
                         return
                     self.wfile.write(data)
                     return
@@ -1360,6 +1370,26 @@ class ExecutorTests(Base):
             self.api.download("/api/worker/projects/p-big/source", dest, 1 << 20, 30)
         self.assertEqual(cm.exception.status, 413)
         self.assertLessEqual(dest.stat().st_size, 1 << 20)   # 한도를 넘는 만큼은 디스크에 쓰지 않았다
+
+    def test_slow_trickling_response_is_cut_off_at_the_deadline_and_not_retried_past_it(self):
+        # 연결은 살아 있고 느리게 진행되는 응답(소켓 무활동 시간 제한은 걸리지 않는다). 13바이트를 0.5초 간격으로 보내면 끝까지 받는 데 6.5초가 걸린다.
+        # 한 번의 읽기가 1 MiB를 채울 때까지 막히면 전체 제한 시간(1초)을 지키지 못한다(Codex 리뷰 P2). 재시도도 같은 제한 안에서만 한다
+        self.backend.source_trickle = 0.5
+        self.cfg.download_timeout = 1
+        started = time.monotonic()
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assertLess(time.monotonic() - started, 4.0)
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(self.backend.source_gets, 1)   # 제한 시간을 다 쓴 뒤에는 다시 시도하지 않는다
+
+    def test_api_download_enforces_its_deadline_on_a_slow_response(self):
+        self.backend.source_trickle = 0.5
+        self.backend.sources["p-slow"] = SRC_BYTES
+        started = time.monotonic()
+        with self.assertRaises(worker.ApiError) as cm:
+            self.api.download("/api/worker/projects/p-slow/source", self.tmp / "dl.bin", 1 << 20, 1)
+        self.assertEqual(cm.exception.status, 0)
+        self.assertLess(time.monotonic() - started, 4.0)
 
     def test_source_without_content_length_is_accepted_when_within_the_limit(self):
         self.backend.source_no_length = True
