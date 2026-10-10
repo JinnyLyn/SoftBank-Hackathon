@@ -84,8 +84,9 @@ export default function ReviewStep({
           <strong>{tier.label}</strong>
         </div>
         <div>
-          <span>앱 월 예상</span>
+          <span>{tier.usualUsd !== undefined ? '앱 월 최대' : '앱 월 예상'}</span>
           <strong>{costText(cost)}</strong>
+          {tier.usualUsd !== undefined && <small className="muted">평소 {usd(tier.usualUsd)}</small>}
         </div>
         <div>
           <span>도메인</span>

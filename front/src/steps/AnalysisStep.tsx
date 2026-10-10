@@ -190,12 +190,20 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
                         )
                       const on = choice?.connectionId === o.connectionId && choice?.tier === t.key
                       const over = tierTotal(t) > budget
+                      // 계획이 없는 비교용 안 (다시 계획하는 경로가 생기기 전까지 고를 수 없음)
+                      const compareOnly = t.planned === false
                       return (
                         <td key={t.key}>
                           <button
                             className={'cell' + (on ? ' is-on' : '') + (over ? ' is-over' : '')}
-                            disabled={locked || over}
-                            title={over ? `월 예산 $${budget}을 넘습니다` : undefined}
+                            disabled={locked || over || compareOnly}
+                            title={
+                              over
+                                ? `월 예산 $${budget}을 넘습니다`
+                                : compareOnly
+                                  ? '비교용 예상치입니다. 이 안으로 배포하는 계획은 아직 만들지 않았습니다.'
+                                  : undefined
+                            }
                             aria-pressed={on}
                             onClick={() => onChoice({ connectionId: o.connectionId, tier: t.key })}
                           >
@@ -205,8 +213,13 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
                                 <span className="tag-low">최저</span>
                               )}
                               {over && <span className="tag-over">예산 초과</span>}
+                              {t.rankLabel && <span className="tag-rank">{t.rankLabel}</span>}
+                              {compareOnly && !over && <span className="tag-rank">비교용</span>}
                             </span>
                             <strong>{costText(tierTotal(t))}</strong>
+                            {t.usualUsd !== undefined && t.usualUsd !== tierTotal(t) && (
+                              <small className="cell-usual">평소 {usd(t.usualUsd)} · 부하 최대 기준</small>
+                            )}
                             <small>{t.headline}</small>
                           </button>
                         </td>

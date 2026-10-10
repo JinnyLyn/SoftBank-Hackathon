@@ -654,6 +654,8 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 @keyframes reveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .reveal, .work-hint { animation: none; } }
 .blockers { margin: 6px 0; padding-left: 18px; }
+.tag-rank { font-size: 11px; font-weight: 600; color: var(--ink-2); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 5px; }
+.cell-usual { color: var(--muted); }
 .draft-box { display: flex; flex-direction: column; gap: 8px; }
 .draft-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .draft-actions { display: flex; gap: 6px; }

@@ -198,7 +198,51 @@ interface PlanOut {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
+// 승인 금액. worker는 부하가 최대일 때(태스크 max_tasks개)의 월 비용을 넣음(cost.amount_basis: peak_monthly)
 const planCost = (p: PlanOut) => Number(p.cost_estimate?.amount ?? 0)
+
+const RANK_LABEL: Record<string, string> = { lowest: '최저', average: '평균', highest: '최대' }
+
+/**
+ * worker가 계획에 담아 준 비교 안(variables.options: 최저·평균·최대, 예산에 따라 1~3개).
+ * Terraform 계획은 추천 안 하나만 있으므로 그 안은 계획에서, 나머지는 비교용 예상치로 만듦
+ */
+function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
+  const options = Array.isArray(p.variables.options) ? p.variables.options.filter(isObj) : []
+  const seen = new Set<TierKey>()
+  const out: { key: TierKey; tier: Tier }[] = []
+  for (const o of options) {
+    const key = TIER_KEYS.find((k) => k === o.tier)
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    const peak = Number(o.peak_monthly)
+    const usual = Number(o.total_monthly)
+    const extra = {
+      rankLabel: RANK_LABEL[str(o.rank)],
+      usualUsd: Number.isFinite(usual) ? usual : undefined,
+    }
+    if (o.recommended === true || key === p.variables.tier) {
+      out.push({ key, tier: { ...toTier(p, key), ...extra, planned: true } })
+      continue
+    }
+    const sizing = `${str(o.task_size)} 태스크 ${o.min_tasks}~${o.max_tasks}개`
+    out.push({
+      key,
+      tier: {
+        key,
+        ...TIER_META[key],
+        label: str(o.label) || TIER_META[key].label,
+        headline: str(o.headline) || sizing,
+        tradeoff: str(o.tradeoff),
+        resources: [{ service: 'ECS Fargate', spec: sizing, monthlyUsd: Number.isFinite(peak) ? peak : 0, why: '비교용 예상치 (이 안의 배포 계획은 아직 없음)' }],
+        totalUsd: Number.isFinite(peak) ? peak : undefined,
+        ...extra,
+        planned: false,
+      },
+    })
+  }
+  return out
+}
 
 // 화면에서 고른 칸(대상:크기) → 백엔드 계획. 승인할 때 plan id와 fingerprint를 여기서 찾음
 let plansByKey = new Map<string, PlanOut>()
@@ -302,13 +346,28 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
   plansByKey = new Map()
   const bundles: Record<string, TerraformBundle> = {}
   const tiers: Tier[] = []
-  for (const key of TIER_KEYS) {
-    const p = byTier.get(key)
-    if (!p) continue
-    const k = keyOf({ connectionId, tier: key })
-    plansByKey.set(k, p)
-    bundles[k] = toBundle(p)
-    tiers.push(toTier(p, key))
+  // 새 worker: 가장 최근 계획 하나에 비교 안(options)이 들어 있음. 없으면 예전처럼 크기별 계획을 하나씩 씀
+  const newest = [...plans].sort((a, b) => (a.created_at < b.created_at ? 1 : -1))[0]
+  const fromOptions = newest ? tiersFromOptions(newest) : []
+  if (fromOptions.length) {
+    byTier.clear()
+    for (const { key, tier } of fromOptions.sort((a, b) => TIER_KEYS.indexOf(a.key) - TIER_KEYS.indexOf(b.key))) {
+      tiers.push(tier)
+      if (!tier.planned) continue
+      const k = keyOf({ connectionId, tier: key })
+      byTier.set(key, newest)
+      plansByKey.set(k, newest)
+      bundles[k] = toBundle(newest)
+    }
+  } else {
+    for (const key of TIER_KEYS) {
+      const p = byTier.get(key)
+      if (!p) continue
+      const k = keyOf({ connectionId, tier: key })
+      plansByKey.set(k, p)
+      bundles[k] = toBundle(p)
+      tiers.push(toTier(p, key))
+    }
   }
 
   const budget = scale.monthlyBudgetUsd

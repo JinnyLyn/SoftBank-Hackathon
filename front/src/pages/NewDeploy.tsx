@@ -457,8 +457,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
         <StepRail items={railItems} onSelect={setStep} />
         {option && selectedTier && (
           <div className="cost-note">
-            <span>월 예상 비용</span>
+            <span>{selectedTier.usualUsd !== undefined ? '월 최대 예상 비용' : '월 예상 비용'}</span>
             <strong>{costText(tierTotal(selectedTier))}</strong>
+            {selectedTier.usualUsd !== undefined && <small>평소 {usd(selectedTier.usualUsd)} (부하가 늘면 최대까지)</small>}
             <small className="with-mark">
               <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
             </small>
