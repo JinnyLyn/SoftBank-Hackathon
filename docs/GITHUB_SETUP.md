@@ -10,7 +10,7 @@
 | `paved-main-pr-review` | 기본 브랜치 main | PR, 승인 1명, CODEOWNERS 승인, 새 커밋 시 승인 무효화, 대화 해결. 마지막 push의 독립 승인은 해제. merge commit만 허용. 삭제·강제 푸시 금지 |
 | `paved-only-team-branches` | main·개인 5개 외 모든 브랜치 | 생성·갱신 금지. 우회 없음 |
 | `paved-personal-branch-history` | 개인 5개 | 삭제·강제 푸시 금지. 우회 없음 |
-| `paved-main-ci` | 기본 브랜치 main | Windows·Ubuntu Git guard 성공, 최신 main 기준 검사. 우회 없음 |
+| `paved-main-ci` | 기본 브랜치 main | Windows·Ubuntu Git guard 성공(훅 회귀·PR 보고 형식), 최신 main 기준 검사. 우회 없음 |
 
 개인 브랜치: `JinnyLyn`, `JinVibe`, `Ophelia0419`, `totorosi`, `wisetg`.
 
@@ -20,10 +20,12 @@ CODEOWNERS는 main의 파일을 사용하며 기본 리뷰 담당은 JinnyLyn이
 
 ## 필수 CI
 
-기존 `Team Git Guard`는 Git 훅의 허용·차단 동작을 검증한다. 이 두 필수 검사의 성공만으로 앱 동작을 확인한 것은 아니다.
+`Team Git Guard`는 Git 훅의 허용·차단 동작과 PR 보고 검사 자체의 회귀를 검증한다. main 대상 PR에서는 컨텍스트·워크플로 보고 형식도 검사하며, 본문 수정 때 재실행한다. 이 두 필수 검사의 성공만으로 앱 동작이나 보고 내용의 사실성을 확인한 것은 아니다.
 
 - `Git guard (ubuntu-latest)`
 - `Git guard (windows-latest)`
+
+PR 보고 검사는 기존 두 check 안에 포함하므로 서버 ruleset 변경이나 새 필수 check 등록 없이 적용한다. 누락된 보고는 PR 본문을 보완해 해결한다. 이 워크플로가 반영된 최신 main과 동기화한 뒤 사용하며, 구체적인 검사 범위와 로컬 명령은 [CI.md](CI.md)를 따른다.
 
 2026-10-08 [설정 PR #3의 최초 CI](https://github.com/JinnyLyn/SoftBank-Hackathon/actions/runs/37748541823)에서 두 작업의 성공을 확인하고 `paved-main-ci` ruleset의 필수 status check로 등록했다. 대상은 기본 브랜치, 우회 목록은 비워 두고 최신 main 기준 검사를 요구한다. 이렇게 분리해 본인 PR의 리뷰를 생략해도 CI는 유지한다. 이후 새 검사를 도입할 때도 최초 성공을 확인한 뒤 필수로 등록한다.
 
