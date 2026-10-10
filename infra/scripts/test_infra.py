@@ -85,11 +85,14 @@ def find_bash():
     for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")):
         if base:
             cands += [os.path.join(base, "Git", "bin", "bash.exe"), os.path.join(base, "Programs", "Git", "bin", "bash.exe")]
+    # WSL bash도 산술 식은 계산하지만 Windows 경로(C:/...·/c/...)를 열지 못한다. deploy.sh를 실제로 보는지까지 확인한다
+    sh = (INFRA / "scripts" / "deploy.sh").as_posix()
+    probe = f'[ -f "$(cygpath -u "{sh}" 2>/dev/null || echo "{sh}")" ] && echo $((40+2))'
     for c in cands:
         if not c or not os.path.exists(c):
             continue
         try:
-            r = subprocess.run([c, "-c", "echo $((40+2))"], capture_output=True, text=True, timeout=30)
+            r = subprocess.run([c, "-c", probe], capture_output=True, text=True, timeout=30)
             if r.returncode == 0 and r.stdout.strip() == "42":
                 return c
         except Exception:

@@ -215,16 +215,19 @@ def posix(path):
 
 
 def find_bash():
-    """실제로 스크립트를 실행할 수 있는 bash. Windows에서 PATH의 bash는 WSL 중계 실행 파일일 수 있어 직접 확인한다."""
+    """실제로 스크립트를 실행할 수 있는 bash. Windows에서 PATH의 bash는 WSL 중계 실행 파일일 수 있어 직접 확인한다.
+
+    WSL bash도 산술 식은 계산하지만 /c/Users/... 경로(posix())를 열지 못한다. 그래서 deploy.sh를 실제로 볼 수 있는지까지 확인한다."""
     cands = [os.environ.get("BASH_EXE"), shutil.which("bash")]
     for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")):
         if base:
             cands += [os.path.join(base, "Git", "bin", "bash.exe"), os.path.join(base, "Programs", "Git", "bin", "bash.exe")]
+    probe = posix(INFRA / "scripts" / "deploy.sh")
     for c in cands:
         if not c or not os.path.exists(c):
             continue
         try:
-            r = subprocess.run([c, "-c", "echo $((40+2))"], capture_output=True, text=True, timeout=30)
+            r = subprocess.run([c, "-c", f'[ -f "{probe}" ] && echo $((40+2))'], capture_output=True, text=True, timeout=30)
             if r.returncode == 0 and r.stdout.strip() == "42":
                 return c
         except (OSError, subprocess.SubprocessError):
