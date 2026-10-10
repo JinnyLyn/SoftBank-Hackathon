@@ -1,0 +1,4 @@
+fastapi==0.142.4
+uvicorn[standard]==0.54.0
+PyMySQL==1.1.2
+cryptography==46.0.5
