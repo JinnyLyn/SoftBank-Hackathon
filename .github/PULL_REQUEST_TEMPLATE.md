@@ -43,5 +43,6 @@
 
 - 기본 담당: JinnyLyn. JinnyLyn 본인 PR은 팀원 승인 없이 PR 전용 우회로 머지할 수 있다.
 - 다른 팀원 PR은 JinnyLyn 승인과 적용된 필수 검사를 확인한다. `WORKFLOW.md` §1.1의 임시 위임 기간에는 작성자 외 팀원 코드오너 1명의 승인으로 진행할 수 있다. 본인 PR도 필수 검사를 통과해야 한다.
+- 서버 필수 check와 별도로 `Git guard (ubuntu-latest)`·`Git guard (windows-latest)`의 최신 실행 성공을 직접 확인한다. 실패·진행 중·미실행이면 머지하지 않는다.
 - 리뷰·머지 담당자는 위 보고의 누락 여부와 문서 갱신·후속 처리 필요성, 최신 head의 Code Review·Security Review와 미해결 대화를 확인한다. 작성·리뷰 기준은 `WORKFLOW.md` §4·§4.1을 따른다.
 - Create a merge commit으로 합치고 개인 브랜치는 유지한다.
