@@ -148,6 +148,11 @@ class DraftTests(unittest.TestCase):
         a = analyze_files(files(**{"apps/web/package.json": pkg, "apps/web/next.config.ts": config, "apps/web/src/app/page.tsx": "x\n"}))
         self.assertEqual(a.health_check_path, "/")
         self.assertNotIn("health_check_path", a.unresolved)
+        # 모듈 불러오기·값 변환 호출만 있으면 주소가 바뀌지 않음
+        plain = ("const path = require('path')\nconst port = Number(process.env.PORT)\nconst dir = path.join(__dirname, 'x')\n"
+                 "module.exports = { output: 'standalone' }\n")
+        a = analyze_files(files(**{"package.json": pkg, "next.config.js": plain, "app/page.tsx": "x\n"}))
+        self.assertEqual(a.health_check_path, "/")
 
     def test_next_routing_that_may_move_paths_stays_unresolved(self):
         pkg = json.dumps({"dependencies": {"next": "^15"}, "scripts": {"start": "next start"}})
@@ -157,6 +162,11 @@ class DraftTests(unittest.TestCase):
             "spread": {"next.config.js": "const shared = require('@x/config')\nmodule.exports = { ...shared }\n"},
             "plugin wrapper": {"next.config.mjs": "import withIntl from 'next-intl/plugin'\nexport default withIntl()({})\n"},
             "middleware": {"next.config.js": "module.exports = {}\n", "src/middleware.ts": "export function middleware() {}\n"},
+            # 래퍼 결과를 변수에 담았다가 내보냄 (PR #40 리뷰)
+            "wrapper via variable": {"next.config.js": "const withRouting = require('next-routing')\nconst config = withRouting({})\nmodule.exports = config\n"},
+            "typed wrapper via variable": {"next.config.ts": "import withX from 'next-x'\nconst config: NextConfig = withX({})\nexport default config\n"},
+            "awaited wrapper": {"next.config.mjs": "const config = await makeConfig()\nexport default config\n"},
+            "curried require": {"next.config.js": "const config = require('@next/bundle-analyzer')({ enabled: true })({})\nmodule.exports = config\n"},
         }
         for name, extra in cases.items():
             with self.subTest(name=name):

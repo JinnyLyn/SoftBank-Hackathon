@@ -381,6 +381,12 @@ _NEXT_ROUTES = [
 _NEXT_ROUTING = re.compile(r"\b(basePath|rewrites|redirects|i18n)\b")
 # 다른 파일의 설정을 가져오거나 플러그인으로 감싸면 그 안에서 basePath 등을 넣을 수 있어 내용을 다 볼 수 없음
 _NEXT_INDIRECT = re.compile(r"""require\(\s*['"]\.|\bfrom\s+['"]\.|\.\.\.\s*[A-Za-z_$]|(?:export\s+default|module\.exports\s*=)\s*[A-Za-z_$][\w$.]*\s*\(""")
+# 함수 호출 결과를 변수에 담았다가 내보내는 설정(const c = withX({...}); export default c)도 래퍼일 수 있음.
+# 모듈 불러오기(require 단독)와 값만 바꾸는 흔한 호출은 주소를 바꾸지 않아 뺀다
+_NEXT_CALL_ASSIGN = re.compile(
+    r"""(?<![=!<>])=\s*(?:await\s+)?(?!(?:require|Number|String|Boolean|parseInt|parseFloat|JSON\.parse|path\.\w+)\s*\()"""
+    r"""[A-Za-z_$][\w$.]*\s*\(|require\([^)]*\)\s*\("""
+)
 _NEXT_MIDDLEWARE = re.compile(r"(^|/)(src/)?middleware\.(t|j)s$")
 
 
@@ -388,7 +394,7 @@ def _next_routing_unclear(repo: Repo) -> Optional[Tuple[SourceFile, int]]:
     """주소를 바꿀 수 있는 설정·미들웨어가 있으면 그 파일과 줄 번호"""
     for f in repo.named("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"):
         for n, line in enumerate(f.text.splitlines(), 1):
-            if _NEXT_ROUTING.search(line) or _NEXT_INDIRECT.search(line):
+            if _NEXT_ROUTING.search(line) or _NEXT_INDIRECT.search(line) or _NEXT_CALL_ASSIGN.search(line):
                 return f, n
     m = next((x for x in repo.files if _NEXT_MIDDLEWARE.search(x.path)), None)
     return (m, 1) if m else None
