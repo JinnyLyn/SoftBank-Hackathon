@@ -1,0 +1,168 @@
+export type Provider = 'aws' | 'onprem'
+
+export interface Connection {
+  id: string
+  provider: Provider
+  name: string
+  /** pending: 사용자가 벤더 콘솔에서 연결 작업을 마치길 기다리는 중 */
+  status: 'connected' | 'pending' | 'error'
+  /** 목록에 보여 줄 한 줄 요약 (계정, 리전, 호스트 등) */
+  detail: string
+  error?: string
+  /** pending일 때 사용자가 열어야 할 벤더 콘솔 주소 (예: AWS CloudFormation 빠른 생성) */
+  setupUrl?: string
+  /** (온프레미스) pending일 때 서버에서 실행할 설치 명령. 일회용 토큰이 들어 있음 */
+  installCommand?: string
+  /** installCommand 만료 시각 (ISO) */
+  expiresAt?: string
+  checkedAt: string
+  /** 폼에 입력한 원본 값. 비밀 값은 서버가 돌려주지 않음 */
+  fields: Record<string, string>
+}
+
+export interface ConnectionInput {
+  id?: string
+  provider: Provider
+  name: string
+  fields: Record<string, string>
+}
+
+export type Source =
+  | { kind: 'zip'; file: File }
+  | { kind: 'github'; url: string; branch: string }
+
+export type ExpectedUsers = '~100' | '~1,000' | '~10,000' | '10,000+'
+export type TrafficPattern = 'steady' | 'peak' | 'unknown'
+
+export interface ScaleInput {
+  expectedUsers: ExpectedUsers
+  pattern: TrafficPattern
+  purpose: string
+  /** 월 예산 한도(USD). 이 금액을 넘는 구성은 추천하지도, 고르게 하지도 않음 */
+  monthlyBudgetUsd: number
+}
+
+export interface Finding {
+  level: 'info' | 'warn'
+  title: string
+  detail: string
+}
+
+export interface Analysis {
+  projectId: string
+  /** 코드에서 읽어낸 스택 정보 (프레임워크, 포트 등) */
+  stack: { label: string; value: string }[]
+  findings: Finding[]
+  /** 스캐너가 찾은 판단 근거 */
+  evidence: string[]
+}
+
+export type TierKey = 'lean' | 'balanced' | 'roomy'
+
+export interface Resource {
+  service: string
+  spec: string
+  monthlyUsd: number
+  /** 왜 이 사양을 골랐는지 */
+  why: string
+}
+
+export interface Tier {
+  key: TierKey
+  label: string
+  headline: string
+  fit: string
+  tradeoff: string
+  resources: Resource[]
+  /** 추가 비용이 없을 때(온프레미스) 대신 보여 줄 자원 사용량 */
+  usageNote?: string
+  /**
+   * 서버의 월 비용 추정 총액. 있으면 추천·선택 차단·승인 화면이 모두 이 값을 씀
+   * (리소스별 금액은 참고용이라 합계가 달라도 총액은 이 값)
+   */
+  totalUsd?: number
+}
+
+/** 연결된 배포 대상 하나에서 가능한 구성들 */
+export interface TargetOption {
+  connectionId: string
+  provider: Provider
+  name: string
+  tiers: Tier[]
+}
+
+/** 어디에(connection) 어떤 크기로(tier) 올릴지 */
+export interface Choice {
+  connectionId: string
+  tier: TierKey
+}
+
+export interface Recommendation {
+  /** 예산 안에 맞는 구성이 하나도 없으면 null. reason에 이유를 씀 */
+  recommended: Choice | null
+  reason: string
+  options: TargetOption[]
+  assumptions: string[]
+  /**
+   * 백엔드가 미리 만들어 둔 배포 코드. 키는 `${connectionId}:${tier}`.
+   * 최소한 추천 조합은 들어 있어야 코드 검토 화면이 바로 뜸
+   */
+  bundles?: Record<string, TerraformBundle>
+}
+
+export interface Patch {
+  file: string
+  before: string[]
+  after: string[]
+}
+
+/** 백엔드 배포 계획(PlanOut)에서 승인에 필요한 정보 */
+export interface PlanInfo {
+  planId: string
+  moduleId: string
+  summary: string
+  /** 사용자가 승인하는 계획 내용의 식별자. 서버가 만든 값을 그대로 돌려보내야 함 */
+  fingerprint: string
+  /** AWS는 Terraform plan 파일이 서버에 올라와 있어야 승인 가능 */
+  ready: boolean
+  pricingAsOf?: string
+}
+
+export interface TerraformBundle {
+  /** 온프레미스는 Terraform 대신 docker compose 사용 */
+  tool: 'terraform' | 'compose'
+  /** 실패 진단 수정안을 반영해 다시 만든 경우, 이번에 바뀐 내용 (재승인 화면에 표시) */
+  patches?: Patch[]
+  files: { name: string; content: string }[]
+  /** 개수를 알 수 없으면(백엔드가 plan 요약만 줄 때) null */
+  plan: { add: number | null; change: number | null; destroy: number | null; text: string }
+  /** 실제 백엔드 계획일 때만 있음 */
+  planInfo?: PlanInfo
+}
+
+export interface DeployStatus {
+  state: 'running' | 'success' | 'failed'
+  log: string[]
+  url?: string
+  /** 실패 시 AI가 로그를 보고 정리한 원인과 수정안 */
+  diagnosis?: {
+    cause: string
+    fix: string
+    patch: Patch
+  }
+}
+
+export interface DeployRecord {
+  id: string
+  app: string
+  version: string
+  tier: string
+  provider: Provider
+  target: string
+  monthlyUsd: number
+  status: 'success' | 'failed' | 'running'
+  note?: string
+  url?: string
+  createdAt: string
+}
+
