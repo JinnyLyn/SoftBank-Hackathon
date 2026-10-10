@@ -59,6 +59,11 @@ export interface Analysis {
   findings: Finding[]
   /** 스캐너가 찾은 판단 근거 */
   evidence: string[]
+  /**
+   * 배포할 수 없는 이유 (미지원 DB·여러 이미지, 포트·헬스체크·Dockerfile을 못 찾음 등).
+   * 하나라도 있으면 worker가 계획을 만들지 않으므로 기다리지 않고 이유를 보여 줌
+   */
+  blockers?: string[]
 }
 
 export type TierKey = 'lean' | 'balanced' | 'roomy'

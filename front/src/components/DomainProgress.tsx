@@ -114,4 +114,12 @@ function RecordTable({ records }: { records: DnsRecord[] }) {
   )
 }
 
-export const domainDone = (s?: DomainStatus) => !s || ['active', 'failed', 'skipped'].includes(s.state)
+/**
+ * 도메인 확인을 멈춰도 되는지. 도메인 기능이 없어 미리보기로 진행한 경우(mode none)만 상태가 없어도 끝.
+ * 주소를 고른 배포는 상태가 올 때까지 기다리고, active·failed·skipped 에서 멈춤 (PR #25 리뷰: 상태가 늦게 오면 완료로 처리했음)
+ */
+export const domainDone = (s: DomainStatus | undefined, mode: DomainPlan['mode']) =>
+  mode === 'none' ? true : !!s && ['active', 'failed', 'skipped'].includes(s.state)
+
+/** 연결에 실패했는지 (진행 단계 표시용) */
+export const domainFailed = (s?: DomainStatus) => s?.state === 'failed'

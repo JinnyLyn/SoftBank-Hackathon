@@ -35,8 +35,20 @@ interface Props {
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
 export default function AnalysisStep({ analysis, rec, recError, recStartedAt, onRetryRec, ...plans }: Props) {
+  const blockers = analysis.blockers ?? []
   return (
     <div className="stack-lg">
+      {blockers.length > 0 && (
+        <div className="error" role="alert">
+          <strong>이 앱은 지금 배포할 수 없습니다.</strong>
+          <ul className="blockers">
+            {blockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+          <span>코드를 고친 뒤 처음 화면에서 다시 올려 주세요.</span>
+        </div>
+      )}
       <section>
         <h3 className="sub-title">코드에서 찾은 것</h3>
         <dl className="kv">
@@ -69,7 +81,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
         </details>
       </section>
 
-      {rec ? (
+      {blockers.length > 0 ? null : rec ? (
         <Plans rec={rec} {...plans} />
       ) : (
         <section>

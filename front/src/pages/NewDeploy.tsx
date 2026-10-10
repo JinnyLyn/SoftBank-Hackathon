@@ -8,7 +8,7 @@ import AnalysisStep, { type CodeState } from '../steps/AnalysisStep'
 import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
 import DomainStep, { domainReady } from '../steps/DomainStep'
-import { domainDone } from '../components/DomainProgress'
+import { domainDone, domainFailed } from '../components/DomainProgress'
 import WorkProgress from '../components/WorkProgress'
 import { STAGE_SIZE } from '../progress'
 import { costText, tierTotal, usd } from '../format'
@@ -101,6 +101,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
   // 서버가 확정한 도메인 계획. 분석(프로젝트 생성) 뒤에 저장
   const [domainPlan, setDomainPlan] = useState<DomainPlan | null>(null)
   const [domainNotice, setDomainNotice] = useState<string | null>(null)
+  // 상태 확인 콜백이 최신 도메인 방식을 보게 함
+  const domainModeRef = useRef<DomainPlan['mode']>('none')
+  domainModeRef.current = domainPlan?.mode ?? 'none'
   const [approved, setApproved] = useState(false)
   const [deploy, setDeploy] = useState<DeployStatus | null>(null)
   // 올릴 때마다 상태 확인을 새로 시작 (새 배포, 다시 조회)
@@ -141,6 +144,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setDomainChoiceState(c)
     setDomainPlan(null)
     setDomainNotice(null)
+    // 승인한 내용(주소·비용)이 바뀌므로 이전 확인은 무효 (PR #25 리뷰)
+    setConfirmed(false)
   }
 
   const prefetch = (projectId: string, c: Choice) => {
@@ -214,7 +219,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
         setDeploy(s)
         if (s.state !== 'running') setBusy(null)
         // 앱이 끝나도 도메인(DNS·인증서)이 진행 중이면 계속 확인
-        if (s.state === 'failed' || (s.state === 'success' && domainDone(s.domain))) return
+        if (s.state === 'failed' || (s.state === 'success' && domainDone(s.domain, domainModeRef.current))) return
         if (Date.now() > deadlineRef.current) {
           setPollIssue({
             kind: 'timeout',
@@ -340,7 +345,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
         projectRef.current = a.projectId
         setAnalysis(a)
         await saveDomain(a.projectId)
-        loadRec(a.projectId)
+        // 배포할 수 없는 앱이면 worker가 계획을 만들지 않으므로 기다리지 않음 (PR #25 리뷰)
+        if (!a.blockers?.length) loadRec(a.projectId)
       }
       setStep(ANALYSIS)
     })
@@ -393,7 +399,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
     if (i === REVIEW && bundle) sub = bundle.plan.add === null ? '계획 준비됨' : `${bundle.plan.add}개 추가`
     if (i === REVIEW && !bundle && codeState === 'loading') sub = '코드 준비 중'
     if (i === DEPLOY && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
-    if (i === DEPLOY && deploy?.state === 'success' && !domainDone(deploy.domain)) sub = '도메인 연결 중'
+    if (i === DEPLOY && deploy?.state === 'success' && !domainDone(deploy.domain, domainPlan?.mode ?? 'none')) sub = '주소 연결 중'
+    if (i === DEPLOY && deploy?.state === 'success' && domainFailed(deploy.domain)) sub = '앱 완료 · 주소 연결 실패'
 
     let state: RailItem['state'] = 'todo'
     if (i === DEPLOY && deploy?.state === 'failed') state = 'failed'
@@ -432,12 +439,15 @@ export default function NewDeploy({ onShowHistory }: Props) {
       }
   }
   if (step === ANALYSIS && locked) next = { label: '다음', onClick: () => setStep(REVIEW) }
+  // 앱과 도메인을 합친 월 비용이 예산을 넘으면 승인하지 않음 (PR #25 리뷰)
+  const overBudget =
+    selectedTier !== null && tierTotal(selectedTier) + (domainPlan?.monthlyUsd ?? 0) > scale.monthlyBudgetUsd
   if (step === REVIEW && !locked)
     next = {
       label:
         busy === 'approve' ? '승인 처리 중…' : '승인하고 배포',
       onClick: approve,
-      disabled: !confirmed,
+      disabled: !confirmed || overBudget,
     }
   if (step === REVIEW && locked) next = { label: '진행 상태로', onClick: () => setStep(DEPLOY) }
 
@@ -483,6 +493,11 @@ export default function NewDeploy({ onShowHistory }: Props) {
 
         <div className="panel-body">
           {domainNotice && (step === ANALYSIS || step === REVIEW) && <p className="readonly-note">{domainNotice}</p>}
+          {step === REVIEW && overBudget && (
+            <div className="error" role="alert">
+              앱과 주소 비용을 합치면 월 예산 {usd(scale.monthlyBudgetUsd)}을 넘습니다. 예산을 늘리거나 더 작은 구성·다른 주소를 골라 주세요.
+            </div>
+          )}
           {step === SOURCE && (
             <div className="stack-lg">
               <section>

@@ -653,6 +653,7 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .reveal { animation: reveal 0.35s ease both; }
 @keyframes reveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
 @media (prefers-reduced-motion: reduce) { .reveal, .work-hint { animation: none; } }
+.blockers { margin: 6px 0; padding-left: 18px; }
 .rec-wait { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-2); font-size: 13px; }
 .rec-wait .pulse { display: inline-block; width: 8px; height: 8px; }
 .rec-wait.is-error { color: var(--fail); }

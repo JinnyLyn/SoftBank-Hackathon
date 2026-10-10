@@ -129,7 +129,28 @@ function toAnalysis(out: AnalysisOut): Analysis {
     isObj(e) ? [str(e.file) + (e.line ? `:${e.line}` : ''), str(e.text ?? e.reason)].filter(Boolean).join(' — ') : str(e),
   )
 
-  return { projectId: out.project_id, stack, findings, evidence }
+  return { projectId: out.project_id, stack, findings, evidence, blockers: blockersOf(r) }
+}
+
+// worker가 계획을 만들려면 꼭 있어야 하는 값 (infra/worker app_config_from_analysis)
+const REQUIRED_FOR_PLAN: Record<string, string> = {
+  container_port: '포트',
+  health_check_path: '헬스체크 경로',
+  dockerfile: 'Dockerfile',
+}
+
+/** 배포할 수 없는 이유. 미지원(supported: false)과, 계획에 꼭 필요한 값을 못 찾은 경우 */
+function blockersOf(r: Record<string, unknown>): string[] {
+  const out: string[] = []
+  if (r.supported === false) {
+    const reasons = Array.isArray(r.unsupported_reasons) ? r.unsupported_reasons.map(str).filter(Boolean) : []
+    out.push(...(reasons.length ? reasons : ['지원하지 않는 형태의 앱입니다.']))
+  }
+  const unresolved = isObj(r.unresolved) ? r.unresolved : {}
+  for (const [key, label] of Object.entries(REQUIRED_FOR_PLAN)) {
+    if (key in unresolved) out.push(`${label}: ${str(unresolved[key]) || '코드에서 찾지 못했습니다.'}`)
+  }
+  return out
 }
 
 /**
