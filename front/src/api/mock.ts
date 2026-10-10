@@ -3,6 +3,11 @@ import type {
   Choice,
   Connection,
   ConnectionInput,
+  DnsRecord,
+  DomainChoice,
+  DomainPlan,
+  DomainQuote,
+  DomainStatus,
   DeployRecord,
   DeployStatus,
   Provider,
@@ -284,11 +289,79 @@ export async function status(_projectId: string): Promise<DeployStatus> {
       },
     }
   }
+  const appUrl = publicUrl(conn.provider, tier.key, conn.fields.host)
   return {
     state: 'success',
     log: [...log, '{"status":"ok"}', 'health check passed'],
-    url: publicUrl(conn.provider, tier.key, conn.fields.host),
+    url: appUrl,
+    domain: domainProgress(t - end, appUrl),
   }
+}
+
+// ---------- 도메인 (mock) ----------
+// 실제 구매·DNS·인증서는 백엔드·인프라 작업이 필요함. 여기서는 화면 흐름만 흉내
+
+// Route 53 등록 가격을 흉내 낸 값 (USD/년). 실제 가격은 서버가 가격표로 계산해야 함
+const TLD_PRICE: Record<string, number> = { com: 15, net: 17, org: 15, dev: 17, app: 20, io: 71, xyz: 13 }
+const TAKEN = /(google|naver|amazon|kakao|test)\./
+let domainChoice: DomainChoice = { mode: 'later', name: '' }
+
+export async function checkDomain(name: string): Promise<DomainQuote> {
+  await wait(500)
+  const tld = name.split('.').pop() ?? ''
+  const price = TLD_PRICE[tld] ?? null
+  if (price === null)
+    return { name, available: false, priceUsdPerYear: null, reason: `.${tld} 도메인은 구매를 지원하지 않습니다. .com .net .org .dev .app .io .xyz 중에서 골라 주세요.` }
+  if (TAKEN.test(name)) {
+    const base = name.slice(0, -(tld.length + 1))
+    return {
+      name,
+      available: false,
+      priceUsdPerYear: price,
+      reason: '이미 등록된 도메인입니다.',
+      suggestions: [`get${base}.${tld}`, `${base}-app.${tld}`, `${base}.dev`],
+    }
+  }
+  return { name, available: true, priceUsdPerYear: price }
+}
+
+const appRecords = (name: string): DnsRecord[] => [
+  { type: 'CNAME', name, value: '배포 뒤 확정 (예: paved-alb-1203.sa-east-1.elb.amazonaws.com)', purpose: '도메인을 앱 주소로 연결' },
+  { type: 'CNAME', name: `_3f9a1c.${name}`, value: '_8d2e0b.acm-validations.aws', purpose: 'HTTPS 인증서 발급 확인용' },
+]
+
+export async function saveDomain(_projectId: string, choice: DomainChoice): Promise<DomainPlan> {
+  await wait(300)
+  domainChoice = choice
+  if (choice.mode === 'later')
+    return { mode: 'later', name: null, oneTimeUsd: 0, monthlyUsd: 0, records: [], note: 'AWS 기본 주소로 접속합니다. 도메인은 나중에 연결할 수 있습니다.' }
+  if (choice.mode === 'own')
+    return { mode: 'own', name: choice.name, oneTimeUsd: 0, monthlyUsd: 0, records: appRecords(choice.name) }
+  const price = TLD_PRICE[choice.name.split('.').pop() ?? ''] ?? 0
+  return {
+    mode: 'buy',
+    name: choice.name,
+    oneTimeUsd: price,
+    // Route 53 호스팅 영역 1개
+    monthlyUsd: 0.5,
+    records: [],
+    note: '구매한 도메인의 DNS와 인증서는 자동으로 설정합니다.',
+  }
+}
+
+export async function confirmDomainPurchase(_projectId: string, _plan: DomainPlan): Promise<void> {
+  await wait(200)
+}
+
+/** 앱 배포가 끝난 뒤 지난 시간(ms)에 따라 도메인 단계를 흉내 */
+function domainProgress(since: number, appUrl: string): DomainStatus {
+  const { mode, name } = domainChoice
+  if (mode === 'later') return { state: 'skipped', name: null, message: '도메인 없이 AWS 기본 주소로 접속합니다.', url: appUrl }
+  if (mode === 'buy' && since < 3000) return { state: 'registering', name, message: '도메인을 등록하고 있습니다. 보통 몇 분 걸립니다.' }
+  if (mode === 'own' && since < 4000)
+    return { state: 'waiting_dns', name, message: '도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.', records: appRecords(name) }
+  if (since < 7000) return { state: 'issuing_cert', name, message: 'HTTPS 인증서를 발급하고 있습니다.' }
+  return { state: 'active', name, url: `https://${name}` }
 }
 
 export async function history(): Promise<DeployRecord[]> {

@@ -1,6 +1,7 @@
 import CodeView from '../components/CodeView'
+import DomainProgress from '../components/DomainProgress'
 import { IS_MOCK } from '../api'
-import type { DeployStatus } from '../types'
+import type { DeployStatus, DomainMode } from '../types'
 
 /** 배포 상태를 확인하지 못한 경우. 배포 실패와는 다름 */
 export interface PollIssue {
@@ -11,6 +12,8 @@ export interface PollIssue {
 interface Props {
   status: DeployStatus | null
   targetName: string
+  /** 사용자가 고른 도메인 방식 */
+  domainMode: DomainMode
   fixing: boolean
   pollIssue: PollIssue | null
   repolling: boolean
@@ -25,6 +28,7 @@ interface Props {
 export default function DeployStep({
   status,
   targetName,
+  domainMode,
   fixing,
   pollIssue,
   repolling,
@@ -88,6 +92,8 @@ export default function DeployStep({
           </div>
         </div>
       )}
+
+      {status.state === 'success' && status.domain && <DomainProgress status={status.domain} mode={domainMode} />}
 
       {status.state === 'failed' && (
         <div className="diagnosis">

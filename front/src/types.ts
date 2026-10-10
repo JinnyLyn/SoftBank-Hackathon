@@ -140,8 +140,64 @@ export interface TerraformBundle {
   planInfo?: PlanInfo
 }
 
+// ---------- 도메인 ----------
+
+/** own: 이미 가진 도메인 연결, buy: 새로 구매, later: 나중에 (AWS 기본 주소 사용) */
+export type DomainMode = 'own' | 'buy' | 'later'
+
+export interface DomainChoice {
+  mode: DomainMode
+  /** later 일 때는 빈 문자열 */
+  name: string
+}
+
+/** 구매 가능 여부와 가격 */
+export interface DomainQuote {
+  name: string
+  available: boolean
+  /** 1년 등록 가격. 구매를 지원하지 않는 확장자면 null */
+  priceUsdPerYear: number | null
+  reason?: string
+  suggestions?: string[]
+}
+
+export interface DnsRecord {
+  type: 'CNAME' | 'A' | 'ALIAS' | 'TXT' | 'NS'
+  name: string
+  value: string
+  /** 화면 설명 (예: "인증서 확인용") */
+  purpose: string
+}
+
+/** 서버가 확정한 도메인 계획. 비용 승인 화면에 앱 비용과 함께 보여 줌 */
+export interface DomainPlan {
+  mode: DomainMode
+  name: string | null
+  /** 1회 비용 (구매 1년치). 구매는 취소·환불되지 않음 */
+  oneTimeUsd: number
+  /** 매달 붙는 비용 (DNS 호스팅 등) */
+  monthlyUsd: number
+  /** 이미 가진 도메인일 때 사용자가 도메인 업체에 넣을 레코드. 값은 배포 뒤 확정될 수 있음 */
+  records: DnsRecord[]
+  note?: string
+}
+
+export type DomainState = 'skipped' | 'registering' | 'waiting_dns' | 'issuing_cert' | 'active' | 'failed'
+
+export interface DomainStatus {
+  state: DomainState
+  name: string | null
+  message?: string
+  /** waiting_dns 일 때 아직 확인되지 않은 레코드 */
+  records?: DnsRecord[]
+  /** active 일 때 접속 주소 */
+  url?: string
+}
+
 export interface DeployStatus {
   state: 'running' | 'success' | 'failed'
+  /** 도메인 연결 진행 상태. 앱 배포가 끝난 뒤에도 DNS·인증서 때문에 더 걸릴 수 있음 */
+  domain?: DomainStatus
   log: string[]
   url?: string
   /** 실패 시 AI가 로그를 보고 정리한 원인과 수정안 */

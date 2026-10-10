@@ -7,6 +7,11 @@ import type {
   ConnectionInput,
   DeployRecord,
   DeployStatus,
+  DnsRecord,
+  DomainChoice,
+  DomainPlan,
+  DomainQuote,
+  DomainStatus,
   Finding,
   Recommendation,
   ScaleInput,
@@ -348,12 +353,13 @@ export async function status(projectId: string): Promise<DeployStatus> {
     `/projects/${projectId}/status`,
   )
   if (!s) return { state: 'running', log: ['배포 대기열에 등록했습니다. worker가 가져가기를 기다리는 중입니다.'] }
+  const domain = toDomainStatus((s as { domain?: unknown }).domain)
   const d = s.diagnosis
   const diagnosis =
     isObj(d) && typeof d.cause === 'string' && typeof d.fix === 'string' && isObj(d.patch)
       ? (d as unknown as DeployStatus['diagnosis'])
       : undefined
-  return { state: s.state, log: s.log, url: s.url ?? undefined, diagnosis }
+  return { state: s.state, log: s.log, url: s.url ?? undefined, diagnosis, domain }
 }
 
 /** 배포 이력. 백엔드가 화면용 요약 필드(app, tier, monthlyUsd 등)를 같이 줌 */
@@ -388,4 +394,75 @@ export function saveConnection(input: ConnectionInput): Promise<Connection> {
   return input.id
     ? req<Connection>(`/connections/${input.id}`, send('PUT', body))
     : req<Connection>('/connections', send('POST', body))
+}
+
+// ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------
+// 서버에 아직 없으면 404/405가 오므로 501(미지원)로 바꿔 던짐 → 화면은 "나중에 연결"로 진행
+
+const DOMAIN_STATES = ['skipped', 'registering', 'waiting_dns', 'issuing_cert', 'active', 'failed']
+
+async function domainReq<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  try {
+    return await req<T>(path, init)
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405))
+      throw new ApiError(501, '서버에 도메인 기능이 아직 없습니다. 도메인 없이 AWS 기본 주소로 배포합니다.')
+    throw e
+  }
+}
+
+const toRecords = (v: unknown): DnsRecord[] =>
+  (Array.isArray(v) ? v : []).filter(isObj).map((r) => ({
+    type: str(r.type) as DnsRecord['type'],
+    name: str(r.name),
+    value: str(r.value),
+    purpose: str(r.purpose),
+  }))
+
+/** GET /api/domains/check?name= → { name, available, price_usd_per_year, reason?, suggestions? } */
+export async function checkDomain(name: string): Promise<DomainQuote> {
+  const r = await domainReq<Record<string, unknown>>(`/domains/check?${new URLSearchParams({ name })}`)
+  const price = r.price_usd_per_year
+  return {
+    name: str(r.name) || name,
+    available: r.available === true,
+    priceUsdPerYear: typeof price === 'number' || typeof price === 'string' ? Number(price) : null,
+    reason: r.reason ? str(r.reason) : undefined,
+    suggestions: Array.isArray(r.suggestions) ? r.suggestions.map(str) : undefined,
+  }
+}
+
+/** PUT /api/projects/{id}/domain { mode, name } → { mode, name, one_time_usd, monthly_usd, records, note } */
+export async function saveDomain(projectId: string, choice: DomainChoice): Promise<DomainPlan> {
+  const r = await domainReq<Record<string, unknown>>(
+    `/projects/${projectId}/domain`,
+    send('PUT', { mode: choice.mode, name: choice.mode === 'later' ? null : choice.name }),
+  )
+  return {
+    mode: (str(r.mode) || choice.mode) as DomainPlan['mode'],
+    name: r.name ? str(r.name) : null,
+    oneTimeUsd: Number(r.one_time_usd ?? 0),
+    monthlyUsd: Number(r.monthly_usd ?? 0),
+    records: toRecords(r.records),
+    note: r.note ? str(r.note) : undefined,
+  }
+}
+
+/**
+ * POST /api/projects/{id}/domain/approve { name, one_time_usd }
+ * 도메인 구매는 취소·환불되지 않으므로 사용자가 본 금액을 그대로 보내 서버가 다시 확인하게 함
+ */
+export async function confirmDomainPurchase(projectId: string, plan: DomainPlan): Promise<void> {
+  await domainReq(`/projects/${projectId}/domain/approve`, send('POST', { name: plan.name, one_time_usd: plan.oneTimeUsd }))
+}
+
+function toDomainStatus(v: unknown): DomainStatus | undefined {
+  if (!isObj(v) || !DOMAIN_STATES.includes(str(v.state))) return undefined
+  return {
+    state: str(v.state) as DomainStatus['state'],
+    name: v.name ? str(v.name) : null,
+    message: v.message ? str(v.message) : undefined,
+    records: toRecords(v.records),
+    url: v.url ? str(v.url) : undefined,
+  }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, NEEDS_CONNECTION, sourceName } from '../api'
+import { api, ApiError, NEEDS_CONNECTION, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
@@ -7,6 +7,8 @@ import ScaleStep, { budgetValid } from '../steps/ScaleStep'
 import AnalysisStep, { type CodeState } from '../steps/AnalysisStep'
 import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
+import DomainStep, { domainReady } from '../steps/DomainStep'
+import { domainDone } from '../components/DomainProgress'
 import { costText, tierTotal, usd } from '../format'
 import type { PollIssue } from '../steps/DeployStep'
 import type {
@@ -14,22 +16,35 @@ import type {
   Choice,
   Connection,
   DeployStatus,
+  DomainChoice,
+  DomainPlan,
+  DomainQuote,
   Recommendation,
   ScaleInput,
   Source,
   TerraformBundle,
 } from '../types'
 
+// 앱 제출 → 도메인 → 분석과 추천 → 비용 승인 → 진행 상태
+const SOURCE = 0
+const DOMAIN = 1
+const ANALYSIS = 2
+const REVIEW = 3
+const DEPLOY = 4
+
 const STEPS = [
+  { label: '앱 제출', title: '앱 제출', desc: '코드와 대략적인 사용 규모, 월 예산을 받습니다.' },
+  { label: '도메인', title: '도메인', desc: '가지고 있는 도메인을 연결하거나, 새로 사거나, 나중에 정할 수 있습니다.' },
+  { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과 구성별 비용을 비교합니다.' },
   {
-    label: '소스와 규모',
-    title: '소스와 사용 규모',
-    desc: '코드와 대략적인 사용 규모를 한 번에 받습니다. 분석, 구성 추천, 배포 코드까지 여기서 미리 만들어 둡니다.',
+    label: '비용 승인',
+    title: '비용 승인',
+    desc: '앱과 도메인 비용, 배포 계획을 확인하고 승인합니다. 승인하기 전에는 아무것도 만들거나 사지 않습니다.',
   },
-  { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과, 연결된 배포 대상별 구성과 비용을 나란히 비교합니다.' },
-  { label: '코드 검토', title: '코드 검토', desc: '미리 만들어 둔 코드와 변경 계획입니다. 승인하기 전에는 아무것도 만들지 않습니다.' },
-  { label: '배포', title: '배포', desc: '이미지를 빌드해 배포하고 헬스체크까지 확인합니다.' },
+  { label: '진행 상태', title: '진행 상태', desc: '빌드·배포·헬스체크와 도메인 연결(DNS, 인증서) 진행 상황입니다.' },
 ]
+
+const DEFAULT_DOMAIN: DomainChoice = { mode: 'later', name: '' }
 
 const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '', monthlyBudgetUsd: 30 }
 
@@ -42,6 +57,8 @@ const FIRST_DEADLINE_MS = 30 * 60 * 1000
 const REPOLL_DEADLINE_MS = 10 * 60 * 1000
 // 코드 검토 중 plan 파일 준비 여부를 다시 확인하는 간격
 const PLAN_READY_POLL_MS = 3000
+// 앱 배포가 끝난 뒤 도메인(DNS·인증서) 상태를 확인하는 간격
+const DOMAIN_POLL_MS = 3000
 
 type Busy = null | 'analyze' | 'approve' | 'fix'
 
@@ -65,7 +82,7 @@ export default function NewDeploy({
   onShowHistory,
   onShowConnections,
 }: Props) {
-  const [step, setStep] = useState(0)
+  const [step, setStep] = useState(SOURCE)
   const [source, setSourceState] = useState<Source | null>(null)
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
@@ -76,6 +93,12 @@ export default function NewDeploy({
   const [codeErrors, setCodeErrors] = useState<Record<string, string>>({})
   const [inflight, setInflight] = useState<Set<string>>(new Set())
   const [confirmed, setConfirmed] = useState(false)
+  const [domainChoice, setDomainChoiceState] = useState<DomainChoice>(DEFAULT_DOMAIN)
+  const [domainQuote, setDomainQuote] = useState<DomainQuote | null>(null)
+  // 서버가 확정한 도메인 계획. 분석(프로젝트 생성) 뒤에 저장
+  const [domainPlan, setDomainPlan] = useState<DomainPlan | null>(null)
+  const [domainNotice, setDomainNotice] = useState<string | null>(null)
+  const [purchaseConfirmed, setPurchaseConfirmed] = useState(false)
   const [approved, setApproved] = useState(false)
   const [deploy, setDeploy] = useState<DeployStatus | null>(null)
   // 올릴 때마다 상태 확인을 새로 시작 (새 배포, 다시 조회)
@@ -96,6 +119,9 @@ export default function NewDeploy({
     setCodeErrors({})
     setInflight(new Set())
     setConfirmed(false)
+    setDomainPlan(null)
+    setDomainNotice(null)
+    setPurchaseConfirmed(false)
   }
   const setSource = (s: Source | null) => {
     setSourceState(s)
@@ -104,6 +130,13 @@ export default function NewDeploy({
   const setScale = (s: ScaleInput) => {
     setScaleState(s)
     if (analysis) resetResults()
+  }
+  // 도메인을 바꾸면 분석은 그대로 두고 도메인 계획만 다시 저장
+  const setDomainChoice = (c: DomainChoice) => {
+    setDomainChoiceState(c)
+    setDomainPlan(null)
+    setDomainNotice(null)
+    setPurchaseConfirmed(false)
   }
 
   const prefetch = (projectId: string, c: Choice) => {
@@ -147,7 +180,15 @@ export default function NewDeploy({
           ? 'error'
           : 'idle'
 
-  const reached = approved ? 3 : bundle ? 2 : analysis && rec ? 1 : 0
+  const reached = approved
+    ? DEPLOY
+    : bundle && domainPlan
+      ? REVIEW
+      : analysis && rec && domainPlan
+        ? ANALYSIS
+        : source
+          ? DOMAIN
+          : SOURCE
   const locked = approved
 
   const option = rec?.options.find((o) => o.connectionId === choice?.connectionId) ?? null
@@ -168,7 +209,9 @@ export default function NewDeploy({
         if (stopped) return
         errors = 0
         setDeploy(s)
-        if (s.state !== 'running') return setBusy(null)
+        if (s.state !== 'running') setBusy(null)
+        // 앱이 끝나도 도메인(DNS·인증서)이 진행 중이면 계속 확인
+        if (s.state === 'failed' || (s.state === 'success' && domainDone(s.domain))) return
         if (Date.now() > deadlineRef.current) {
           setPollIssue({
             kind: 'timeout',
@@ -176,7 +219,7 @@ export default function NewDeploy({
           })
           return setBusy(null)
         }
-        timer = window.setTimeout(tick, POLL_MS)
+        timer = window.setTimeout(tick, s.state === 'running' ? POLL_MS : DOMAIN_POLL_MS)
       } catch (e) {
         if (stopped) return
         errors += 1
@@ -210,7 +253,7 @@ export default function NewDeploy({
   // 코드 검토 중 plan 파일이 아직 없으면, LLM을 다시 돌리지 않고 같은 계획의 준비 상태만 다시 읽음
   const planReady = bundle?.planInfo?.ready
   useEffect(() => {
-    if (step !== 2 || locked || !analysis || !choice || planReady !== false) return
+    if (step !== REVIEW || locked || !analysis || !choice || planReady !== false) return
     let stopped = false
     let timer: number | undefined
     const reviewedFingerprint = bundle?.planInfo?.fingerprint
@@ -247,11 +290,26 @@ export default function NewDeploy({
     }
   }
 
-  // 분석 → 추천(+추천 조합 코드)을 한 번에
+  // 도메인 계획 저장. 서버에 도메인 기능이 없으면(501) "나중에"로 진행하고 이유를 보여 줌
+  const saveDomain = async (projectId: string) => {
+    try {
+      setDomainPlan(await api.saveDomain(projectId, domainChoice))
+      setDomainNotice(null)
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 501)) throw e
+      setDomainPlan({ mode: 'later', name: null, oneTimeUsd: 0, monthlyUsd: 0, records: [] })
+      setDomainNotice(e.message)
+    }
+  }
+
+  // 분석 → 추천(+추천 조합 코드) → 도메인 계획 저장을 한 번에
+  // 이미 분석했으면 바뀐 도메인만 다시 저장
   const analyze = () =>
     run('analyze', async () => {
       if (!source) return
-      if (!analysis || !rec) {
+      if (analysis && rec) {
+        if (!domainPlan) await saveDomain(analysis.projectId)
+      } else {
         const a = await api.analyze(source, scale)
         const r = await api.recommend(a.projectId, scale)
         projectRef.current = a.projectId
@@ -262,17 +320,20 @@ export default function NewDeploy({
         setChoiceState(r.recommended)
         // 백엔드가 추천 조합 코드를 안 보냈으면 바로 요청
         if (r.recommended && !r.bundles?.[keyOf(r.recommended)]) prefetch(a.projectId, r.recommended)
+        await saveDomain(a.projectId)
       }
-      setStep(1)
+      setStep(ANALYSIS)
     })
 
   const approve = () =>
     run('approve', async () => {
       if (!analysis || !choice) return
+      // 도메인 구매는 사용자가 본 금액으로 먼저 확정 (환불 불가라 앱 승인과 따로 동의받음)
+      if (domainPlan?.mode === 'buy') await api.confirmDomainPurchase(analysis.projectId, domainPlan)
       await api.approve(analysis.projectId, choice)
       setApproved(true)
       setDeploy(null)
-      setStep(3)
+      setStep(DEPLOY)
       startPolling(FIRST_DEADLINE_MS)
     })
 
@@ -287,13 +348,15 @@ export default function NewDeploy({
       setConfirmed(false)
       setDeploy(null)
       setPollIssue(null)
-      setStep(2)
+      setStep(REVIEW)
     })
 
   const restart = () => {
     setPollIssue(null)
-    setStep(0)
+    setStep(SOURCE)
     setSourceState(null)
+    setDomainChoiceState(DEFAULT_DOMAIN)
+    setDomainQuote(null)
     setScaleState(DEFAULT_SCALE)
     resetResults()
     setApproved(false)
@@ -301,18 +364,26 @@ export default function NewDeploy({
     setError(null)
   }
 
+  const domainLabel =
+    domainChoice.mode === 'later'
+      ? '나중에'
+      : `${domainChoice.name || '이름 미입력'} (${domainChoice.mode === 'buy' ? '구매' : '보유'})`
+
   const railItems: RailItem[] = STEPS.map((s, i) => {
     let sub: string | undefined
-    if (i === 0 && source) sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명 · ${budgetValid(scale.monthlyBudgetUsd) ? usd(scale.monthlyBudgetUsd) : '예산 미입력'}`
-    if (i === 1 && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
-    if (i === 2 && bundle) sub = bundle.plan.add === null ? '계획 준비됨' : `${bundle.plan.add}개 추가`
-    if (i === 2 && !bundle && codeState === 'loading') sub = '코드 준비 중'
-    if (i === 3 && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
+    if (i === SOURCE && source)
+      sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명 · ${budgetValid(scale.monthlyBudgetUsd) ? usd(scale.monthlyBudgetUsd) : '예산 미입력'}`
+    if (i === DOMAIN && source) sub = domainLabel
+    if (i === ANALYSIS && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
+    if (i === REVIEW && bundle) sub = bundle.plan.add === null ? '계획 준비됨' : `${bundle.plan.add}개 추가`
+    if (i === REVIEW && !bundle && codeState === 'loading') sub = '코드 준비 중'
+    if (i === DEPLOY && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
+    if (i === DEPLOY && deploy?.state === 'success' && !domainDone(deploy.domain)) sub = '도메인 연결 중'
 
     let state: RailItem['state'] = 'todo'
-    if (i === 3 && deploy?.state === 'failed') state = 'failed'
+    if (i === DEPLOY && deploy?.state === 'failed') state = 'failed'
     else if (i === step) state = 'current'
-    else if (i < reached || (i === 3 && deploy?.state === 'success')) state = 'done'
+    else if (i < reached || (i === DEPLOY && deploy?.state === 'success')) state = 'done'
 
     return { label: s.label, sub, state, enabled: i <= reached && busy === null }
   })
@@ -320,28 +391,40 @@ export default function NewDeploy({
   const meta = STEPS[step]
 
   let next: { label: string; onClick: () => void; disabled?: boolean } | null = null
-  if (step === 0)
+  if (step === SOURCE)
     next = {
-      label: busy === 'analyze' ? '분석하고 코드 준비 중…' : analysis ? '다음' : '분석 시작',
-      onClick: analyze,
+      label: '다음: 도메인',
+      onClick: () => setStep(DOMAIN),
       disabled:
         !source || !budgetValid(scale.monthlyBudgetUsd) || (NEEDS_CONNECTION && !analysis && usable.length === 0),
     }
-  if (step === 1 && !locked) {
+  if (step === DOMAIN && !locked)
+    next = {
+      label: busy === 'analyze' ? '분석하고 계획 준비 중…' : analysis && domainPlan ? '다음' : '분석 시작',
+      onClick: analyze,
+      disabled: !domainReady(domainChoice, domainQuote),
+    }
+  if (step === DOMAIN && locked) next = { label: '다음', onClick: () => setStep(ANALYSIS) }
+  if (step === ANALYSIS && !locked) {
     if (codeState === 'error' && analysis && choice)
       next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
-    else if (!choice) next = { label: '코드 검토', onClick: () => {}, disabled: true }
+    else if (!choice) next = { label: '비용 승인', onClick: () => {}, disabled: true }
     else
       next = {
-        label: codeState === 'loading' ? '코드 준비 중…' : '코드 검토',
-        onClick: () => setStep(2),
+        label: codeState === 'loading' ? '계획 준비 중…' : '비용 승인',
+        onClick: () => setStep(REVIEW),
         disabled: codeState !== 'ready',
       }
   }
-  if (step === 1 && locked) next = { label: '다음', onClick: () => setStep(2) }
-  if (step === 2 && !locked)
-    next = { label: busy === 'approve' ? '승인 처리 중…' : '승인하고 배포', onClick: approve, disabled: !confirmed }
-  if (step === 2 && locked) next = { label: '배포 화면으로', onClick: () => setStep(3) }
+  if (step === ANALYSIS && locked) next = { label: '다음', onClick: () => setStep(REVIEW) }
+  if (step === REVIEW && !locked)
+    next = {
+      label:
+        busy === 'approve' ? '승인 처리 중…' : domainPlan?.mode === 'buy' ? '도메인 구매하고 배포' : '승인하고 배포',
+      onClick: approve,
+      disabled: !confirmed || (domainPlan?.mode === 'buy' && !purchaseConfirmed),
+    }
+  if (step === REVIEW && locked) next = { label: '진행 상태로', onClick: () => setStep(DEPLOY) }
 
   return (
     <div className="deploy-layout">
@@ -355,6 +438,13 @@ export default function NewDeploy({
               <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
             </small>
             <small className="muted">월 예산 {usd(scale.monthlyBudgetUsd)} 안</small>
+            {domainPlan && domainPlan.mode !== 'later' && (
+              <small>
+                도메인 {domainPlan.name}
+                {domainPlan.oneTimeUsd > 0 && ` · 1회 ${usd(domainPlan.oneTimeUsd)}`}
+                {domainPlan.monthlyUsd > 0 && ` · 매달 +${usd(domainPlan.monthlyUsd)}`}
+              </small>
+            )}
             {rec && (rec.recommended?.connectionId !== option.connectionId || rec.recommended?.tier !== selectedTier.key) && (
               <small className="muted">AI 추천과 다른 선택</small>
             )}
@@ -378,7 +468,8 @@ export default function NewDeploy({
         )}
 
         <div className="panel-body">
-          {step === 0 && (
+          {domainNotice && (step === ANALYSIS || step === REVIEW) && <p className="readonly-note">{domainNotice}</p>}
+          {step === SOURCE && (
             <div className="stack-lg">
               <section>
                 <h3 className="sub-title">소스</h3>
@@ -399,7 +490,16 @@ export default function NewDeploy({
               </section>
             </div>
           )}
-          {step === 1 && analysis && rec && (
+          {step === DOMAIN && (
+            <DomainStep
+              choice={domainChoice}
+              quote={domainQuote}
+              locked={locked || busy === 'analyze'}
+              onChange={setDomainChoice}
+              onQuote={setDomainQuote}
+            />
+          )}
+          {step === ANALYSIS && analysis && rec && (
             <AnalysisStep
               analysis={analysis}
               rec={rec}
@@ -411,21 +511,25 @@ export default function NewDeploy({
               onChoice={setChoice}
             />
           )}
-          {step === 2 && bundle && option && selectedTier && (
+          {step === REVIEW && bundle && option && selectedTier && (
             <ReviewStep
               key={key}
               bundle={bundle}
               tier={selectedTier}
               target={option}
+              domain={domainPlan}
               confirmed={confirmed}
+              purchaseConfirmed={purchaseConfirmed}
               locked={locked}
               onConfirm={setConfirmed}
+              onPurchaseConfirm={setPurchaseConfirmed}
             />
           )}
-          {step === 3 && (
+          {step === DEPLOY && (
             <DeployStep
               status={deploy}
               targetName={option?.name ?? ''}
+              domainMode={domainPlan?.mode ?? 'later'}
               fixing={busy === 'fix'}
               pollIssue={pollIssue}
               repolling={busy === 'approve'}
@@ -437,9 +541,9 @@ export default function NewDeploy({
           )}
         </div>
 
-        {step < 3 && (
+        {step < DEPLOY && (
           <footer className="panel-foot">
-            {step > 0 ? (
+            {step > SOURCE ? (
               <button className="btn btn-ghost" onClick={() => setStep(step - 1)} disabled={busy !== null}>
                 이전
               </button>

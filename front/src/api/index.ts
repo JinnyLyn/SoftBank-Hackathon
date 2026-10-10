@@ -32,6 +32,9 @@ type Api = Pick<
   | 'applyFix'
   | 'status'
   | 'history'
+  | 'checkDomain'
+  | 'saveDomain'
+  | 'confirmDomainPurchase'
 >
 
 export const api: Api = USE_MOCK ? mock : backend
