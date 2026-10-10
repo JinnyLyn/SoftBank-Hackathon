@@ -19,11 +19,13 @@
 
 #### ZIP 업로드
 
-`POST /api/projects?name={프로젝트명}&filename={파일명}`
+`POST /api/projects?name={프로젝트명}&filename={파일명}&expected_users=~1,000&traffic_pattern=peak&monthly_budget_usd=30&purpose=서비스설명`
 
 - Body: ZIP 원본 바이트
 - Header: `Content-Type: application/zip` (또는 `application/octet-stream`)
 - 파일은 압축 해제하지 않고 저장합니다. 기본 최대 크기는 200 MiB이며 서버 설정으로 조정할 수 있습니다.
+- `expected_users`, `traffic_pattern`, `monthly_budget_usd`, `purpose`는 선택 입력입니다. 프런트 입력 계약에 맞춰 사용자 규모(`~100`, `~1,000`, `~10,000`, `10,000+`), 접속 패턴(`steady`, `peak`, `unknown`), USD 월 예산(0 이상), 서비스 설명(최대 2,000자)을 프로젝트 메타데이터로 저장합니다. 기존 요청은 그대로 유효하며 값이 없으면 `null`입니다.
+- `purpose`는 비밀값으로 판단되는 키·값이 포함되면 저장을 거부합니다. 프로젝트 메타데이터는 분석 결과를 대신하지 않으며 LLM/추천 모듈이 별도로 읽어 사용해야 합니다.
 
 #### GitHub 저장소 등록
 
@@ -33,7 +35,11 @@
 {
   "name": "sample-app",
   "repository_url": "https://github.com/owner/repository",
-  "ref": "main"
+  "ref": "main",
+  "expected_users": "~1,000",
+  "traffic_pattern": "peak",
+  "monthly_budget_usd": 30,
+  "purpose": "동아리 출석 체크"
 }
 ```
 
@@ -53,11 +59,15 @@
   "source_type": "zip",
   "source_url": null,
   "source_ref": null,
+  "expected_users": "~1,000",
+  "traffic_pattern": "peak",
+  "monthly_budget_usd": "30.0000",
+  "purpose": "동아리 출석 체크",
   "created_at": "2026-10-10T00:00:00Z"
 }
 ```
 
-GitHub 입력이면 `source_type`은 `github`이고 URL/ref가 채워집니다.
+GitHub 입력이면 `source_type`은 `github`이고 URL/ref가 채워집니다. 네 가지 규모/예산 입력도 응답에 포함됩니다.
 
 - `GET /api/projects?limit=20&cursor={next_cursor}`: `{ "items": [...], "next_cursor": "..." }` 반환. `limit`은 1~100입니다.
 - `GET /api/projects/{project_id}`: 프로젝트 상세 반환.

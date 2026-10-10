@@ -7,8 +7,9 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
 from starlette.concurrency import run_in_threadpool
@@ -224,6 +225,10 @@ async def create_project(
     request: Request,
     name: str = Query(min_length=1, max_length=120),
     filename: str = Query(default="project.zip", min_length=1, max_length=512),
+    expected_users: Literal["~100", "~1,000", "~10,000", "10,000+"] | None = None,
+    traffic_pattern: Literal["steady", "peak", "unknown"] | None = None,
+    monthly_budget_usd: Decimal | None = Query(default=None, ge=0, max_digits=12, decimal_places=4),
+    purpose: str | None = Query(default=None, max_length=2000),
 ) -> ProjectOut:
     content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
     if content_type not in {"application/zip", "application/octet-stream"}:
@@ -232,6 +237,9 @@ async def create_project(
     clean_name = name.strip()
     if not clean_name or any(not char.isprintable() for char in clean_name):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "프로젝트 이름을 입력해 주세요.")
+    clean_purpose = _clean_purpose(purpose)
+    if clean_purpose is not None:
+        _reject_secret_fields(clean_purpose)
     safe_filename = filename.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
     safe_filename = "".join(char for char in safe_filename if char.isprintable())[:255]
     project_id = uuid4()
@@ -240,17 +248,20 @@ async def create_project(
         with connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO projects
-                   (id, name, source_filename, source_path, source_sha256, source_size_bytes, source_type)
-                   VALUES (%s, %s, %s, %s, %s, %s, 'zip')""",
+                   (id, name, source_filename, source_path, source_sha256, source_size_bytes, source_type,
+                    expected_users, traffic_pattern, monthly_budget_usd, purpose)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'zip', %s, %s, %s, %s)""",
                 (
                     str(project_id), clean_name, safe_filename, str(stored.path),
-                    stored.sha256, stored.size_bytes,
+                    stored.sha256, stored.size_bytes, expected_users, traffic_pattern, monthly_budget_usd,
+                    clean_purpose,
                 ),
             )
             connection.commit()
             cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
-                          source_type, source_url, source_ref, created_at
+                          source_type, source_url, source_ref, expected_users, traffic_pattern,
+                          monthly_budget_usd, purpose, created_at
                    FROM projects WHERE id = %s""",
                 (str(project_id),),
             )
@@ -266,6 +277,9 @@ async def create_github_project(body: GitHubProjectIn) -> ProjectOut:
     clean_name = body.name.strip()
     if not clean_name or any(not char.isprintable() for char in clean_name):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "프로젝트 이름을 입력해 주세요.")
+    clean_purpose = _clean_purpose(body.purpose)
+    if clean_purpose is not None:
+        _reject_secret_fields(clean_purpose)
     project_id = uuid4()
     stored, source_url, source_ref = await run_in_threadpool(
         save_github_zip, body.repository_url, body.ref, project_id
@@ -276,15 +290,18 @@ async def create_github_project(body: GitHubProjectIn) -> ProjectOut:
             cursor.execute(
                 """INSERT INTO projects
                    (id, name, source_filename, source_path, source_sha256, source_size_bytes,
-                    source_type, source_url, source_ref)
-                   VALUES (%s, %s, %s, %s, %s, %s, 'github', %s, %s)""",
+                    source_type, source_url, source_ref, expected_users, traffic_pattern,
+                    monthly_budget_usd, purpose)
+                   VALUES (%s, %s, %s, %s, %s, %s, 'github', %s, %s, %s, %s, %s, %s)""",
                 (str(project_id), clean_name, filename, str(stored.path), stored.sha256,
-                 stored.size_bytes, source_url, source_ref),
+                 stored.size_bytes, source_url, source_ref, body.expected_users, body.traffic_pattern,
+                 body.monthly_budget_usd, clean_purpose),
             )
             connection.commit()
             cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
-                          source_type, source_url, source_ref, created_at
+                          source_type, source_url, source_ref, expected_users, traffic_pattern,
+                          monthly_budget_usd, purpose, created_at
                    FROM projects WHERE id = %s""",
                 (str(project_id),),
             )
@@ -305,7 +322,8 @@ def list_projects(
         if before:
             db_cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
-                          source_type, source_url, source_ref, created_at
+                          source_type, source_url, source_ref, expected_users, traffic_pattern,
+                          monthly_budget_usd, purpose, created_at
                    FROM projects WHERE (created_at, id) < (%s, %s)
                    ORDER BY created_at DESC, id DESC LIMIT %s""",
                 (before[0], before[1], limit + 1),
@@ -313,7 +331,8 @@ def list_projects(
         else:
             db_cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
-                          source_type, source_url, source_ref, created_at
+                          source_type, source_url, source_ref, expected_users, traffic_pattern,
+                          monthly_budget_usd, purpose, created_at
                    FROM projects ORDER BY created_at DESC, id DESC LIMIT %s""",
                 (limit + 1,),
             )
@@ -329,7 +348,8 @@ def get_project(project_id: UUID) -> ProjectOut:
     with connect() as connection, connection.cursor() as cursor:
         cursor.execute(
             """SELECT id, name, source_filename, source_sha256, source_size_bytes,
-                      source_type, source_url, source_ref, created_at
+                      source_type, source_url, source_ref, expected_users, traffic_pattern,
+                      monthly_budget_usd, purpose, created_at
                FROM projects WHERE id = %s""",
             (str(project_id),),
         )
@@ -1250,8 +1270,19 @@ def _project_out(row: dict[str, Any]) -> ProjectOut:
         id=UUID(row["id"]), name=row["name"], source_filename=row["source_filename"],
         source_sha256=row["source_sha256"], source_size_bytes=row["source_size_bytes"],
         source_type=row["source_type"], source_url=row.get("source_url"), source_ref=row.get("source_ref"),
+        expected_users=row.get("expected_users"), traffic_pattern=row.get("traffic_pattern"),
+        monthly_budget_usd=row.get("monthly_budget_usd"), purpose=row.get("purpose"),
         created_at=_as_utc(row["created_at"]),
     )
+
+
+def _clean_purpose(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if any(not char.isprintable() and char not in "\r\n\t" for char in cleaned):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "서비스 설명에 제어 문자를 사용할 수 없습니다.")
+    return cleaned or None
 
 
 def _connection_out(row: dict[str, Any]) -> ConnectionOut:
