@@ -987,6 +987,18 @@ def part_d():
     say("ok" if rc == 0 and re.fullmatch(re.escape(ECR) + r":abcd1234-r[0-9]+", out.strip()) else "fail", "D image-ref: ECR 주소:배포ID-r시각 형태로 출력", f"{out.strip()[:90]} {err[:60]}")
     rc, out, err = sh('export_foundation() { :; }; cmd_image_ref "../foundation"')
     say("ok" if rc != 0 and "deploy id" in err and out.strip() == "" else "fail", "D image-ref: 배포 ID 형식이 아니면 거부", err[:60])
+
+    # foundation-info: 최신 foundation 출력을 compact JSON 한 줄로 낸다(worker가 비용을 계산하기 전에 읽는다)
+    rc, out, err = sh('need() { :; }; export_foundation() { :; }; cmd_foundation_info')
+    try:
+        parsed = json.loads(out.strip())
+    except ValueError:
+        parsed = None
+    say("ok" if rc == 0 and len(out.strip().splitlines()) == 1 and parsed == FAKE_FOUNDATION else "fail",
+        "D foundation-info: foundation 출력을 JSON 한 줄로 낸다", f"rc={rc} {out.strip()[:80]} {err[:60]}")
+    rc, out, err = sh('need() { :; }; export_foundation() { die "foundation 출력을 읽지 못했습니다"; }; cmd_foundation_info')
+    say("ok" if rc != 0 and out.strip() == "" and "foundation 출력을 읽지 못했습니다" in err else "fail",
+        "D foundation-info: foundation 출력을 읽지 못하면 비정상 종료(캐시로 대신하지 않음)", f"rc={rc} {err[:60]}")
     rc, out, err = sh('main detect-arch')
     say("ok" if out.strip() in ("X86_64", "ARM64") else "fail", "D detect-arch 명령은 X86_64 또는 ARM64를 출력", out.strip()[:30] + err[:60])
 

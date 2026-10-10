@@ -19,6 +19,7 @@
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -282,15 +283,25 @@ def scale_from_analysis(result):
     """사용 규모·예산. 백엔드 API에 받는 곳이 없어서 분석 결과의 scale 필드에서 읽는다(없으면 기본값)."""
     s = result.get("scale") if isinstance(result, dict) else None
     s = s if isinstance(s, dict) else {}
+    # 분석 결과는 외부 모듈이 만든 값이라 타입을 믿지 않는다. 리스트·객체가 들어오면 cost.recommend의 딕셔너리 조회가
+    # 처리되지 않은 TypeError를 내서 worker 전체가 멈췄다(프로젝트 하나의 잘못된 입력은 그 프로젝트의 오류로만 처리한다)
+    users, pattern = s.get("expected_users"), s.get("traffic_pattern")
+    for name, value in (("expected_users", users), ("traffic_pattern", pattern)):
+        if value is not None and not isinstance(value, str):
+            raise PlanError(f"scale.{name}는 문자열이어야 합니다: {type(value).__name__}")
     budget = s.get("monthly_budget_usd")
     if budget is not None:
+        if isinstance(budget, bool):   # float(True) == 1.0 이라 숫자처럼 통과해 버린다
+            raise PlanError("scale.monthly_budget_usd가 숫자가 아닙니다: bool")
         try:
             budget = float(budget)
         except (TypeError, ValueError):
-            raise PlanError(f"scale.monthly_budget_usd가 숫자가 아닙니다: {budget!r}") from None
+            raise PlanError(f"scale.monthly_budget_usd가 숫자가 아닙니다: {type(budget).__name__}") from None
+        if not math.isfinite(budget):   # NaN·inf는 예산 비교를 모두 거짓으로 만든다
+            raise PlanError("scale.monthly_budget_usd는 유한한 숫자여야 합니다")
         if budget < 0:
             raise PlanError("scale.monthly_budget_usd는 0 이상이어야 합니다")
-    return s.get("expected_users"), s.get("traffic_pattern"), budget
+    return users, pattern, budget
 
 
 def sha256_file(path):
@@ -313,13 +324,24 @@ def discard_unapplied(cfg, deploy_id):
     shutil.rmtree(d, ignore_errors=True)
 
 
-def load_foundation(cfg):
-    """배포된 foundation의 출력(infra/deployments/foundation.json. deploy.sh가 호출될 때마다 갱신한다). 없거나 읽을 수 없으면 None."""
+def fetch_foundation(cfg, env):
+    """배포된 foundation의 **최신** 출력을 deploy.sh foundation-info로 읽는다(읽기 전용. foundation.json 캐시도 갱신한다).
+
+    비용은 이 값으로 계산해야 한다. 캐시 파일은 foundation을 다시 apply하기 전의 옛 구성일 수 있어, 읽기 전에 비용을 확정하면
+    예산을 넘는 구성이 추천된다. 읽지 못하면 옛 캐시로 대신하지 않고 PlanError로 멈춘다.
+    foundation-info는 compact JSON을 마지막 줄에 낸다(앞 줄은 진행 로그일 수 있다). 빈 객체면 None(기본 가정을 쓴다)."""
+    rc, out, err = run_capture(deploy(cfg, "foundation-info"), 120, cwd=str(INFRA), env=env)
+    if rc != 0:
+        raise PlanError("foundation 정보를 읽지 못해 비용을 계산할 수 없습니다(foundation이 apply됐는지, 자격 증명을 확인하세요): "
+                        + redact((err or out).strip())[-200:])
+    lines = [ln for ln in out.splitlines() if ln.strip()]
     try:
-        d = json.loads((cfg.deployments_dir / "foundation.json").read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else None
-    except (OSError, ValueError):
-        return None
+        d = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        raise PlanError("foundation 정보를 해석하지 못했습니다(deploy.sh foundation-info의 출력이 JSON이 아닙니다)")
+    return d or None
 
 
 def upload_plan(api, plan_id, plan_file):
@@ -376,8 +398,10 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     if not isinstance(src_sha, str) or not SHA256_RE.match(src_sha):
         raise PlanError("프로젝트의 source_sha256을 읽지 못했습니다(승인한 소스를 배포 직전에 확인하려면 필요합니다)")
     result = analysis.get("result", {})
-    users, pattern, budget = scale_from_analysis(result)
-    foundation = load_foundation(cfg)
+    users, pattern, budget = scale_from_analysis(result)   # 입력 검증을 먼저 한다(잘못된 입력에 deploy.sh를 부르지 않는다)
+    app_config_from_analysis(result, "lean")   # 앱 설정도 검증만 먼저 한다. 단계별 크기는 아래에서 고른 단계로 다시 정한다
+    env = child_env(cfg)
+    foundation = fetch_foundation(cfg, env)   # 비용을 확정하기 전에 최신 foundation 구성을 읽는다
     rec = cost.recommend(users, pattern, budget, prices, arch, foundation)
     if rec["recommended"] is None:
         raise PlanError(rec["reason"])
@@ -385,7 +409,6 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     est = rec["estimates"][tier]
     app, dockerfile = app_config_from_analysis(result, tier)
 
-    env = child_env(cfg)
     rc, out, err = run_capture(deploy(cfg, "make-id", f"{project['name']}|{project['id']}"), 60, env=env)
     deploy_id = out.strip()
     if rc != 0 or not DEPLOY_ID_RE.match(deploy_id):
@@ -640,9 +663,11 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             state.done[pid] = time.time()
             if plan.get("_upload_pending"):
                 state.repair.add(pid)
-        except (PlanError, ApiError, subprocess.TimeoutExpired, OSError) as e:
+        except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(잘못된 분석 결과 등)가 worker 전체를 멈추지 않게 한다
             state.failures[pid] = (tries + 1, time.time())
-            log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {redact(str(e))[:300]}")
+            expected = isinstance(e, (PlanError, ApiError, subprocess.TimeoutExpired, OSError))
+            kind = "" if expected else f"{type(e).__name__}: "   # 예상한 오류가 아니면 종류를 남겨 원인을 찾게 한다
+            log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {kind}{redact(str(e))[:300]}")
 
 
 def tick(api, cfg, state, prices=None, arch="X86_64"):

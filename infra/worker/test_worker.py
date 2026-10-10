@@ -28,6 +28,12 @@ FAKE_DEPLOY = r'''#!/usr/bin/env bash
 echo "$*" >> "$FAKE_LOG"
 cmd="$1"; shift
 case "$cmd" in
+  foundation-info)
+    # 최신 foundation 출력(compact JSON, 마지막 줄). FAIL이면 실패, FAKE_FOUNDATION_JSON이 있으면 그 값, 없으면 캐시 파일, 아무것도 없으면 {}
+    [ "${FAKE_FOUNDATION_FAIL:-0}" = "0" ] || { echo "foundation 출력을 읽지 못했습니다" >&2; exit 1; }
+    if [ -n "${FAKE_FOUNDATION_JSON:-}" ]; then echo "$FAKE_FOUNDATION_JSON"
+    elif [ -f "$FAKE_DEPLOYMENTS/foundation.json" ]; then tr -d '\n' < "$FAKE_DEPLOYMENTS/foundation.json"; echo
+    else echo '{}'; fi ;;
   make-id) echo "fake0001" ;;
   image-ref) echo "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps:$1-r1" ;;
   up)
@@ -166,7 +172,7 @@ class Base(unittest.TestCase):
         self.log_file = self.tmp / "calls.log"
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
-        for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG"):
+        for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
         os.environ["FAKE_HEARTBEAT"] = worker.posix(self.tmp / "heartbeat")
@@ -225,6 +231,25 @@ class CostTests(unittest.TestCase):
         spec = cost.estimate("lean", self.p, foundation=f)["resources"][-1]["spec"]
         self.assertIn("ALB 가용 영역 2개", spec)
         self.assertIn("탄력적 IP 1개", spec)
+
+    def test_task_public_ipv4_is_charged_per_task_when_there_is_no_nat(self):
+        # NAT 인스턴스가 없는 구성은 앱 태스크마다 공인 IPv4가 붙는다(시간당 $0.005 x 730 = 월 $3.65). 태스크 수만큼 앱 비용에 더한다
+        nonat = {"task_subnet_ids": ["a", "b"], "assign_public_ip": True}
+        withnat = {"task_subnet_ids": ["a", "b"], "assign_public_ip": False, "nat_instance_count": 1}
+        for tier, tasks in [("lean", 1), ("balanced", 1), ("roomy", 2)]:
+            with self.subTest(tier=tier):
+                a = cost.estimate(tier, self.p, foundation=nonat)
+                b = cost.estimate(tier, self.p, foundation=withnat)
+                self.assertAlmostEqual(a["app_monthly"] - b["app_monthly"], 3.65 * tasks, places=2)
+        e = cost.estimate("roomy", self.p, foundation=nonat)
+        self.assertIn("공인 IPv4 주소 (앱 태스크)", [r["service"] for r in e["resources"]])
+        self.assertAlmostEqual(sum(r["monthlyUsd"] for r in e["resources"]), e["total_monthly"], delta=0.05)   # 항목 합이 총액과 맞다
+        # foundation을 모르면 기본 가정(NAT 있음)이라 태스크 IPv4를 더하지 않는다
+        self.assertNotIn("공인 IPv4 주소 (앱 태스크)", [r["service"] for r in cost.estimate("lean", self.p)["resources"]])
+        # 예산 판정에도 들어간다: 이 비용이 빠져 있으면 예산을 살짝 넘는 구성이 추천됐다
+        bal = cost.estimate("balanced", self.p, foundation=nonat)["total_monthly"]
+        self.assertEqual(cost.recommend("~1,000", "steady", bal, self.p, foundation=nonat)["recommended"], "balanced")
+        self.assertEqual(cost.recommend("~1,000", "steady", bal - 0.01, self.p, foundation=nonat)["recommended"], "lean")
 
     def test_balanced_and_roomy_cost_more_and_roomy_runs_two_tasks(self):
         lean, bal, roomy = (cost.estimate(t, self.p)["total_monthly"] for t in cost.ORDER)
@@ -478,6 +503,24 @@ class PlannerTests(Base):
         worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
         self.assertNotIn(TOKEN, json.dumps(self.backend.created_plans))
 
+    def test_malformed_scale_values_are_plan_errors_not_crashes(self):
+        # 분석 결과의 scale 값이 리스트·객체·NaN이면 처리되지 않은 TypeError가 worker 전체를 멈췄다: 해당 프로젝트의 계획 오류로만 처리한다
+        cases = [("expected_users", [], False), ("expected_users", {}, False), ("expected_users", 123, False),
+                 ("traffic_pattern", [], False), ("traffic_pattern", {}, False), ("traffic_pattern", 5, False),
+                 ("monthly_budget_usd", True, False), ("monthly_budget_usd", float("nan"), False),
+                 ("monthly_budget_usd", float("inf"), False), ("monthly_budget_usd", "abc", False), ("monthly_budget_usd", [], False)]
+        for key, bad, _ in cases:
+            with self.subTest(key=key, bad=bad):
+                res = json.loads(json.dumps(GOOD_RESULT))
+                res["scale"][key] = bad
+                with self.assertRaises(worker.PlanError):
+                    worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        self.assertEqual(self.backend.created_plans, [])
+        # 올바른 값(문자열 사용자 수, 숫자 예산)은 그대로 통과한다
+        self.assertEqual(worker.scale_from_analysis({"scale": {"expected_users": "~100", "traffic_pattern": "peak", "monthly_budget_usd": "50"}}),
+                         ("~100", "peak", 50.0))
+        self.assertEqual(worker.scale_from_analysis({}), (None, None, None))
+
     def test_budget_too_small_raises_without_touching_backend_or_terraform(self):
         res = json.loads(json.dumps(GOOD_RESULT))
         res["scale"]["monthly_budget_usd"] = 20
@@ -485,7 +528,31 @@ class PlannerTests(Base):
             worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
         self.assertIn("예산", str(cm.exception))
         self.assertEqual(self.backend.created_plans, [])
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.calls(), ["foundation-info"])   # 읽기 전용인 foundation-info만 부른다(plan·ID 생성·빌드·적용은 하지 않는다)
+
+    def test_cost_uses_the_fresh_foundation_not_the_stale_cache_file(self):
+        # 캐시(옛 구성: 2 AZ + NAT 1대)로는 balanced가 $95.92라 예산 $100 안이지만, 지금 구성(3 AZ + NAT 3대)에서는 $106.87이라 넘는다
+        (self.tmp / "deployments" / "foundation.json").write_text(
+            json.dumps({"task_subnet_ids": ["a", "b"], "assign_public_ip": False, "nat_instance_count": 1}), encoding="utf-8")
+        os.environ["FAKE_FOUNDATION_JSON"] = json.dumps({"task_subnet_ids": ["a", "b", "c"], "assign_public_ip": False, "nat_instance_count": 3})
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"]["monthly_budget_usd"] = 100
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        self.assertEqual(body["variables"]["tier"], "lean")   # 옛 캐시였다면 balanced($106.87)가 예산을 넘은 채 추천됐다
+        self.assertLessEqual(float(body["cost_estimate"]["amount"]), 100)
+        # 비용 계산(foundation-info)이 계획 생성(up)보다 먼저다
+        calls = self.calls()
+        self.assertLess(calls.index("foundation-info"), [i for i, c in enumerate(calls) if c.startswith("up ")][0])
+
+    def test_unreadable_foundation_stops_planning_instead_of_using_the_cache(self):
+        (self.tmp / "deployments" / "foundation.json").write_text('{"task_subnet_ids": ["a"]}', encoding="utf-8")
+        os.environ["FAKE_FOUNDATION_FAIL"] = "1"
+        with self.assertRaises(worker.PlanError) as cm:
+            worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertIn("foundation 정보를 읽지 못해", str(cm.exception))
+        self.assertEqual(self.backend.created_plans, [])
+        self.assertFalse(any(c.startswith("up ") for c in self.calls()))
 
     def test_terraform_plan_failure_raises_and_registers_nothing(self):
         os.environ["FAKE_UP_RC"] = "1"
@@ -805,6 +872,24 @@ class LoopTests(Base):
         (self.tmp / "deployments" / "fake0001" / "tfplan").write_bytes(b"tampered")   # 등록된 SHA-256과 달라진다
         worker.plan_pending(self.api, self.cfg, self.state)
         self.assertEqual(self.backend.uploads, [])
+
+    def test_unexpected_error_in_one_project_does_not_stop_the_other_projects(self):
+        # 한 프로젝트의 예상 못 한 예외(예: 잘못된 분석 결과의 TypeError)가 worker 점검 전체를 중단하면 안 된다
+        bad = {"id": "bad-1", "name": "bad", "source_sha256": SRC_SHA}
+        self.backend.projects = [bad, PROJECT]
+        self.backend.analyses["bad-1"] = {"id": "a1", "result": GOOD_RESULT}
+        self.backend.analyses[PROJECT["id"]] = {"id": "a2", "result": GOOD_RESULT}
+        orig = worker.plan_project
+
+        def flaky(api, cfg, project, *a, **k):
+            if project["id"] == "bad-1":
+                raise TypeError("unhashable type: 'list'")
+            return orig(api, cfg, project, *a, **k)
+        worker.plan_project = flaky
+        self.addCleanup(setattr, worker, "plan_project", orig)
+        worker.plan_pending(self.api, self.cfg, self.state)   # 예외가 밖으로 나오지 않는다
+        self.assertEqual([p["project_id"] for p in self.backend.created_plans], [PROJECT["id"]])   # 다른 프로젝트는 계속 계획된다
+        self.assertEqual(self.state.failures["bad-1"][0], 1)
 
     def test_plan_created_once_for_analyzed_project(self):
         self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}

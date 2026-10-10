@@ -18,6 +18,7 @@
 #   deploy.sh db-check a1b2c3d4            # 앱 전용 DB 계정이 자기 DB만 쓸 수 있는지 확인한다
 #   deploy.sh destroy  a1b2c3d4 [--yes] [--drop-db]
 #   deploy.sh drop-db  a1b2c3d4 [--yes]    # 앱 전용 DB와 계정을 지운다 (되돌릴 수 없다)
+#   deploy.sh foundation-info              # foundation의 최신 출력을 JSON 한 줄로 낸다(읽기 전용. worker가 비용 계산 전에 호출)
 #   deploy.sh foundation-state             # foundation state를 S3로 옮긴다 (PAVED_STATE_BUCKET 필요)
 #
 # 필요한 것: terraform(>=1.6, S3 state(PAVED_STATE_BUCKET)를 쓰면 >=1.10), aws CLI(자격증명 설정 완료), python(python3 또는 python),
@@ -919,6 +920,15 @@ cmd_image_ref() {  # image-ref <id>
   echo "$(fjson ecr_repository_url):$id-r$(date +%s)"
 }
 
+# foundation의 최신 출력(deploy_inputs)을 compact JSON 한 줄로 낸다. 읽기 전용이다(foundation.json 캐시도 갱신한다).
+# worker가 비용을 계산하기 전에 지금 foundation 구성(가용 영역 수, NAT 유무)을 읽는 데 쓴다. 캐시 파일만 읽으면
+# foundation을 다시 apply하기 전의 옛 구성으로 비용을 확정해 예산을 넘는 구성이 추천될 수 있다
+cmd_foundation_info() {
+  need terraform
+  export_foundation
+  "$(pick_python)" -c "import json,sys;print(json.dumps(json.load(open(sys.argv[1],encoding='utf-8')),ensure_ascii=False,separators=(',',':')))" "$FOUNDATION_JSON"
+}
+
 # 소스(ZIP 또는 폴더)에서 이미지를 빌드해 foundation ECR에 올리고 이미지 주소를 표준 출력으로 낸다(진행 로그는 표준 오류).
 # 승인된 배포에만 실행한다(AGENTS.md 7장: Docker 빌드·실행에는 배포 승인과 실행 범위를 적용한다).
 # 빌드에는 호스트의 AWS 키나 docker 소켓을 넘기지 않는다
@@ -1430,6 +1440,7 @@ main() {
     make-id) make_id "${1:-}" ;;
     detect-arch) detect_arch ;;
     image-ref) cmd_image_ref "$@" ;;
+    foundation-info) cmd_foundation_info ;;
     foundation-state) cmd_foundation_state ;;
     db-check) export_foundation; cmd_db_check "$@" ;;
     drop-db) export_foundation; cmd_drop_db "$@" ;;

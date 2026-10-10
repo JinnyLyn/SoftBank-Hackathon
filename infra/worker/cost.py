@@ -70,7 +70,13 @@ def estimate(tier, prices, arch="X86_64", foundation=None):
     f = prices["fargate"][arch]
     per_task = (vcpu * f["vcpu_hour"] + gb * f["gb_hour"]) * hours
     tasks = cfg["min_tasks"]
-    app_monthly = per_task * tasks
+    compute_monthly = per_task * tasks
+    # NAT 인스턴스가 없는 구성(assign_public_ip=true)은 앱 태스크가 퍼블릭 서브넷에서 공인 IPv4를 직접 받는다.
+    # 공인 IPv4는 사용 중인 주소마다 시간당 요금이 붙으므로 태스크마다 더한다(공용 비용이 아니라 태스크가 늘면 같이 늘어나는 앱 비용).
+    # foundation 정보를 모르면 기본 가정(NAT 있음)이라 더하지 않는다
+    task_ipv4 = prices.get("public_ipv4_hour", 0.0) * hours if isinstance(foundation, dict) and foundation.get("assign_public_ip") is True else 0.0
+    task_ipv4_monthly = task_ipv4 * tasks
+    app_monthly = compute_monthly + task_ipv4_monthly
     alb = prices["alb_hour"] * hours
     rds = prices["rds"]
     rds_instance = rds["instance_hour"] * hours
@@ -80,8 +86,14 @@ def estimate(tier, prices, arch="X86_64", foundation=None):
     ipv4 = prices.get("public_ipv4_hour", 0.0) * n_ipv4 * hours
     shared = alb + rds_instance + rds_storage + ipv4
     resources = [
-        {"service": "ECS Fargate", "spec": f"{vcpu:g} vCPU / {gb:g} GB x {tasks}개 ({arch})", "monthlyUsd": _money(app_monthly),
+        {"service": "ECS Fargate", "spec": f"{vcpu:g} vCPU / {gb:g} GB x {tasks}개 ({arch})", "monthlyUsd": _money(compute_monthly),
          "why": f"{cfg['label']} 단계. 평소 {tasks}개, 부하가 늘면 최대 {cfg['max_tasks']}개까지 늘어나며 늘어난 만큼 비용이 더해짐"},
+    ]
+    if task_ipv4_monthly:
+        resources.append(
+            {"service": "공인 IPv4 주소 (앱 태스크)", "spec": f"{tasks}개 (NAT 없음: 태스크가 공인 IP를 직접 받음)", "monthlyUsd": _money(task_ipv4_monthly),
+             "why": "NAT 인스턴스가 없는 구성에서는 앱 태스크마다 공인 IPv4가 붙어 시간당 요금이 생김. 태스크가 늘면 같이 늘어남"})
+    resources += [
         {"service": "Application Load Balancer", "spec": "1개 (공용)", "monthlyUsd": _money(alb),
          "why": "모든 앱이 함께 쓰는 공용 진입점. 앱이 늘어도 늘지 않음"},
         {"service": "RDS MySQL", "spec": f"{rds['instance_class']}, {rds['storage_gb']} GB (공용)", "monthlyUsd": _money(rds_instance + rds_storage),
