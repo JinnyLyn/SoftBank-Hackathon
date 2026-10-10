@@ -8,7 +8,6 @@ import os
 import re
 from datetime import datetime, timezone
 from decimal import Decimal
-from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
@@ -19,8 +18,9 @@ from fastapi.exceptions import RequestValidationError
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.artifacts import artifact_exists, artifact_sha256, delete_artifact, iter_artifact, s3_enabled
 from app.database import check_database, connect
 from app.schemas import (
     AnalysisIn,
@@ -361,7 +361,7 @@ async def create_project(
                     expected_users, traffic_pattern, monthly_budget_usd, purpose)
                    VALUES (%s, %s, %s, %s, %s, %s, 'zip', %s, %s, %s, %s)""",
                 (
-                    str(project_id), clean_name, safe_filename, str(stored.path),
+                    str(project_id), clean_name, safe_filename, stored.storage_ref,
                     stored.sha256, stored.size_bytes, expected_users, traffic_pattern, monthly_budget_usd,
                     clean_purpose,
                 ),
@@ -377,7 +377,7 @@ async def create_project(
             row = cursor.fetchone()
         return _project_out(row)
     except Exception:
-        stored.path.unlink(missing_ok=True)
+        delete_artifact(stored.storage_ref)
         raise
 
 
@@ -402,7 +402,7 @@ async def create_github_project(body: GitHubProjectIn) -> ProjectOut:
                     source_type, source_url, source_ref, expected_users, traffic_pattern,
                     monthly_budget_usd, purpose)
                    VALUES (%s, %s, %s, %s, %s, %s, 'github', %s, %s, %s, %s, %s, %s)""",
-                (str(project_id), clean_name, filename, str(stored.path), stored.sha256,
+                (str(project_id), clean_name, filename, stored.storage_ref, stored.sha256,
                  stored.size_bytes, source_url, source_ref, body.expected_users, body.traffic_pattern,
                  body.monthly_budget_usd, clean_purpose),
             )
@@ -417,7 +417,7 @@ async def create_github_project(body: GitHubProjectIn) -> ProjectOut:
             row = cursor.fetchone()
         return _project_out(row)
     except Exception:
-        stored.path.unlink(missing_ok=True)
+        delete_artifact(stored.storage_ref)
         raise
 
 
@@ -466,6 +466,31 @@ def get_project(project_id: UUID) -> ProjectOut:
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
     return _project_out(row)
+
+
+@app.get("/api/worker/projects/{project_id}/source", tags=["worker"])
+def download_project_source(
+    project_id: UUID,
+    x_worker_token: str | None = Header(default=None),
+) -> StreamingResponse:
+    """Stream an uploaded source archive to a worker without sharing host paths."""
+    _require_worker(x_worker_token)
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT source_path, source_filename FROM projects WHERE id = %s",
+            (str(project_id),),
+        )
+        project = cursor.fetchone()
+    if project is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+    reference = project["source_path"]
+    if not artifact_exists(reference):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "저장된 소스 파일을 찾을 수 없습니다.")
+    return StreamingResponse(
+        iter_artifact(reference),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{project_id}.zip"'},
+    )
 
 
 @app.post(
@@ -962,6 +987,11 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
             job["status"] = "provisioning"
             job["variables"] = _json_value(job["variables"])
             job["cost_estimate"] = _json_value(job["cost_estimate"])
+            job["source_download_path"] = f"/api/worker/projects/{job['project_id']}/source"
+            job["terraform_plan_download_path"] = f"/api/worker/plans/{job['plan_id']}/terraform-plan"
+            if s3_enabled():
+                job["source_path"] = None
+                job["terraform_plan_path"] = None
             return {"job": _json_safe(job)}
 
 
@@ -998,7 +1028,7 @@ async def upload_terraform_plan(
                 """UPDATE deployment_plans SET terraform_plan_path = %s
                    WHERE id = %s AND target = 'aws' AND status = 'awaiting_approval'
                      AND terraform_plan_sha256 = %s AND terraform_plan_path <=> %s""",
-                (str(stored.path), str(plan_id), stored.sha256, plan["terraform_plan_path"]),
+                (stored.storage_ref, str(plan_id), stored.sha256, plan["terraform_plan_path"]),
             )
             if cursor.rowcount != 1:
                 cursor.execute("SELECT * FROM deployment_plans WHERE id = %s FOR UPDATE", (str(plan_id),))
@@ -1011,7 +1041,7 @@ async def upload_terraform_plan(
                     and _terraform_plan_is_valid(current)
                 ):
                     connection.rollback()
-                    stored.path.unlink(missing_ok=True)
+                    delete_artifact(stored.storage_ref)
                     return {
                         "plan_id": str(plan_id),
                         "sha256": stored.sha256,
@@ -1022,9 +1052,41 @@ async def upload_terraform_plan(
                 raise HTTPException(status.HTTP_409_CONFLICT, "plan 저장 중 계획 상태가 바뀌었습니다.")
             connection.commit()
     except Exception:
-        stored.path.unlink(missing_ok=True)
+        delete_artifact(stored.storage_ref)
         raise
     return {"plan_id": str(plan_id), "sha256": stored.sha256, "size_bytes": stored.size_bytes, "ready": True}
+
+
+@app.get("/api/worker/plans/{plan_id}/terraform-plan", tags=["worker"])
+def download_terraform_plan(
+    plan_id: UUID,
+    x_worker_token: str | None = Header(default=None),
+) -> StreamingResponse:
+    """Download an approved plan from the API's storage onto the execution worker."""
+    _require_worker(x_worker_token)
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT p.terraform_plan_path, p.terraform_plan_sha256
+               FROM deployment_plans p
+               WHERE p.id = %s AND p.target = 'aws'
+                 AND EXISTS (
+                   SELECT 1 FROM deployments d WHERE d.plan_id = p.id
+                     AND d.status IN ('provisioning', 'deploying')
+                 )""",
+            (str(plan_id),),
+        )
+        plan = cursor.fetchone()
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "실행 중인 배포의 Terraform plan을 찾을 수 없습니다.")
+    reference = plan.get("terraform_plan_path")
+    expected = plan.get("terraform_plan_sha256") or ""
+    if not artifact_exists(reference) or not hmac.compare_digest(artifact_sha256(reference) or "", expected):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Terraform plan의 SHA-256 검증에 실패했습니다.")
+    return StreamingResponse(
+        iter_artifact(reference),
+        media_type="application/octet-stream",
+        headers={"X-Terraform-Plan-SHA256": expected, "Content-Disposition": f'attachment; filename="{plan_id}.tfplan"'},
+    )
 
 
 @app.post("/api/worker/rollback-plans/{plan_id}/terraform-plan", tags=["worker"])
@@ -1056,15 +1118,15 @@ async def upload_rollback_terraform_plan(
                 """UPDATE deployment_plans SET terraform_plan_sha256 = %s, terraform_plan_path = %s, fingerprint = %s
                    WHERE id = %s AND operation_type = 'rollback' AND status = 'awaiting_approval'
                      AND terraform_plan_path IS NULL""",
-                (stored.sha256, str(stored.path), _fingerprint(payload), str(plan_id)),
+                (stored.sha256, stored.storage_ref, _fingerprint(payload), str(plan_id)),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
-                stored.path.unlink(missing_ok=True)
+                delete_artifact(stored.storage_ref)
                 raise HTTPException(status.HTTP_409_CONFLICT, "롤백 계획 상태가 변경되어 Terraform plan을 저장하지 못했습니다.")
             connection.commit()
     except Exception:
-        stored.path.unlink(missing_ok=True)
+        delete_artifact(stored.storage_ref)
         raise
     return {"plan_id": str(plan_id), "sha256": stored.sha256, "size_bytes": stored.size_bytes, "ready": False}
 
@@ -1220,14 +1282,8 @@ def _terraform_plan_is_valid(row: dict[str, Any]) -> bool:
     expected = row.get("terraform_plan_sha256")
     if not artifact_path or not expected:
         return False
-    digest = hashlib.sha256()
-    try:
-        with open(artifact_path, "rb") as artifact:
-            while chunk := artifact.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError:
-        return False
-    return hmac.compare_digest(digest.hexdigest(), expected)
+    actual = artifact_sha256(artifact_path)
+    return actual is not None and hmac.compare_digest(actual, expected)
 
 
 def _insert_event(cursor: Any, deployment_id: UUID, level: str, event_type: str, message: str, details: Any) -> None:
@@ -1458,10 +1514,7 @@ def _plan_out(row: dict[str, Any]) -> PlanOut:
         terraform_plan_sha256=row["terraform_plan_sha256"],
         terraform_plan_summary=_json_value(row["terraform_plan_summary"]) if row.get("terraform_plan_summary") else None,
         fingerprint=row["fingerprint"],
-        terraform_plan_ready=(
-            row["target"] != "aws"
-            or bool(row.get("terraform_plan_path") and Path(row["terraform_plan_path"]).is_file())
-        ),
+        terraform_plan_ready=(row["target"] != "aws" or artifact_exists(row.get("terraform_plan_path"))),
         status=row["status"], created_at=_as_utc(row["created_at"]),
         approved_at=_as_utc(row["approved_at"]) if row["approved_at"] else None,
     )

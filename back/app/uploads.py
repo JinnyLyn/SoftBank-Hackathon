@@ -15,7 +15,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 
+from app.artifacts import persist_file
 from app.settings import max_upload_bytes, plan_artifact_directory, upload_directory
 
 MAX_ZIP_ENTRIES = 20_000
@@ -26,9 +28,10 @@ MAX_TERRAFORM_PLAN_BYTES = 50 * 1024 * 1024
 
 @dataclass(frozen=True)
 class StoredUpload:
-    path: Path
+    path: Path | None
     sha256: str
     size_bytes: int
+    storage_ref: str
 
 
 async def save_project_zip(chunks: AsyncIterator[bytes], filename: str, project_id: UUID) -> StoredUpload:
@@ -58,9 +61,13 @@ async def save_project_zip(chunks: AsyncIterator[bytes], filename: str, project_
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "유효한 ZIP 파일이 아닙니다.")
         _validate_archive(Path(temporary_name))
         os.replace(temporary_name, final_path)
-        return StoredUpload(final_path, digest.hexdigest(), size)
+        local_path, storage_ref = await run_in_threadpool(
+            persist_file, final_path, f"projects/{project_id}/source.zip", "application/zip"
+        )
+        return StoredUpload(local_path, digest.hexdigest(), size, storage_ref)
     except Exception:
         Path(temporary_name).unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
         raise
 
 
@@ -135,17 +142,21 @@ def save_github_zip(repository_url: str, ref: str | None, project_id: UUID) -> t
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "GitHub가 유효한 ZIP 아카이브를 반환하지 않았습니다.")
         _validate_archive(Path(temporary_name))
         os.replace(temporary_name, final_path)
-        return StoredUpload(final_path, digest.hexdigest(), size), canonical_url, resolved_ref
+        local_path, storage_ref = persist_file(final_path, f"projects/{project_id}/source.zip", "application/zip")
+        return StoredUpload(local_path, digest.hexdigest(), size, storage_ref), canonical_url, resolved_ref
     except HTTPError as exc:
         Path(temporary_name).unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
         if exc.code == 404:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "GitHub ref를 찾을 수 없거나 접근 권한이 없습니다.") from exc
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub 저장소 아카이브를 다운로드하지 못했습니다.") from exc
     except (URLError, TimeoutError) as exc:
         Path(temporary_name).unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "GitHub 아카이브 다운로드에 실패했습니다.") from exc
     except Exception:
         Path(temporary_name).unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
         raise
 
 
@@ -176,13 +187,18 @@ async def save_terraform_plan(
         if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Terraform plan SHA-256이 요청값과 일치하지 않습니다.")
         os.replace(temporary_name, final_path)
+        local_path, storage_ref = await run_in_threadpool(
+            persist_file, final_path, f"plans/{plan_id}/{final_path.name}", "application/octet-stream"
+        )
         try:
-            final_path.chmod(0o600)
+            if local_path is not None:
+                local_path.chmod(0o600)
         except OSError:
             pass
-        return StoredUpload(final_path, digest.hexdigest(), size)
+        return StoredUpload(local_path, digest.hexdigest(), size, storage_ref)
     except Exception:
         Path(temporary_name).unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
         raise
 
 

@@ -15,6 +15,7 @@
 - Uvicorn standard `0.54.0`
 - PyMySQL `1.1.2`
 - cryptography `46.0.5`
+- boto3 `1.43.85` (private S3 artifact storage; only used when configured)
 - MySQL `8.4.11` (8.4 LTS; Compose image is pinned to this version)
 
 ### 로컬 Docker 개발 환경
@@ -27,7 +28,36 @@ docker compose run --rm api python -m app.cli migrate
 docker compose up -d --build api
 ```
 
-API 문서는 FastAPI가 제공하는 `http://127.0.0.1:8000/docs`와 `/openapi.json`에서 확인할 수 있습니다. 프런트 연동을 위한 요청·응답 계약과 흐름은 [`API.md`](API.md)를 참고하세요. 생존 확인은 `/health`, DB 연결 준비 확인은 `/ready`입니다. AWS/RDS 배포 시 Compose의 개발 계정 대신 비밀 저장소에서 주입한 `DATABASE_URL`을 사용하고, 업로드 디렉터리는 영속 저장소로 연결해야 합니다.
+API 문서는 FastAPI가 제공하는 `http://127.0.0.1:8000/docs`와 `/openapi.json`에서 확인할 수 있습니다. 프런트 연동을 위한 요청·응답 계약과 흐름은 [`API.md`](API.md)를 참고하세요. 생존 확인은 `/health`, DB 연결 준비 확인은 `/ready`입니다.
+
+### 서버 실행 환경 (AWS)
+
+API 서버와 배포 worker가 서로 다른 컨테이너/호스트에서 실행될 때 로컬 파일 경로는 공유되지 않습니다. 서버 배포에서는 ZIP과 Terraform plan을 API가 비공개 S3 버킷에 저장하고, worker는 worker 인증이 적용된 API 다운로드 경로로 파일을 받아야 합니다. `ARTIFACT_S3_BUCKET`이 비어 있으면 기존 로컬 개발 저장 방식이 사용됩니다.
+
+서버 설정:
+
+- `DATABASE_URL`: AWS RDS MySQL 주소. 개발 Compose 계정은 사용하지 말고 Secret Manager 등에서 주입합니다.
+- `AWS_REGION`: API가 사용할 AWS 리전입니다. 버킷도 같은 리전을 권장합니다.
+- `ARTIFACT_S3_BUCKET`: 비공개 artifact 버킷 이름.
+- `ARTIFACT_S3_PREFIX`: 버킷 안의 전용 경로 접두사(기본값 `paved-clouds`).
+- `ARTIFACT_S3_SSE`: 서버 측 암호화 방식. 기본 `AES256`; KMS를 쓰면 `aws:kms`로 설정합니다.
+- `ARTIFACT_S3_KMS_KEY_ID`: 선택 항목. KMS 키를 지정하면 API 역할에 해당 키의 encrypt/decrypt/data-key 권한도 부여해야 합니다.
+- API 실행 역할: 해당 prefix 아래에서 `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` 권한이 필요합니다. SDK 기본 자격 증명 체인을 사용하므로 서버 환경 변수에 IAM access key를 넣지 말고 ECS task role/EC2 instance role을 연결합니다.
+- `WORKER_API_TOKEN`: 백엔드와 worker에 동일하게 안전하게 주입합니다. worker는 공개 HTTPS API의 소스/plan 다운로드 경로에 `X-Worker-Token`을 포함해야 합니다.
+- `PUBLIC_API_BASE_URL`: worker와 브라우저가 접근할 실제 HTTPS 주소를 설정합니다. Compose의 `127.0.0.1:8000` 바인딩은 개발 전용입니다.
+
+`POST /api/worker/deployments/claim` 응답에는 `source_download_path`와 `terraform_plan_download_path`가 포함됩니다. worker는 이 경로를 API base URL에 붙여 각각 ZIP과 승인된 binary plan을 내려받아야 합니다. 따라서 **현재 `infra/worker`가 `source_path`·`terraform_plan_path`의 로컬 파일 공유를 전제로 한다면 S3 서버 모드 전환 전에 worker도 API 다운로드 방식으로 변경해야 합니다.** 이 변경 요청에서는 사용자가 지정한 범위에 따라 `back/`만 수정했습니다.
+
+S3 설정을 켜면 claim 응답에서 호스트 경로 필드(`source_path`, `terraform_plan_path`)를 `null`로 반환합니다. 이 값으로 실행하지 말고 다운로드 경로를 사용하세요. `GET /api/worker/plans/{plan_id}/terraform-plan`은 해당 plan을 쓰는 배포가 `provisioning` 또는 `deploying` 상태일 때만 허용하고 응답에 SHA-256을 제공합니다. worker는 다운로드한 plan의 해시도 대조해야 합니다.
+
+기존 DB의 경로가 API 호스트 로컬 디스크를 가리키는 경우 서버 설정만 바꿔서는 새 서버에서 파일을 찾을 수 없습니다. 원래 파일이 있는 환경에서 버킷·DB·`UPLOAD_DIR`·`PLAN_ARTIFACT_DIR`을 설정하고 아래 명령으로 먼저 사전 점검한 뒤 결과를 확인하고 실제 복사를 적용할 수 있습니다. 이 도구는 로컬 파일의 SHA-256을 DB 값과 대조하고 허용된 저장 디렉터리 안의 파일만 이관하며, 로컬 원본 파일은 삭제하지 않습니다. 중단되면 다시 실행할 수 있습니다.
+
+```powershell
+python -m app.cli migrate-artifacts
+python -m app.cli migrate-artifacts --apply
+```
+
+스키마 변경은 없으므로 새 설치에는 migration 추가가 필요하지 않습니다. 실제 S3·RDS 권한과 worker 연동을 확인하기 전에는 서버 배포 완료로 간주할 수 없습니다.
 
 로컬 작업자가 worker API를 사용할 때는 Compose를 실행하는 셸에 `WORKER_API_TOKEN`을 설정합니다. 값은 저장소에 기록하지 말고, worker에 같은 값을 `X-Worker-Token`으로 전달합니다. 별도 origin의 프런트를 연결하면 `CORS_ORIGINS`에 정확한 origin 목록을 쉼표로 구분해 설정합니다. 기본값은 CORS 비활성화입니다.
 
@@ -61,7 +91,7 @@ python tests/integration_connections.py
 
 ## 구현된 API
 
-모든 API 응답과 오류 본문은 JSON입니다. 시간은 UTC 기반 MySQL timestamp로 저장합니다.
+파일 다운로드 응답을 제외한 API 응답과 오류 본문은 JSON입니다. 시간은 UTC 기반 MySQL timestamp로 저장합니다.
 
 | 메서드 | 경로 | 기능 |
 |---|---|---|
@@ -89,12 +119,14 @@ python tests/integration_connections.py
 | `POST` | `/api/deployments/{id}/rollback` | 이전 `healthy` 설정을 바탕으로 새 rollback plan 초안 생성 |
 | `GET` | `/api/projects/{id}/status` | 프런트용 최근 배포 상태·로그 조회 |
 | `POST` | `/api/worker/deployments/claim` | 인증된 작업자가 대기 작업을 원자적으로 가져옴 |
+| `GET` | `/api/worker/projects/{id}/source` | 인증된 작업자에게 저장된 소스 ZIP을 스트리밍 |
+| `GET` | `/api/worker/plans/{id}/terraform-plan` | 실행 중인 배포의 plan을 SHA-256 검증 후 스트리밍 |
 | `POST` | `/api/worker/deployments/{id}/events` | 인증된 작업자의 상태 전이·이벤트 기록 |
 | `POST` | `/api/worker/plans/{id}/terraform-plan` | 인증된 작업자가 SHA-256을 검증한 binary plan을 저장 |
 
-ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로드 크기 기본 한도는 200 MiB이며 `MAX_UPLOAD_BYTES`로 조정할 수 있습니다. ZIP 경로 탈출, 심볼릭 링크, 암호화 ZIP, 과도한 압축 크기/압축률, 파일 수를 검사합니다. 원본은 DB에 넣지 않고 `UPLOAD_DIR`에 저장하며 DB에는 출처 유형, GitHub URL/ref(해당 시), 해시와 경로를 둡니다. GitHub 입력은 `https://github.com/{owner}/{repo}` 형식만 허용합니다.
+ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로드 크기 기본 한도는 200 MiB이며 `MAX_UPLOAD_BYTES`로 조정할 수 있습니다. ZIP 경로 탈출, 심볼릭 링크, 암호화 ZIP, 과도한 압축 크기/압축률, 파일 수를 검사합니다. 원본은 DB에 넣지 않고 로컬 개발에서는 `UPLOAD_DIR`, S3 모드에서는 private S3에 저장하며 DB에는 출처 유형, GitHub URL/ref(해당 시), 해시와 저장소 참조를 둡니다. GitHub 입력은 `https://github.com/{owner}/{repo}` 형식만 허용합니다.
 
-계획은 저장 시 정규 JSON으로 fingerprint를 계산합니다. AWS 계획은 비용 추정치와 저장된 Terraform plan의 SHA-256이 필요합니다. 작업자가 `/api/worker/plans/{id}/terraform-plan`으로 binary plan을 올리면 백엔드는 해시를 확인하고 별도 비공개 디렉터리에 저장합니다. 승인 전, 배포 등록 전, 작업자에게 전달하기 전에 파일 해시를 다시 확인합니다. 승인 요청이 받은 fingerprint와 DB의 값이 다르면 거부하고, 배포 등록 때에도 승인 당시 값과 다시 비교합니다. 승인은 한 번의 배포 등록에만 사용할 수 있습니다. 계획을 바꾸거나 재시도하려면 새 계획을 만들고 다시 승인해야 합니다. API는 승인만 기록하고 Terraform/Docker/AWS 명령을 실행하지 않습니다.
+계획은 저장 시 정규 JSON으로 fingerprint를 계산합니다. AWS 계획은 비용 추정치와 저장된 Terraform plan의 SHA-256이 필요합니다. 작업자가 `/api/worker/plans/{id}/terraform-plan`으로 binary plan을 올리면 백엔드는 해시를 확인하고 로컬 모드에서는 비공개 디렉터리, S3 모드에서는 private S3에 저장합니다. 승인 전, 배포 등록 전, 작업자에게 전달하기 전에 파일 해시를 다시 확인합니다. 승인 요청이 받은 fingerprint와 DB의 값이 다르면 거부하고, 배포 등록 때에도 승인 당시 값과 다시 비교합니다. 승인은 한 번의 배포 등록에만 사용할 수 있습니다. 계획을 바꾸거나 재시도하려면 새 계획을 만들고 다시 승인해야 합니다. API는 승인만 기록하고 Terraform/Docker/AWS 명령을 실행하지 않습니다.
 
 작업자 API는 `WORKER_API_TOKEN`이 설정되어야 사용할 수 있으며 `X-Worker-Token` 헤더를 비교합니다. 일반 배포와 롤백 작업 모두 `queued → provisioning → deploying → healthy` 또는 `failed`의 제한된 전이를 따릅니다. 롤백은 실패한 원래 배포를 바꾸지 않고, 별도 `operation_type: rollback` 이력으로 실행합니다. 로그의 흔한 credential 패턴은 저장 전에 마스킹합니다. 호출 측에서도 로그에 비밀을 보내지 않아야 합니다.
 
@@ -105,7 +137,7 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 ## DB 테이블
 
 - `connections`: AWS 연결 요청·상태, 외부 ID, 연결 완료 시 계정 ID와 IAM role ARN
-- `projects`: ZIP/GitHub 출처, 원본 경로·크기·SHA-256, 사용자 규모·접속 패턴·월 예산·서비스 설명(선택)
+- `projects`: ZIP/GitHub 출처, 원본 저장소 참조·크기·SHA-256, 사용자 규모·접속 패턴·월 예산·서비스 설명(선택)
 - `analyses`: 분석 스키마 버전, 원본 해시, JSON 결과
 - `deployment_plans`: 대상, 모듈 변수, 비용 추정치, plan digest, 승인 fingerprint와 시각
 - `deployments`: 일반 배포·사용자 승인 롤백별 실행 상태와 URL, 원래 실패 배포/복구 기준 정상 배포 연결

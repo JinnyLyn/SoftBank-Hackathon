@@ -215,6 +215,9 @@ CloudFormation callback과 worker 경로는 다음과 같습니다.
 - `POST /api/worker/rollback-plans/{plan_id}/terraform-plan`: 새 rollback Terraform binary plan을 저장합니다. `X-Terraform-Plan-SHA256` 헤더와 본문 해시가 같아야 하며, 기존 성공 배포의 plan을 재사용할 수 없습니다.
 - `POST /api/worker/rollback-plans/{plan_id}/summary`: 새 rollback plan의 SHA-256과 Terraform diff 요약을 저장합니다. 이 요약과 artifact가 모두 있어야 사용자 승인이 가능합니다.
 - `POST /api/worker/deployments/claim`: 대기 중인 AWS 일반 배포 또는 사용자 승인 롤백 작업 하나를 가져옵니다. 롤백 작업에는 `operation_type: "rollback"`, `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다. 없으면 `{ "job": null }`.
+- claim의 작업 객체에는 `source_download_path`와 `terraform_plan_download_path`가 포함됩니다. worker는 API base URL과 경로를 결합해 아래 다운로드 API에서 파일을 받아야 합니다. S3 artifact 모드에서는 `source_path`와 `terraform_plan_path`를 `null`로 반환하므로 호스트 파일 경로를 사용하지 않습니다. 로컬 개발 모드에서는 기존 경로 필드도 호환을 위해 남습니다.
+- `GET /api/worker/projects/{project_id}/source`: 원본 ZIP을 스트리밍합니다. S3 사용 여부와 관계없이 API가 저장소에서 읽어 주며, worker token이 필요합니다.
+- `GET /api/worker/plans/{plan_id}/terraform-plan`: 진행 중(`provisioning` 또는 `deploying`)인 배포의 binary plan을 스트리밍합니다. 저장된 SHA-256을 서버가 확인하고 `X-Terraform-Plan-SHA256` 응답 헤더로 전달합니다. worker도 받은 파일의 SHA-256을 대조해야 합니다.
 - `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 일반 배포와 롤백 모두 `queued → provisioning → deploying → healthy` 또는 `failed` 흐름을 사용합니다. 현재 상태와 같은 상태를 보내면 상태와 URL은 그대로 두고 로그 이벤트만 추가합니다. 다른 상태에서 `healthy`로 전이할 때는 HTTP(S) `url`이 필요합니다.
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.
 - `GET /api/worker/connections/pending`: worker 인증 후 처리할 대기 연결 배열을 반환합니다.
@@ -225,6 +228,8 @@ worker 이벤트의 `message`와 `details`는 DB 저장 전에 비밀값을 마�
 `environment: API_KEY=...`, 인용·이스케이프 JSON 문자열 안의 민감 키, 배열·객체 형태의 비밀값도 같은 경계에서 처리합니다. 분석 결과·계획 변수/설명·연결 설정·롤백 diff의 비밀값은 422로 거부하며 `python:3.12` 같은 일반 Docker 태그는 허용합니다.
 
 현재 API는 Terraform, Docker 또는 AWS 명령을 직접 실행하지 않습니다. 실제 worker 구현과 AWS 배포 검증은 별도 작업입니다.
+
+`ARTIFACT_S3_BUCKET`을 설정하면 ZIP과 plan artifact를 비공개 S3에 저장합니다. API 서버 역할에 설정된 bucket/prefix의 `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` 권한이 필요하며, AWS SDK 기본 자격 증명 체인을 사용합니다. bucket은 공개하지 말고, worker에는 S3 권한 대신 이 인증된 다운로드 API를 사용하게 합니다. 미설정 시 개발 호환을 위해 API 로컬 디스크를 사용합니다. 기존 로컬 artifact 이관은 `python -m app.cli migrate-artifacts`로 사전 점검하고, 결과 확인 후 `--apply`로 수행합니다. 이 명령은 허용 디렉터리 경계와 DB의 SHA-256 일치를 확인하며, 로컬 원본은 삭제하지 않습니다.
 
 대기열에서 가져온 작업의 Terraform plan 파일이 없거나 해시가 맞지 않으면 해당 배포를 `failed`로 바꾸고 오류 이벤트를 남긴 뒤, 다음 대기 작업을 계속 찾습니다. 하나의 손상된 작업이 나머지 작업을 막지 않도록 처리합니다.
 
