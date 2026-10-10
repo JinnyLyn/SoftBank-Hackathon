@@ -88,7 +88,7 @@ PR 승인·머지는 제품의 실제 AWS 배포 승인이 아니다. 실제 배
 - 문서 처리는 `이 PR에서 갱신`, `JinnyLyn 갱신 요청`, `변경 불필요` 중 하나로 표시한다. 바꿀 위치·문구 또는 변경 불필요 이유를 적고, 미결 사항과 확인할 담당자를 남긴다. 확정된 변경은 관련 문서를 같은 PR에서 갱신하고, 아직 확정되지 않은 내용은 팀 결정으로 기록하지 않는다.
 - JinnyLyn은 승인·머지 전에 보고 내용을 확인한다. 누락·불명확한 항목은 보완하고, 문서 수정은 PR에 반영하거나 후속 항목의 담당·링크를 PR에 남긴다. 결정이 필요한 내용은 `docs/OPEN_QUESTIONS.md`에 연결하고 그 결정에 의존하지 않는 작업은 계속한다.
 
-보고는 변경·우회를 자동 승인하지 않으며, 비밀 보호·실제 배포 승인 등 기존 실행 경계를 해제하지 않는다. 이 항목의 작성과 내용 확인은 작성자·리뷰 담당자의 책임이며, 현재 CI는 PR 본문을 자동 검사하지 않는다.
+보고는 변경·우회를 자동 승인하지 않으며, 비밀 보호·실제 배포 승인 등 기존 실행 경계를 해제하지 않는다. `Team Git Guard`의 기존 필수 검사에서 PR 본문의 보고 형식을 확인한다. 제목 누락, 선택 없음·중복, `해당 있음`의 상세 항목 누락·빈칸·TODO는 실패한다. 템플릿의 제목·항목 이름을 유지하고 미정이면 이유도 적는다. 주석·코드 블록에 넣은 보고는 인정하지 않는다. 본문을 수정하면 재검사되며, 보고 내용의 사실성과 충분성은 작성자·리뷰 담당자가 확인한다.
 
 ## 5. 검증 명령
 
@@ -99,6 +99,7 @@ PR 승인·머지는 제품의 실제 AWS 배포 승인이 아니다. 실제 배
 | 샘플 프런트 | `python -m http.server 8080 --bind 127.0.0.1 --directory sample-front` 후 `node scripts/ci/test_sample_front.mjs --url http://127.0.0.1:8080/ --mode mock` | Chrome에서 로그인·가입·글쓰기·응원·MOCK 표시 |
 | 앱 CI 판정 | `python -m unittest discover -s scripts/ci -p 'test_components.py' -v`와 `python scripts/ci/components.py inspect` | 누락된 실행 계약·예상 밖 skip·실패를 성공으로 처리하지 않음 |
 | Git 훅 | `python scripts/test_git_hooks.py` | 허용/차단 경로 회귀 검사. 외부 GitHub에는 쓰지 않음 |
+| PR 보고 | `python -m unittest discover -s scripts/ci -p 'test_pr_report.py' -v`, `python scripts/ci/check_pr_report.py --body-file <PR본문파일>` | 필수 보고 형식 검사. 내용의 사실성·누락된 우회 여부는 리뷰에서 확인 |
 | 설치 상태 | `python scripts/setup_git.py --check` | 개인 브랜치·훅 설치 버전 |
 | 샘플 백엔드 (PR #4 통합 후) | `bash scripts/ci/run_sample_stack.sh` | 실제 Docker·MySQL·API·화면, DB 중지 감지, CI 전용 볼륨 정리 |
 | 플랫폼 프런트 (PR #7 통합 후) | `npm ci --prefix front`와 `npm run build --prefix front` | 타입·빌드. CI는 MOCK/실제 API 설정을 각각 빌드하며 실제 연동 성공으로 보지 않음 |

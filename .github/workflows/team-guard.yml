@@ -3,12 +3,18 @@ name: Team Git Guard
 on:
   pull_request:
     branches: [main]
+    types: [opened, edited, synchronize, reopened]
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# 같은 PR 본문을 연달아 수정하면 최신 보고만 판정한다.
+concurrency:
+  group: team-guard-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   git-guard:
@@ -32,3 +38,12 @@ jobs:
         env:
           PYTHONUTF8: '1'
         run: python scripts/test_git_hooks.py
+      - name: PR 보고 검사 회귀 검증
+        env:
+          PYTHONUTF8: '1'
+        run: python -m unittest discover -s scripts/ci -p 'test_pr_report.py' -v
+      - name: PR 컨텍스트·워크플로 보고 확인
+        if: github.event_name == 'pull_request'
+        env:
+          PYTHONUTF8: '1'
+        run: python scripts/ci/check_pr_report.py
