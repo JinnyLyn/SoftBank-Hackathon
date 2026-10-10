@@ -22,6 +22,10 @@ class ProjectOut(APIModel):
     source_type: Literal["zip", "github"]
     source_url: str | None
     source_ref: str | None
+    expected_users: Literal["~100", "~1,000", "~10,000", "10,000+"] | None = None
+    traffic_pattern: Literal["steady", "peak", "unknown"] | None = None
+    monthly_budget_usd: Decimal | None = None
+    purpose: str | None = None
     created_at: datetime
 
 
@@ -29,6 +33,20 @@ class GitHubProjectIn(APIModel):
     name: str = Field(min_length=1, max_length=120)
     repository_url: str = Field(min_length=1, max_length=2048)
     ref: str | None = Field(default=None, min_length=1, max_length=255)
+    expected_users: Literal["~100", "~1,000", "~10,000", "10,000+"] | None = None
+    traffic_pattern: Literal["steady", "peak", "unknown"] | None = None
+    monthly_budget_usd: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=4)
+    purpose: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("purpose")
+    @classmethod
+    def purpose_is_printable(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if any(not char.isprintable() and char not in "\r\n\t" for char in cleaned):
+            raise ValueError("purpose must not contain control characters")
+        return cleaned or None
 
 
 class ConnectionIn(APIModel):
