@@ -225,7 +225,7 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
     options,
     assumptions: [
       `월 사용자 ${scale.expectedUsers}명, 월 예산 $${budget}, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
-      '클라우드는 서울 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
+      '클라우드는 상파울루(sa-east-1) 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
       '온프레미스는 전기, 회선 비용을 넣지 않음',
     ],
   }
@@ -370,7 +370,7 @@ export async function history(): Promise<DeployRecord[]> {
 }
 
 const HISTORY: DeployRecord[] = [
-    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.ap-northeast-2.elb.amazonaws.com', createdAt: '2026-10-07 14:12' },
+    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.sa-east-1.elb.amazonaws.com', createdAt: '2026-10-07 14:12' },
     { id: 'd5', app: 'club-attendance', version: 'v2', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'failed', note: '헬스체크 실패 → 포트 수정 후 v3', createdAt: '2026-10-07 13:58' },
     { id: 'd4', app: 'club-attendance', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', createdAt: '2026-10-05 18:03' },
     { id: 'd3', app: 'todo-api', version: 'v2', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', url: 'http://192.168.0.24:8080', createdAt: '2026-10-04 11:30' },
