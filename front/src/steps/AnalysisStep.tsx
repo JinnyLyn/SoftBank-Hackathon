@@ -209,7 +209,7 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
                             onClick={() => onChoice({ connectionId: o.connectionId, tier: t.key })}
                           >
                             <span className="cell-tags">
-                              {isRec(o.connectionId, t.key) && <span className="badge">AI 추천</span>}
+                              {isRec(o.connectionId, t.key) && <span className="badge">추천</span>}
                               {cheapest[t.key] === o.connectionId && rec.options.length > 1 && !over && (
                                 <span className="tag-low">최저</span>
                               )}
@@ -222,6 +222,7 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
                               <small className="cell-usual">평소 {usd(t.usualUsd)} · 부하 최대 기준</small>
                             )}
                             <small>{t.headline}</small>
+                            {compareOnly && !over && <small className="cell-note">금액 비교용 · 이 안은 배포 계획이 없어 고를 수 없음</small>}
                           </button>
                         </td>
                       )
@@ -231,6 +232,12 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: 
               </tbody>
             </table>
           </div>
+        )}
+        {rec.options.some((o) => o.tiers.some((t) => t.planned === false)) && (
+          <p className="hint">
+            배포 계획은 추천 안 하나로만 만듭니다. 다른 안으로 배포하려면 사용 규모·예산을 바꿔 다시 분석하세요(다른 안을 바로 고르는
+            기능은 백엔드·worker 연동 후 추가 예정).
+          </p>
         )}
 
         {option && selected && (
