@@ -41,6 +41,28 @@
 
 `schema_version` 은 `analysis/1`.
 
+## runner (`runner.py`)
+
+분석 결과가 없는 프로젝트를 찾아 분석하고 기록한다. 인프라 worker처럼 **백엔드와 같은 PC에서** 돌린다(업로드 ZIP을 직접 읽음).
+
+```bash
+python ai/runner.py           # 계속 돌며 5초마다 점검
+python ai/runner.py --once    # 한 번만 점검
+```
+
+| 설정 | 기본값 |
+|---|---|
+| `PLATFORM_API_URL` / `--api-url` | `http://127.0.0.1:8000` |
+| `UPLOAD_DIR` / `--upload-dir` | `back/data/uploads` (백엔드와 같은 변수·기본값) |
+
+1. `GET /api/projects` 로 프로젝트를 읽고(`next_cursor` 따라 최대 10페이지), `GET /analyses/latest` 가 404인 것만 처리
+2. `{UPLOAD_DIR}/{project_id}.zip` 을 읽고 **SHA-256이 프로젝트에 기록된 값과 같을 때만** 분석 (다르면 멈춤)
+3. 분석 결과에 비밀값이 남지 않았는지 확인한 뒤 `POST /api/projects/{id}/analyses`
+4. 실패하면 2분 뒤 다시, 3번 실패하면 그 프로젝트는 멈춤. 지문 불일치·삭제·형식 오류처럼 다시 보내도 같은 실패는 바로 멈춤
+5. 로그에는 프로젝트 ID·이름·결과 요약만 남긴다
+
+아직 LLM은 부르지 않는다(규칙 분석만). 백엔드 비밀값 검사 문제가 고쳐지기 전에는 기록이 422로 거절될 수 있고, 그 경우 runner가 이유를 로그에 남기고 멈춘다.
+
 ## 비밀값 가리기 (`masking.py`)
 
 - `.env`·키 파일(`*.pem`, `id_rsa` 등)은 내용을 보내지 않는다. `.env` 는 변수 이름만 남긴다.
@@ -72,6 +94,5 @@ python -m unittest discover -s tests -t . -v
 
 ## 남은 일
 
-- runner: 분석 결과가 없는 프로젝트를 찾아 업로드 ZIP을 읽고(SHA-256 확인) 분석해 기록
 - LLM: `unresolved` 값 채우기, 화면 문구 다듬기, 근거가 실제 파일·줄인지 확인
 - 백엔드: 사용 규모·예산 저장 위치, `_reject_secret_fields` 수정
