@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, ApiError, NEEDS_CONNECTION, sourceName } from '../api'
+import { api, ApiError, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
@@ -14,7 +14,6 @@ import type { PollIssue } from '../steps/DeployStep'
 import type {
   Analysis,
   Choice,
-  Connection,
   DeployStatus,
   DomainChoice,
   DomainPlan,
@@ -34,7 +33,7 @@ const DEPLOY = 4
 
 const STEPS = [
   { label: '앱 제출', title: '앱 제출', desc: '코드와 대략적인 사용 규모, 월 예산을 받습니다.' },
-  { label: '도메인', title: '도메인', desc: '가지고 있는 도메인을 연결하거나, 새로 사거나, 나중에 정할 수 있습니다.' },
+  { label: '도메인', title: '도메인', desc: '앱에 연결할 독립 도메인을 고릅니다. 나중에 정하면 미리보기 주소로 먼저 배포합니다.' },
   { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과 구성별 비용을 비교합니다.' },
   {
     label: '비용 승인',
@@ -66,22 +65,10 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
 
 interface Props {
-  connections: Connection[]
-  connectionsError: string | null
-  onReloadConnections: () => void
-  onConnectionsChange: (list: Connection[]) => void
   onShowHistory: () => void
-  onShowConnections: () => void
 }
 
-export default function NewDeploy({
-  connections,
-  connectionsError,
-  onReloadConnections,
-  onConnectionsChange,
-  onShowHistory,
-  onShowConnections,
-}: Props) {
+export default function NewDeploy({ onShowHistory }: Props) {
   const [step, setStep] = useState(SOURCE)
   const [source, setSourceState] = useState<Source | null>(null)
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
@@ -193,7 +180,6 @@ export default function NewDeploy({
 
   const option = rec?.options.find((o) => o.connectionId === choice?.connectionId) ?? null
   const selectedTier = option?.tiers.find((t) => t.key === choice?.tier) ?? null
-  const usable = connections.filter((c) => c.status === 'connected')
 
   // 승인 후 상태 확인. 끝나거나(성공·실패), 기한을 넘기거나, 화면을 떠나거나, 새로 조회하면 멈춤
   // 기한 초과·조회 실패는 배포 실패가 아님 → pollIssue로 안내만 하고 다시 조회는 사용자가 누름
@@ -366,7 +352,7 @@ export default function NewDeploy({
 
   const domainLabel =
     domainChoice.mode === 'later'
-      ? '나중에'
+      ? '나중에 (미리보기)'
       : `${domainChoice.name || '이름 미입력'} (${domainChoice.mode === 'buy' ? '구매' : '보유'})`
 
   const railItems: RailItem[] = STEPS.map((s, i) => {
@@ -395,8 +381,7 @@ export default function NewDeploy({
     next = {
       label: '다음: 도메인',
       onClick: () => setStep(DOMAIN),
-      disabled:
-        !source || !budgetValid(scale.monthlyBudgetUsd) || (NEEDS_CONNECTION && !analysis && usable.length === 0),
+      disabled: !source || !budgetValid(scale.monthlyBudgetUsd),
     }
   if (step === DOMAIN && !locked)
     next = {
@@ -477,16 +462,7 @@ export default function NewDeploy({
               </section>
               <section>
                 <h3 className="sub-title">사용 규모</h3>
-                <ScaleStep
-                  scale={scale}
-                  locked={locked || busy === 'analyze'}
-                  connections={connections}
-                  connectionsError={connectionsError}
-                  onReloadConnections={onReloadConnections}
-                  onChange={setScale}
-                  onConnectionsChange={onConnectionsChange}
-                  onShowConnections={onShowConnections}
-                />
+                <ScaleStep scale={scale} locked={locked || busy === 'analyze'} onChange={setScale} />
               </section>
             </div>
           )}

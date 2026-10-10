@@ -219,6 +219,6 @@ export default function ReviewStep({
 }
 
 function domainSummary(domain: DomainPlan | null) {
-  if (!domain || domain.mode === 'later') return '나중에'
+  if (!domain || domain.mode === 'later') return '나중에 (미리보기)'
   return domain.mode === 'buy' ? `구매 ${usd(domain.oneTimeUsd)}/년` : '보유 도메인'
 }

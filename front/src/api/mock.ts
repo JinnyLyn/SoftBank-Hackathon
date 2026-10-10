@@ -32,6 +32,18 @@ let deployChoice: Choice | null = null
 
 // ---------- 연결 ----------
 
+// 연결이 없어도 배포할 곳: 운영자가 준비한 AWS (관리형 배포)
+const MANAGED_AWS: Connection = {
+  id: 'managed-aws',
+  provider: 'aws',
+  name: '관리형 AWS',
+  status: 'connected',
+  detail: '운영자가 준비한 계정',
+  checkedAt: '2026-10-10 00:00',
+  fields: {},
+}
+const findConnection = (id?: string) => connections.find((c) => c.id === id) ?? MANAGED_AWS
+
 let connections: Connection[] = [
   {
     id: 'c1',
@@ -181,6 +193,7 @@ const total = (resources: { monthlyUsd: number }[]) => resources.reduce((s, r) =
 export async function recommend(_projectId: string, scale: ScaleInput): Promise<Recommendation> {
   await wait(700)
   const usable = connections.filter((c) => c.status === 'connected' && isEnabled(c.provider))
+  if (!usable.some((c) => c.provider === 'aws')) usable.unshift(MANAGED_AWS)
   const options = usable.map((c) => ({
     connectionId: c.id,
     provider: c.provider,
@@ -249,7 +262,7 @@ export async function generate(_projectId: string, choice: Choice): Promise<Terr
 }
 
 function buildBundle(choice: Choice): TerraformBundle {
-  const conn = connections.find((c) => c.id === choice.connectionId)!
+  const conn = findConnection(choice.connectionId)
   const tier = findTier(conn.provider, choice.tier)
   const n = tier.resources.length
   return {
@@ -280,7 +293,7 @@ const HOST_PATCH = {
 
 export async function status(_projectId: string): Promise<DeployStatus> {
   await wait(120)
-  const conn = connections.find((c) => c.id === deployChoice?.connectionId)!
+  const conn = findConnection(deployChoice?.connectionId)
   const tier = findTier(conn.provider, deployChoice!.tier)
   const script = logScript(conn.provider, tier, conn.fields.host)
   const end = script[script.length - 1][0] + 1200
@@ -344,7 +357,7 @@ export async function saveDomain(_projectId: string, choice: DomainChoice): Prom
   await wait(300)
   domainChoice = choice
   if (choice.mode === 'later')
-    return { mode: 'later', name: null, oneTimeUsd: 0, monthlyUsd: 0, records: [], note: 'AWS 기본 주소로 접속합니다. 도메인은 나중에 연결할 수 있습니다.' }
+    return { mode: 'later', name: null, oneTimeUsd: 0, monthlyUsd: 0, records: [], note: '독립 도메인 없이 미리보기 주소(AWS 기본 주소)로 접속합니다. 도메인 연결 완료가 아닙니다. 도메인은 나중에 연결할 수 있습니다.' }
   if (choice.mode === 'own')
     return { mode: 'own', name: choice.name, oneTimeUsd: 0, monthlyUsd: 0, records: appRecords(choice.name) }
   const price = TLD_PRICE[choice.name.split('.').pop() ?? ''] ?? 0
@@ -366,7 +379,7 @@ export async function confirmDomainPurchase(_projectId: string, _plan: DomainPla
 /** 앱 배포가 끝난 뒤 지난 시간(ms)에 따라 도메인 단계를 흉내 */
 function domainProgress(since: number, appUrl: string): DomainStatus {
   const { mode, name } = domainChoice
-  if (mode === 'later') return { state: 'skipped', name: null, message: '도메인 없이 AWS 기본 주소로 접속합니다.', url: appUrl }
+  if (mode === 'later') return { state: 'skipped', name: null, message: '독립 도메인 없이 미리보기 주소(AWS 기본 주소)로 접속합니다. 도메인 연결 완료가 아닙니다.', url: appUrl }
   if (mode === 'buy' && since < 3000) return { state: 'registering', name, message: '도메인을 등록하고 있습니다. 보통 몇 분 걸립니다.' }
   if (mode === 'own' && since < 4000)
     return { state: 'waiting_dns', name, message: '도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.', records: appRecords(name) }

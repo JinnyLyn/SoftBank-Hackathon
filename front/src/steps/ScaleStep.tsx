@@ -1,9 +1,5 @@
-import ProviderMark from '../components/ProviderMark'
-import QuickConnect from '../components/QuickConnect'
-import LoadError from '../components/LoadError'
 import { ONPREM_ENABLED } from '../providers'
-import { NEEDS_CONNECTION } from '../api'
-import type { Connection, ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
+import type { ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
 
 const USERS: { value: ExpectedUsers; note: string }[] = [
   { value: '~100', note: '시연, 지인 테스트' },
@@ -25,27 +21,11 @@ export const budgetValid = (n: number) => Number.isFinite(n) && n >= 1
 interface Props {
   scale: ScaleInput
   locked: boolean
-  connections: Connection[]
-  connectionsError: string | null
-  onReloadConnections: () => void
   onChange: (s: ScaleInput) => void
-  onConnectionsChange: (list: Connection[]) => void
-  onShowConnections: () => void
 }
 
-export default function ScaleStep({
-  scale,
-  locked,
-  connections,
-  connectionsError,
-  onReloadConnections,
-  onChange,
-  onConnectionsChange,
-  onShowConnections,
-}: Props) {
-  const usable = connections.filter((c) => c.status === 'connected')
-  const skipped = connections.length - usable.length
-
+// 관리형 배포: 사용자 AWS 계정 연결은 새 배포의 전제조건이 아님 (docs/PRODUCT_DIRECTION.md §1)
+export default function ScaleStep({ scale, locked, onChange }: Props) {
   return (
     <div className="stack">
       <fieldset className="field" disabled={locked}>
@@ -136,37 +116,12 @@ export default function ScaleStep({
         <p className="hint">몰리는 시간이나 저장하는 데이터 양을 적어 주면 사양을 더 알맞게 고릅니다.</p>
       </div>
 
-      {!NEEDS_CONNECTION ? (
-        <div className="compare-note">
-          <div>
-            <strong>팀 AWS 계정에 배포합니다</strong>
-            <span className="hint">
-              플랫폼이 실행 중인 팀 AWS 계정으로 배포합니다. 개인 AWS 계정 연결은 준비 중입니다.
-            </span>
-          </div>
-        </div>
-      ) : connectionsError ? (
-        <LoadError what="연결 목록" message={connectionsError} onRetry={onReloadConnections} />
-      ) : usable.length === 0 && !locked ? (
-        <QuickConnect connections={connections} onChange={onConnectionsChange} />
-      ) : (
       <div className="compare-note">
         <div>
-          <strong>연결된 배포 대상 {usable.length}곳을 모두 비교합니다</strong>
-          <span className="compare-targets">
-            {usable.map((c) => (
-              <span key={c.id}>
-                <ProviderMark provider={c.provider} /> {c.name}
-              </span>
-            ))}
-            {skipped > 0 && <span className="muted">확인이 필요한 {skipped}곳은 빠집니다</span>}
-          </span>
+          <strong>운영자가 준비한 AWS에 배포합니다</strong>
+          <span className="hint">AWS 계정이나 키가 없어도 됩니다. 플랫폼 운영자가 준비해 둔 AWS 환경에 앱을 올립니다.</span>
         </div>
-        <button className="link-btn" onClick={onShowConnections}>
-          연결 관리
-        </button>
       </div>
-      )}
     </div>
   )
 }

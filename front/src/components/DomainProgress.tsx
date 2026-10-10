@@ -26,8 +26,8 @@ export default function DomainProgress({ status, mode }: Props) {
     return (
       <div className="domain-progress">
         <div className="domain-head">
-          <strong>도메인</strong>
-          <span className="muted small">{status.message ?? '도메인 없이 AWS 기본 주소로 접속합니다.'}</span>
+          <strong>도메인 미연결 · 미리보기</strong>
+          <span className="muted small">{status.message ?? '독립 도메인 없이 미리보기 주소(AWS 기본 주소)로 접속합니다. 도메인 연결 완료가 아닙니다.'}</span>
         </div>
       </div>
     )

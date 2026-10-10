@@ -281,8 +281,8 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
     reason: pick
       ? str(pick[1].variables.reason) || pick[1].summary
       : `월 예산 ${usd(budget)} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 ${usd(planCost(sorted[0]))}입니다. 예산을 늘려 주세요.`,
-    // 개인 계정 연결이 없으면 worker가 쓰는 팀 AWS 계정으로 표시
-    options: [{ connectionId, provider: 'aws', name: aws?.name ?? '팀 AWS 계정', tiers }],
+    // 연결이 없으면 worker가 쓰는 운영자 AWS (관리형 배포)
+    options: [{ connectionId, provider: 'aws', name: aws?.name ?? '관리형 AWS', tiers }],
     assumptions: [
       `월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`,
       pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음',
@@ -412,7 +412,7 @@ async function domainReq<T>(path: string, init?: RequestInit & { timeoutMs?: num
     return await req<T>(path, init)
   } catch (e) {
     if (e instanceof ApiError && (e.status === 404 || e.status === 405))
-      throw new ApiError(501, '서버에 도메인 기능이 아직 없습니다. 도메인 없이 AWS 기본 주소로 배포합니다.')
+      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소)로 배포합니다. 독립 도메인은 연결되지 않습니다.')
     throw e
   }
 }

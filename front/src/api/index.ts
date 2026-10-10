@@ -11,12 +11,10 @@ const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 export const IS_MOCK = USE_MOCK
 
 /**
- * 배포 대상 연결이 있어야 새 배포를 시작할 수 있는지.
- * 실제 백엔드에서는 개인 AWS 계정 연결(CloudFormation 템플릿·연결 완료 처리)이 아직 없고,
- * 인프라 worker가 실행 PC의 팀 AWS 계정으로 배포하므로 연결 없이 진행한다 (10/10 결정).
- * mock은 가짜 연결로 대상별 비교를 보여 주므로 연결을 요구한다.
+ * 신규 도메인 구매를 화면에 보일지. 서버·인프라가 구매(등록인 정보·동의·결제·등록)를 지원할 때만 켬.
+ * 지원하지 않는데 구매 가능처럼 보이지 않게 함 (docs/PRODUCT_DIRECTION.md §3 프런트). mock은 시제품을 보여 주려고 켬
  */
-export const NEEDS_CONNECTION = USE_MOCK
+export const DOMAIN_PURCHASE = USE_MOCK || import.meta.env.VITE_DOMAIN_PURCHASE === 'true'
 
 // 화면은 api.* 만 부름. mock과 실제 백엔드(real.ts, back/API.md 기준)가 같은 모양을 지켜야 함
 type Api = Pick<

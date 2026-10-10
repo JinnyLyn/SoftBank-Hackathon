@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { api } from '../api'
+import { api, DOMAIN_PURCHASE } from '../api'
 import { usd } from '../format'
 import type { DomainChoice, DomainMode, DomainQuote } from '../types'
 
@@ -14,7 +14,7 @@ export const domainValid = (v: string) => DOMAIN_RE.test(v)
 const MODES: { key: DomainMode; title: string; desc: string }[] = [
   { key: 'own', title: '가지고 있는 도메인', desc: '이미 산 도메인을 연결합니다. 도메인 업체에서 레코드 2개를 추가하면 됩니다.' },
   { key: 'buy', title: '새로 구매', desc: '원하는 이름이 비어 있으면 대신 구매하고 DNS·인증서까지 자동으로 설정합니다.' },
-  { key: 'later', title: '나중에', desc: 'AWS가 주는 기본 주소로 먼저 배포합니다. 도메인은 나중에 연결할 수 있습니다.' },
+  { key: 'later', title: '나중에 (미리보기)', desc: '도메인 없이 미리보기 주소로 먼저 배포합니다. 독립 도메인은 연결되지 않은 상태이고, 나중에 연결할 수 있습니다.' },
 ]
 
 interface Props {
@@ -58,7 +58,7 @@ export default function DomainStep({ choice, quote, locked, onChange, onQuote }:
   return (
     <div className="stack">
       <div className="domain-modes" role="radiogroup" aria-label="도메인">
-        {MODES.map((m) => (
+        {MODES.filter((m) => m.key !== 'buy' || DOMAIN_PURCHASE).map((m) => (
           <button
             key={m.key}
             role="radio"

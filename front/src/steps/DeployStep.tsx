@@ -73,13 +73,21 @@ export default function DeployStep({
       {status.state === 'success' && (
         <div className="done-card">
           <div>
-            <span className="done-label">{IS_MOCK ? 'MOCK: 배포 완료 (예시, 실제로 배포되지 않음)' : '배포 완료'}</span>
+            <span className="done-label">{IS_MOCK ? 'MOCK: 앱 배포 완료 (예시, 실제로 배포되지 않음)' : '앱 배포 완료'}</span>
             {status.url ? (
               <a href={status.url} target="_blank" rel="noreferrer" className="mono">
                 {status.url}
               </a>
             ) : (
               <span className="muted small">접속 주소를 아직 받지 못했습니다.</span>
+            )}
+            {/* 독립 도메인이 연결되기 전 주소는 미리보기. 도메인 연결 성공으로 보이지 않게 (PRODUCT_DIRECTION §2) */}
+            {status.url && status.domain?.state !== 'active' && (
+              <span className="muted small">
+                {domainMode === 'later' || !status.domain || status.domain.state === 'skipped'
+                  ? '미리보기 주소입니다. 독립 도메인은 연결되지 않았습니다.'
+                  : '미리보기 주소입니다. 도메인 연결은 아래에서 진행 중입니다.'}
+              </span>
             )}
           </div>
           <div className="done-actions">
