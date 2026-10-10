@@ -378,6 +378,12 @@ _NEXT_ROUTES = [
 
 
 def _next_health(a: Analysis, repo: Repo) -> bool:
+    configs = repo.named("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts")
+    if configs:
+        # 실행 가능한 설정에는 basePath·rewrite·외부 설정이 있을 수 있다. 파일 경로만으로 URL을 확정하지 않는다.
+        a.unresolved["health_check_path"] = "Next.js 설정이 있어 basePath 등 실제 라우팅을 확인해야 합니다. 파일 경로만으로 헬스체크 URL을 확정하지 않습니다."
+        a.evidence.append(Evidence(configs[0].path, 1, configs[0].text.splitlines()[0] if configs[0].text else ""))
+        return True
     for path, pattern in _NEXT_ROUTES:
         f = next((x for x in sorted(repo.files, key=lambda x: (x.path.count("/"), x.path)) if pattern.search(x.path)), None)
         if f:

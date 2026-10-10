@@ -33,7 +33,7 @@ MAX_TOKENS = 16000
 MAX_PROMPT_CHARS = 120_000  # 보낼 파일 내용 상한 (대략 3만 토큰)
 MAX_NOTES = 5
 # 프롬프트·검증 규칙을 바꾸면 올림 → 캐시 키가 바뀌어 예전 답을 다시 쓰지 않음
-PROMPT_VERSION = "2026-10-11"
+PROMPT_VERSION = "2026-10-11-schema-validation-v2"
 
 # LLM에 물어볼 수 있는 값. 금액·크기는 여기 없음
 FILLABLE = {
@@ -120,7 +120,8 @@ class LlmOutcome:
 # ---------- 보낼 파일 고르기 ----------
 
 _MANIFESTS = {"requirements.txt", "pyproject.toml", "pipfile", "setup.py", "package.json", "go.mod", "pom.xml",
-              "build.gradle", "build.gradle.kts", ".env.example", ".env.sample", "procfile", "runtime.txt"}
+              "build.gradle", "build.gradle.kts", ".env.example", ".env.sample", "procfile", "runtime.txt",
+              "next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"}
 _ENTRY = re.compile(r"(?i)(^|/)(main|app|server|index|manage|wsgi|asgi|settings|config)\.(py|js|ts|mjs|cjs)$|application\.(properties|ya?ml)$")
 _HINTS = re.compile(r"(?i)\b(listen|port|route|@app\.|@router\.|app\.get|health|uvicorn|gunicorn)\b")
 _CODE = (".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".kt", ".go", ".rb")
@@ -379,9 +380,12 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
         for t in targets:
             outcome.rejected[t] = "LLM 답이 JSON이 아님"
         return outcome
-    # 형식이 맞는 답만 캐시 (PR #29 리뷰: 잘못된 답을 저장하면 같은 소스·모델에서 다시 묻지 못함).
-    # 근거 검증에서 버려지는 답은 형식은 맞으므로 저장해도 됨 (다시 물어도 같은 근거로 버려짐)
-    if not outcome.cached and _well_formed(data):
+    # 캐시 여부와 관계없이 스키마 검증이 끝나기 전에는 값·메모를 적용하지 않는다.
+    if not _well_formed(data):
+        for t in targets:
+            outcome.rejected[t] = "LLM 답이 출력 스키마와 맞지 않음"
+        return outcome
+    if not outcome.cached:
         cache.put(key, {"text": text, "stop_reason": stop_reason, "model": outcome.model})
 
     by_path = {f.path: f.text.splitlines() for f in masked}

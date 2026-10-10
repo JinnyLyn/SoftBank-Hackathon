@@ -30,10 +30,9 @@ class OllamaFillTests(unittest.TestCase):
         self.files = files()
         self.analysis = analyze_files(self.files)
 
-    def test_accepts_fenced_json_and_skips_answers_missing_fields(self):
-        # glm-5.3 실제 응답처럼 코드 블록으로 감싸고, 한 답은 근거 파일을 빼먹음
-        payload = {"answers": [answer("container_port", "5050", "config.py", 2), {"field": "framework", "value": "Flask"}],
-                   "notes": ["문자열 메모는 무시"]}
+    def test_accepts_schema_valid_fenced_json(self):
+        # 코드 블록으로 감싼 JSON도 전체 스키마를 통과하면 반영한다.
+        payload = {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}
         client = FakeOllama("```json\n" + json.dumps(payload) + "\n```")
         out = fill_unresolved(self.analysis, self.files, client, model="glm-5.3")
         self.assertEqual(out.filled, ["container_port"])
@@ -41,6 +40,19 @@ class OllamaFillTests(unittest.TestCase):
         self.assertEqual(out.model, "glm-5.3")
         self.assertIn("JSON 스키마", client.calls[0]["system"], "스키마를 강제하지 않으므로 형식을 프롬프트에도 적음")
         self.assertNotIn("FAKE-should-never-be-sent", client.calls[0]["user"])
+
+    def test_rejects_fenced_json_with_invalid_answer_or_note(self):
+        for payload in (
+            {"answers": [answer("container_port", "5050", "config.py", 2), {"field": "framework", "value": "Flask"}], "notes": []},
+            {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": ["문자열 메모"]},
+        ):
+            with self.subTest(payload=payload):
+                analysis = analyze_files(self.files)
+                client = FakeOllama("```json\n" + json.dumps(payload) + "\n```")
+                out = fill_unresolved(analysis, self.files, client)
+                self.assertEqual(out.filled, [])
+                self.assertIsNone(analysis.container_port)
+                self.assertIn("스키마", out.rejected["container_port"])
 
     def test_text_around_json_and_non_json(self):
         payload = {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}

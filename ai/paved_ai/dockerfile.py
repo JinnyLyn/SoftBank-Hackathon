@@ -164,20 +164,20 @@ def _node(files, framework: str, runtime: Optional[str], port: int) -> Tuple[Opt
         based_on.append(entry)
     has_build = isinstance(scripts.get("build"), str)
 
-    # 빌드가 있으면 개발 의존성(TypeScript·Vite 등)도 필요함 (PR #29 리뷰).
-    # NODE_ENV=production 은 매니저가 개발 의존성을 빼게 하므로 빌드가 끝난 뒤에 설정함
+    # start도 tsx·ts-node 같은 개발 의존성을 사용할 수 있어 초안에서는 모두 설치한다.
+    # NODE_ENV=production은 설치·빌드 뒤에 설정한다.
     if pm == "npm":
         lock = _root(files, "package-lock.json") is not None
-        install = ("npm ci" if lock else "npm install") + (" --include=dev" if has_build else " --omit=dev")
+        install = ("npm ci" if lock else "npm install") + " --include=dev"
         copy = ["COPY package*.json ./", f"RUN {install}", "COPY . ."]
         build = "npm run build"
     elif pm == "pnpm":
         # 워크스페이스(모노레포)는 하위 패키지의 package.json 이 모두 있어야 설치되므로 전체를 먼저 복사
-        install = "corepack enable && pnpm install --frozen-lockfile" + ("" if has_build else " --prod")
+        install = "corepack enable && pnpm install --frozen-lockfile"
         copy = ["COPY . .", f"RUN {install}"]
         build = "pnpm run build"
     else:
-        install = "corepack enable && yarn install" + ("" if has_build else " --production")
+        install = "corepack enable && yarn install"
         copy = ["COPY . .", f"RUN {install}"]
         build = "yarn build"
 

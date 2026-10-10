@@ -114,6 +114,32 @@ class DraftTests(unittest.TestCase):
         c = d["content"]
         self.assertLess(c.index("pnpm run build"), c.index("ENV NODE_ENV=production"))
 
+    def test_start_only_typescript_keeps_development_tools(self):
+        for lock in (None, "package-lock.json", "pnpm-lock.yaml", "yarn.lock"):
+            with self.subTest(lock=lock):
+                spec = {"package.json": json.dumps({"dependencies": {"express": "^4"},
+                        "devDependencies": {"tsx": "^4"}, "scripts": {"start": "tsx server.ts"}}),
+                        "server.ts": "app.listen(3000)\n"}
+                if lock:
+                    spec[lock] = "{}"
+                _, draft = draft_of(spec)
+                content = draft["content"]
+                self.assertNotIn("--omit=dev", content)
+                self.assertNotIn("--prod", content)
+                if lock in (None, "package-lock.json"):
+                    self.assertIn("--include=dev", content)
+                self.assertLess(content.index(" install") if lock != "package-lock.json" else content.index("npm ci"),
+                                content.index("ENV NODE_ENV=production"))
+
+    def test_next_config_keeps_health_url_unresolved(self):
+        pkg = json.dumps({"dependencies": {"next": "^15"}, "scripts": {"start": "next start"}})
+        for config in ("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"):
+            for route in ("app/page.tsx", "app/api/health/route.ts", "pages/index.js"):
+                with self.subTest(config=config, route=route):
+                    analysis = analyze_files(files(**{"package.json": pkg, config: "export default {basePath: '/shop'}\n", route: "export default function Page() {}\n"}))
+                    self.assertIsNone(analysis.health_check_path)
+                    self.assertIn("basePath", analysis.unresolved["health_check_path"])
+
     def test_next_health_path_from_file_routes(self):
         pkg = json.dumps({"private": True, "dependencies": {"next": "^15"}, "scripts": {"build": "next build", "start": "next start"}})
         app_router = analyze_files(files(**{"package.json": pkg, "src/app/page.tsx": "export default function P() {}\n"}))

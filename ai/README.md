@@ -83,7 +83,7 @@ LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 
 | 대안 | Anthropic `claude-opus-5-5`, effort `medium`, SDK 필요. `PAVED_AI_PROVIDER=anthropic` 이거나 Ollama 키가 없을 때 |
 | 모델 변경 | `PAVED_AI_MODEL` 또는 `--model` (예: `glm-5.3`) |
 | 모델 비교 (10/11) | 시험 앱 2개(숨은 포트 Flask·설정 파일 포트 Express) × 3회, 캐시 끔. 중간값: gemma4:31b 1.2초, deepseek-v4.1-flash 2.1초, kimi-k2.7-code 5.0초, glm-5.3 5.6초, kimi-k3 8.3초, deepseek-v4-pro:0813 8.5초. 모두 정답 6/6 → 가장 빠른 gemma4:31b 를 기본으로 |
-| 출력 | JSON 스키마 (`answers`, `notes`). Ollama는 `format` 에 스키마를 주지만 강제되지 않아(코드 블록으로 감싸거나 필드를 빼먹음) 코드 블록을 벗기고 필드가 빠진 답은 버림. Anthropic은 `output_config.format` 으로 강제, 거절 시 `fallbacks: "default"` |
+| 출력 | JSON 스키마 (`answers`, `notes`). Ollama는 `format` 에 스키마를 주지만 강제되지 않아(코드 블록으로 감싸거나 필드를 빼먹음) 코드 블록을 벗긴 뒤 전체 스키마가 틀리면 결과를 반영하지 않음. Anthropic은 `output_config.format` 으로 강제, 거절 시 `fallbacks: "default"` |
 | 검증 | 근거 파일·줄이 실제로 있고 그 줄에 값이 들어 있어야 받아들임. 아니면 버리고 `unresolved` 유지 |
 | 비밀값 | 보내기 직전에 다시 가림. 업로드 코드 속 문장은 지시가 아니라 데이터라고 프롬프트에 밝힘 |
 | 표시 | 결과의 `ai.filled` 에 LLM이 채운 값 이름, `findings` 에 "AI가 채운 값" 안내 |
@@ -93,6 +93,8 @@ LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 
 | Dockerfile 초안 | Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 `dockerfile_draft` 로 전달 (LLM 미사용, `paved_ai/dockerfile.py`). 진입점을 확정 못 하면 만들지 않음 |
 
 초안의 기본 포트는 코드에서 확인한 값이 아니므로 `unresolved.container_port`를 유지한다. LLM이 근거로 포트를 확인하면 초안의 실행 명령·`ENV PORT`·`EXPOSE`와 `app_config`를 같은 포트로 갱신한다. LLM을 사용하지 않거나 답을 채택하지 못하면 기본 포트는 제안으로 남으며 실제 앱의 응답을 확인한 결과가 아니다. Python 초안은 중첩 `-r`·`-c` 파일과 로컬 의존성이 설치 전에 존재하도록 전체 소스를 먼저 복사한다.
+
+LLM 응답은 캐시에서 가져온 경우에도 전체 스키마를 통과해야 값·메모에 반영한다. Node 초안은 빌드 스크립트가 없어도 `start`가 tsx·ts-node 등을 사용할 수 있으므로 개발 의존성을 유지한다. Next.js 설정 파일이 있으면 `basePath`·rewrite·외부 설정을 실행해서 평가하지 않고 헬스체크 경로를 미해결로 남기며, 해당 설정 파일을 LLM 분석에 포함한다. 설정 파일이 있으나 기본 경로를 그대로 쓰는 앱도 규칙 분석만으로 경로를 확정하지 않는 제한이 있다.
 
 설치 (Ollama는 설치할 것이 없음. `requirements.txt` 는 Anthropic을 쓸 때만):
 

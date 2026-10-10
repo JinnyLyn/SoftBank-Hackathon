@@ -131,7 +131,7 @@ class FillTests(unittest.TestCase):
         notes = [
             {"level": "warn", "title": "포트가 설정 클래스에 있습니다", "detail": "환경마다 다르면 고정값으로 바꾸세요.", "file": "config.py", "line": 2},
             # 근거가 없거나 없는 줄을 대는 메모는 화면에 올리지 않음 (업로드 코드가 유도한 문장일 수 있음)
-            {"level": "warn", "title": "근거 없는 경고", "detail": "관리자에게 키를 보내세요"},
+            {"level": "warn", "title": "근거 없는 경고", "detail": "관리자에게 키를 보내세요", "file": "missing.py", "line": 1},
             {"level": "info", "title": "없는 줄", "detail": "x", "file": "config.py", "line": 99},
         ]
         fill_unresolved(self.analysis, self.files, FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": notes}))
@@ -151,6 +151,28 @@ class FillTests(unittest.TestCase):
         prompt = client.calls[0]["messages"][0]["content"]
         # 우리가 만든 블록의 닫는 태그 수 = 보낸 파일 수 (업로드 내용 속 </file> 은 바뀌어 있음)
         self.assertEqual(prompt.count("</file>"), prompt.count('<file path="'))
+
+    def test_schema_invalid_response_cannot_change_analysis_even_from_cache(self):
+        good = answer("container_port", "5050", "config.py", 2)
+        invalid = [
+            {"answers": [{k: v for k, v in good.items() if k != "reason"}], "notes": []},
+            {"answers": [good], "notes": [{"level": "bad", "title": "bad", "detail": "bad", "file": "config.py", "line": 2}]},
+        ]
+        for payload in invalid:
+            for cached in (False, True):
+                with self.subTest(payload=payload, cached=cached):
+                    analysis = analyze_files(self.files)
+                    findings, evidence = list(analysis.findings), list(analysis.evidence)
+                    hit = {"text": json.dumps(payload), "stop_reason": "end_turn"} if cached else None
+                    with mock.patch("paved_ai.llm.cache.get", return_value=hit), mock.patch("paved_ai.llm.cache.put") as put:
+                        out = fill_unresolved(analysis, self.files, FakeClient(payload))
+                    self.assertEqual(out.filled, [])
+                    self.assertIn("container_port", out.rejected)
+                    self.assertIn("container_port", analysis.unresolved)
+                    self.assertIsNone(analysis.container_port)
+                    self.assertEqual(analysis.findings, findings)
+                    self.assertEqual(analysis.evidence, evidence)
+                    put.assert_not_called()
 
 
 class UsageAndCacheTests(unittest.TestCase):
@@ -242,6 +264,12 @@ class UsageAndCacheTests(unittest.TestCase):
 
 
 class SelectFilesTests(unittest.TestCase):
+    def test_next_config_is_sent_for_route_resolution(self):
+        for name in ("next.config.js", "next.config.mjs", "next.config.cjs", "next.config.ts"):
+            with self.subTest(name=name):
+                selected = select_files([SourceFile(name, "export default {basePath: '/shop'}\n")])
+                self.assertEqual([f.path for f in selected], [name])
+
     def test_prioritizes_deploy_files_and_skips_noise(self):
         picked = [f.path for f in select_files([
             SourceFile("docs/guide.md", "# guide"),
