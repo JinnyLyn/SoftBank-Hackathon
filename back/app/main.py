@@ -64,8 +64,11 @@ if _cors_origins:
 _SECRET_KEY = re.compile(
     r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)"
 )
-_SECRET_VALUE = re.compile(
-    r"""(?ix)(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)(?P<separator>\s*[:=]\s*)(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"""
+_KEY_ASSIGNMENT = re.compile(
+    r"""(?ix)(?<![A-Z0-9_-])(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)\s*[:=]\s*"""
+)
+_ASSIGNMENT_VALUE = re.compile(
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]"']+"""
 )
 _CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -413,9 +416,7 @@ def create_plan(body: PlanIn) -> PlanOut:
     fingerprint = _fingerprint(payload)
     cost_estimate = body.cost_estimate.model_dump(mode="json") if body.cost_estimate else None
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT id FROM projects WHERE id = %s", (str(body.project_id),))
-        if cursor.fetchone() is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+        _lock_project(cursor, str(body.project_id))
         if body.analysis_id:
             cursor.execute(
                 "SELECT project_id FROM analyses WHERE id = %s",
@@ -472,6 +473,7 @@ def get_plan(plan_id: UUID) -> PlanOut:
 @app.post("/api/plans/{plan_id}/approve", response_model=PlanOut, tags=["plans"])
 def approve_plan(plan_id: UUID, body: ApproveIn) -> PlanOut:
     with connect() as connection, connection.cursor() as cursor:
+        _lock_plan_project(cursor, str(plan_id))
         cursor.execute("SELECT * FROM deployment_plans WHERE id = %s FOR UPDATE", (str(plan_id),))
         row = cursor.fetchone()
         if row is None:
@@ -486,6 +488,7 @@ def approve_plan(plan_id: UUID, body: ApproveIn) -> PlanOut:
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 SHA-256과 일치하는 저장 Terraform plan이 없습니다.")
         if row.get("operation_type") == "rollback" and row.get("terraform_plan_summary") is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "롤백 Terraform plan의 diff 요약을 먼저 저장해야 합니다.")
+        _validate_rollback_context(cursor, row)
         cursor.execute(
             """UPDATE deployment_plans
                SET status = 'approved', approved_at = CURRENT_TIMESTAMP(6), approved_fingerprint = %s
@@ -509,6 +512,7 @@ def approve_plan(plan_id: UUID, body: ApproveIn) -> PlanOut:
 def queue_deployment(body: DeploymentCreateIn) -> DeploymentOut:
     deployment_id = uuid4()
     with connect() as connection, connection.cursor() as cursor:
+        _lock_plan_project(cursor, str(body.plan_id))
         cursor.execute("SELECT * FROM deployment_plans WHERE id = %s FOR UPDATE", (str(body.plan_id),))
         plan = cursor.fetchone()
         if plan is None:
@@ -525,6 +529,14 @@ def queue_deployment(body: DeploymentCreateIn) -> DeploymentOut:
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 Terraform plan이 없거나 SHA-256 검증에 실패했습니다.")
         if plan.get("operation_type") == "rollback" and plan.get("terraform_plan_summary") is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "롤백 Terraform plan의 diff 요약이 없어 실행 대기열에 넣을 수 없습니다.")
+        cursor.execute(
+            """SELECT id FROM deployments WHERE project_id = %s AND operation_type = 'rollback'
+               AND status IN ('provisioning', 'deploying') LIMIT 1 FOR UPDATE""",
+            (plan["project_id"],),
+        )
+        if cursor.fetchone() is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "실행 중인 롤백이 완료된 후 새 배포를 등록하세요.")
+        _validate_rollback_context(cursor, plan)
         cursor.execute(
             """UPDATE deployment_plans SET status = 'consumed'
                WHERE id = %s AND status = 'approved' AND approved_fingerprint = %s""",
@@ -645,6 +657,7 @@ def queue_rollback(deployment_id: UUID, body: RollbackRequestIn) -> PlanOut:
     """Create a fresh rollback plan draft; approval happens only after worker uploads its plan and diff."""
     plan_id = uuid4()
     with connect() as connection, connection.cursor() as cursor:
+        _lock_deployment_project(cursor, str(deployment_id))
         cursor.execute("SELECT * FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
         failed = cursor.fetchone()
         if failed is None:
@@ -762,6 +775,19 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
     _require_worker(x_worker_token)
     with connect() as connection, connection.cursor() as cursor:
         while True:
+            # Discover without taking child-row locks; every lifecycle writer
+            # acquires the project first, then re-reads mutable rows with locks.
+            cursor.execute(
+                """SELECT d.project_id FROM deployments d
+                   JOIN deployment_plans p ON p.id = d.plan_id
+                   WHERE d.status = 'queued' AND d.target = 'aws' AND p.target = 'aws'
+                   ORDER BY d.created_at, d.id LIMIT 1"""
+            )
+            candidate = cursor.fetchone()
+            if candidate is None:
+                connection.rollback()
+                return {"job": None}
+            _lock_project(cursor, candidate["project_id"])
             cursor.execute(
                 """SELECT d.id AS deployment_id, d.status, d.target, d.operation_type,
                           d.rollback_from_deployment_id, d.rollback_to_deployment_id, d.plan_id, d.project_id,
@@ -772,15 +798,27 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
                    JOIN deployment_plans p ON p.id = d.plan_id
                    JOIN projects pr ON pr.id = d.project_id
                    WHERE d.status = 'queued' AND d.target = 'aws' AND p.target = 'aws'
+                     AND d.project_id = %s
                    ORDER BY d.created_at, d.id
-                   LIMIT 1 FOR UPDATE SKIP LOCKED"""
+                   LIMIT 1 FOR UPDATE""",
+                (candidate["project_id"],),
             )
             job = cursor.fetchone()
             if job is None:
                 connection.rollback()
-                return {"job": None}
-            if job["target"] == "aws" and not _terraform_plan_is_valid(job):
+                continue
+            failure_message = None
+            failure_event = "rollback_context_invalidated"
+            try:
+                _validate_rollback_context(cursor, job, exclude_deployment_id=job["deployment_id"])
+            except HTTPException as error:
+                if error.status_code != status.HTTP_409_CONFLICT:
+                    raise
+                failure_message = error.detail
+            if failure_message is None and job["target"] == "aws" and not _terraform_plan_is_valid(job):
                 failure_message = "대기 작업의 Terraform plan 파일이 없거나 SHA-256 검증에 실패했습니다."
+                failure_event = "terraform_plan_validation_failed"
+            if failure_message is not None:
                 cursor.execute(
                     "UPDATE deployments SET status = 'failed', url = NULL WHERE id = %s AND status = 'queued'",
                     (job["deployment_id"],),
@@ -790,7 +828,7 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
                         cursor,
                         UUID(job["deployment_id"]),
                         "error",
-                        "terraform_plan_validation_failed",
+                        failure_event,
                         failure_message,
                         None,
                     )
@@ -959,7 +997,8 @@ def record_worker_event(
     body_dict["message"] = _redact(body.message)
     body_dict["details"] = _redact_tree(body.details) if body.details is not None else None
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT status, operation_type FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
+        _lock_deployment_project(cursor, str(deployment_id))
+        cursor.execute("SELECT * FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
         current = cursor.fetchone()
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
@@ -973,6 +1012,9 @@ def record_worker_event(
             "rolled_back": set(),
         }
         same_status = body.status == current["status"]
+        if (current["operation_type"] == "rollback" and not same_status
+                and body.status in {"provisioning", "deploying", "healthy"}):
+            _validate_rollback_context(cursor, current, exclude_deployment_id=str(deployment_id))
         if current["operation_type"] == "rollback" and body.status in {"rolling_back", "rolled_back"}:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "롤백 실행은 일반 배포와 같은 상태 흐름을 사용합니다.")
         if not same_status and body.status not in allowed[current["status"]]:
@@ -999,6 +1041,63 @@ def record_worker_event(
         cursor.execute("SELECT * FROM deployments WHERE id = %s", (str(deployment_id),))
         row = cursor.fetchone()
     return _deployment_out(row)
+
+
+def _lock_project(cursor: Any, project_id: str) -> None:
+    cursor.execute("SELECT id FROM projects WHERE id = %s FOR UPDATE", (project_id,))
+    if cursor.fetchone() is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+
+
+def _lock_plan_project(cursor: Any, plan_id: str) -> None:
+    cursor.execute("SELECT project_id FROM deployment_plans WHERE id = %s", (plan_id,))
+    plan = cursor.fetchone()
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 계획을 찾을 수 없습니다.")
+    _lock_project(cursor, plan["project_id"])
+
+
+def _lock_deployment_project(cursor: Any, deployment_id: str) -> None:
+    cursor.execute("SELECT project_id FROM deployments WHERE id = %s", (deployment_id,))
+    deployment = cursor.fetchone()
+    if deployment is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
+    _lock_project(cursor, deployment["project_id"])
+
+
+def _validate_rollback_context(
+    cursor: Any, plan: dict[str, Any], *, exclude_deployment_id: str = "",
+) -> None:
+    """Revalidate under the project lock using current (locking) reads."""
+    if plan.get("operation_type") != "rollback":
+        return
+    cursor.execute(
+        """SELECT id FROM deployments WHERE project_id = %s AND id <> %s
+           AND status IN ('queued', 'provisioning', 'deploying', 'rolling_back')
+           LIMIT 1 FOR UPDATE""",
+        (plan["project_id"], exclude_deployment_id),
+    )
+    if cursor.fetchone() is not None:
+        raise HTTPException(status.HTTP_409_CONFLICT, "다른 대기 또는 실행 중인 배포가 있어 롤백할 수 없습니다.")
+    cursor.execute(
+        """SELECT * FROM deployments WHERE project_id = %s AND id <> %s
+           ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+        (plan["project_id"], exclude_deployment_id),
+    )
+    failed = cursor.fetchone()
+    if (failed is None or failed["id"] != plan.get("rollback_from_deployment_id")
+            or failed["operation_type"] != "deploy" or failed["status"] != "failed"
+            or failed["target"] != "aws"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "후속 배포 또는 상태 변경으로 롤백 승인이 무효화되었습니다.")
+    cursor.execute(
+        """SELECT id FROM deployments
+           WHERE project_id = %s AND target = 'aws' AND status = 'healthy' AND updated_at <= %s
+           ORDER BY updated_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+        (plan["project_id"], failed["updated_at"]),
+    )
+    candidate = cursor.fetchone()
+    if candidate is None or candidate["id"] != plan.get("rollback_to_deployment_id"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "이전 정상 버전이 변경되어 롤백 승인이 무효화되었습니다.")
 
 
 def _require_worker(token: str | None) -> None:
@@ -1062,27 +1161,46 @@ def _redact(text: str) -> str:
     text = _BEARER.sub("Bearer [REDACTED]", text)
     text = _AWS_ACCESS_KEY.sub("[REDACTED_AWS_ACCESS_KEY]", text)
 
-    def replace_secret(match: re.Match[str]) -> str:
-        key = match.group("key")
-        if not _is_secret_key(key):
-            return match.group(0)
-        value = match.group("value")
-        quote = value[0] if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0] else ""
-        redacted = f"{quote}[REDACTED]{quote}" if quote else "[REDACTED]"
-        return f"{match.group('key_quote')}{key}{match.group('key_quote')}{match.group('separator')}{redacted}"
+    parts = []
+    end = 0
+    for start, stop, redacted in _inline_secret_values(text):
+        if start < end:
+            continue
+        parts.extend((text[end:start], redacted))
+        end = stop
+    parts.append(text[end:])
+    return "".join(parts)
 
-    return _SECRET_VALUE.sub(replace_secret, text)
+
+def _inline_secret_values(text: str):
+    # Scan assignment keys without consuming nonsensitive outer values. Otherwise
+    # `environment: API_KEY=...` hides its inner assignment from finditer().
+    for assignment in _KEY_ASSIGNMENT.finditer(text):
+        start = assignment.end()
+        value = _ASSIGNMENT_VALUE.match(text, start)
+        if not value:
+            continue
+        decoded = None
+        stop = value.end()
+        if text[start] in '{["':
+            try:
+                decoded, stop = json.JSONDecoder().raw_decode(text, start)
+            except (ValueError, RecursionError):
+                # A malformed structured secret still must not expose its tail.
+                if text[start] in "{[":
+                    stop = len(text)
+        if _is_secret_key(assignment.group("key")):
+            raw = text[start:stop]
+            quote = raw[0] if len(raw) >= 2 and raw[0] in {"'", '"'} and raw[-1] == raw[0] else ""
+            yield start, stop, f"{quote}[REDACTED]{quote}"
+        elif isinstance(decoded, str) and _contains_inline_secret(decoded):
+            # Decode serialized log/JSON strings so escaped inner keys are seen.
+            yield start, stop, json.dumps(_redact(decoded), ensure_ascii=False)
 
 
 def _contains_inline_secret(text: str) -> bool:
-    """Return whether inline key/value text contains a value for a secret key.
-
-    `_SECRET_VALUE` intentionally recognizes generic ``key: value`` and
-    ``key=value`` forms so that log redaction can preserve their original
-    formatting.  A generic match alone is not sensitive, though: Docker image
-    references such as ``python:3.12`` must remain valid analysis input.
-    """
-    return any(_is_secret_key(match.group("key")) for match in _SECRET_VALUE.finditer(text))
+    """Detect sensitive assignments while preserving ordinary values like python:3.12."""
+    return next(_inline_secret_values(text), None) is not None
 
 
 def _is_secret_key(key: str) -> bool:

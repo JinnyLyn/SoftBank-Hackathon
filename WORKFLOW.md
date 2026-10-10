@@ -104,6 +104,7 @@ PR 승인·머지는 제품의 실제 AWS 배포 승인이 아니다. 실제 배
 | 샘플 백엔드 (PR #4 통합 후) | `bash scripts/ci/run_sample_stack.sh` | 실제 Docker·MySQL·API·화면, DB 중지 감지, CI 전용 볼륨 정리 |
 | 플랫폼 프런트 (PR #7 통합 후) | `npm ci --prefix front`와 `npm run build --prefix front` | 타입·빌드. CI는 MOCK/실제 API 설정을 각각 빌드하며 실제 연동 성공으로 보지 않음 |
 | 플랫폼 백엔드 (PR #10) | manifest의 Python으로 `python -m pip install -r back/requirements.txt`, `python -m pip check`, `python -m compileall -q back/app`, `python scripts/ci/test_platform_back.py` | 앱 기동·OpenAPI·DB 미설정 오류·인증·입력 검증. 실제 DB·프런트·LLM·배포는 미검증 |
+| 플랫폼 DB·마스킹·롤백 (Issue #16) | `bash scripts/ci/run_platform_stack.sh` | 격리 MySQL migration·재실행, 실제 API의 마스킹·새 rollback 승인·오래된 승인·동시 등록 차단. 합성 plan/worker 보고 사용, AWS·프런트·LLM은 미검증 |
 | Terraform (PR #6 통합 후) | `docs/CI.md`의 fmt·backend 비활성 init·validate·셸 문법 명령 | 실제 AWS plan/apply와 전체 회귀 suite는 별도 증빙 |
 
 - CI에 없는 검사를 통과했다고 쓰지 않는다. 미실행 항목은 이유를 적는다.
