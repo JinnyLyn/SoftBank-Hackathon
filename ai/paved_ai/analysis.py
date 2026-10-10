@@ -17,6 +17,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .dockerfile import draft_dockerfile
 from .masking import MaskReport, backend_safe_text, mask_files
 from .source import SourceFile
 
@@ -75,6 +76,8 @@ class Analysis:
     # LLM이 채운 값 (규칙이 못 찾은 것만). 화면에서 근거 확인을 권함
     ai_filled: List[str] = field(default_factory=list)
     ai_model: Optional[str] = None
+    # Dockerfile이 없을 때 만든 초안 {path, content, port, based_on}. 사용자가 저장소에 넣고 다시 올리는 제안
+    dockerfile_draft: Optional[dict] = None
 
     def warn(self, title: str, detail: str) -> None:
         self.findings.append(Finding("warn", title, detail))
@@ -122,6 +125,10 @@ class Analysis:
             "unresolved": self.unresolved,
             "sizing_hints": self.sizing_hints,
             "has_dockerfile": self.has_dockerfile,
+            "dockerfile_draft": (
+                {**self.dockerfile_draft, "based_on": [backend_safe_text(b) for b in self.dockerfile_draft["based_on"]]}
+                if self.dockerfile_draft else None
+            ),
             "masking": {"withheld_files": self.withheld_files, "redactions": self.redactions},
             "ai": {"model": self.ai_model, "filled": self.ai_filled},
         }
@@ -608,6 +615,19 @@ def _check_dockerfile_copies(a: Analysis, repo: Repo, dockerfile: str) -> None:
         )
 
 
+def _suggest_dockerfile(a: Analysis, files: List[SourceFile], family: Optional[str], py: dict) -> None:
+    """Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 보여 줌. 배포는 여전히 Dockerfile이 저장소에 있어야 함"""
+    draft, why = draft_dockerfile(files, family, a.framework, a.runtime, a.container_port, py)
+    a.findings = [f for f in a.findings if f.title != "Dockerfile이 없습니다"]
+    if draft is None:
+        a.info("Dockerfile이 없습니다", f"배포하려면 Dockerfile이 필요합니다. 초안도 만들지 못했습니다: {why}")
+        return
+    a.dockerfile_draft = draft.as_dict()
+    a.unresolved["dockerfile"] = "Dockerfile이 없습니다. 아래 초안을 저장소 루트에 Dockerfile 로 추가하고 다시 올려 주세요."
+    a.info("Dockerfile 초안을 만들었습니다",
+           f"코드를 보고 {a.framework}용 초안을 만들었습니다(포트 {draft.port}). 내용을 확인하고 저장소에 추가한 뒤 다시 올리면 배포할 수 있습니다.")
+
+
 def analyze_files(files: List[SourceFile]) -> Analysis:
     """원본 파일 목록 → 가린 뒤 규칙으로 분석. 원본은 바꾸지 않음."""
     report: MaskReport = mask_files(files)
@@ -627,6 +647,8 @@ def analyze_files(files: List[SourceFile]) -> Analysis:
     _detect_environment(a, repo)
     _detect_hints(a, repo, family, deps)
     _check_shape(a, repo, family)
+    if not a.has_dockerfile and a.supported:
+        _suggest_dockerfile(a, report.files, family, py)
     if report.withheld:
         a.info("비밀 파일은 분석에서 뺐습니다", f"{', '.join(report.withheld)}: 변수 이름만 보고 값은 보내지 않았습니다.")
 
