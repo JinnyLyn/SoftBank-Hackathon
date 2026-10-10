@@ -1,6 +1,7 @@
 import CodeView from '../components/CodeView'
+import DomainProgress from '../components/DomainProgress'
 import { IS_MOCK } from '../api'
-import type { DeployStatus } from '../types'
+import type { DeployStatus, DomainPlan } from '../types'
 
 /** 배포 상태를 확인하지 못한 경우. 배포 실패와는 다름 */
 export interface PollIssue {
@@ -11,6 +12,8 @@ export interface PollIssue {
 interface Props {
   status: DeployStatus | null
   targetName: string
+  /** 사용자가 고른 도메인 방식 (none: 서버에 도메인 기능이 없어 미리보기 주소만) */
+  domainMode: DomainPlan['mode']
   fixing: boolean
   pollIssue: PollIssue | null
   repolling: boolean
@@ -25,6 +28,7 @@ interface Props {
 export default function DeployStep({
   status,
   targetName,
+  domainMode,
   fixing,
   pollIssue,
   repolling,
@@ -69,13 +73,21 @@ export default function DeployStep({
       {status.state === 'success' && (
         <div className="done-card">
           <div>
-            <span className="done-label">{IS_MOCK ? 'MOCK: 배포 완료 (예시, 실제로 배포되지 않음)' : '배포 완료'}</span>
+            <span className="done-label">{IS_MOCK ? 'MOCK: 앱 배포 완료 (예시, 실제로 배포되지 않음)' : '앱 배포 완료'}</span>
             {status.url ? (
               <a href={status.url} target="_blank" rel="noreferrer" className="mono">
                 {status.url}
               </a>
             ) : (
               <span className="muted small">접속 주소를 아직 받지 못했습니다.</span>
+            )}
+            {/* 독립 도메인이 연결되기 전 주소는 미리보기. 도메인 연결 성공으로 보이지 않게 (PRODUCT_DIRECTION §2) */}
+            {status.url && status.domain?.state !== 'active' && (
+              <span className="muted small">
+                {domainMode === 'none' || !status.domain || status.domain.state === 'skipped'
+                  ? '미리보기 주소입니다. 도메인은 연결되지 않았습니다.'
+                  : '미리보기 주소입니다. 주소 연결은 아래에서 진행 중입니다.'}
+              </span>
             )}
           </div>
           <div className="done-actions">
@@ -88,6 +100,8 @@ export default function DeployStep({
           </div>
         </div>
       )}
+
+      {status.state === 'success' && status.domain && <DomainProgress status={status.domain} mode={domainMode} />}
 
       {status.state === 'failed' && (
         <div className="diagnosis">

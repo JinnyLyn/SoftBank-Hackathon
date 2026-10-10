@@ -7,6 +7,10 @@ import type {
   ConnectionInput,
   DeployRecord,
   DeployStatus,
+  DnsRecord,
+  DomainChoice,
+  DomainPlan,
+  DomainStatus,
   Finding,
   Recommendation,
   ScaleInput,
@@ -21,13 +25,19 @@ import { sourceName, TIER_META, usd } from '../format'
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** 결과가 생길 때까지 주기적으로 확인. 시간이 지나면 이유를 담아 실패 */
-async function poll<T>(fn: () => Promise<T | null>, opts: { intervalMs: number; timeoutMs: number; what: string }) {
+async function poll<T>(
+  fn: () => Promise<T | null>,
+  opts: { intervalMs: number; timeoutMs: number; what: string; hint?: string },
+) {
   const until = Date.now() + opts.timeoutMs
   for (;;) {
     const v = await fn()
     if (v) return v
     if (Date.now() > until)
-      throw new ApiError(408, `${opts.what}가 ${Math.round(opts.timeoutMs / 60000)}분 안에 준비되지 않았습니다. 잠시 뒤 다시 시도해 주세요.`)
+      throw new ApiError(
+        408,
+        `${Math.round(opts.timeoutMs / 60000)}분 동안 기다렸지만 ${opts.what}이(가) 오지 않았습니다. ${opts.hint ?? '잠시 뒤 다시 시도해 주세요.'}`,
+      )
     await wait(opts.intervalMs)
   }
 }
@@ -47,10 +57,22 @@ interface ProjectOut {
 }
 
 /** ZIP은 원본 바이트를 그대로, GitHub는 주소와 ref를 JSON으로 */
-function createProject(source: Source): Promise<ProjectOut> {
+/**
+ * 사용 규모·예산. 인프라 worker가 구성 단계와 예산 검사에 쓰는 사용자 입력이라 그대로 보냄 (AI가 바꾸지 않음).
+ * 백엔드가 프로젝트에 저장하고, AI runner가 분석 결과 scale 로 복사해 worker에 넘김
+ */
+function scaleParams(scale: ScaleInput): Record<string, string> {
+  const p: Record<string, string> = { expected_users: scale.expectedUsers, traffic_pattern: scale.pattern }
+  if (Number.isFinite(scale.monthlyBudgetUsd)) p.monthly_budget_usd = String(scale.monthlyBudgetUsd)
+  if (scale.purpose.trim()) p.purpose = scale.purpose.trim().slice(0, 500)
+  return p
+}
+
+function createProject(source: Source, scale: ScaleInput): Promise<ProjectOut> {
   const name = sourceName(source)
   if (source.kind === 'zip') {
-    const q = new URLSearchParams({ name, filename: source.file.name })
+    // 본문이 ZIP 원본이라 사용 규모는 쿼리로
+    const q = new URLSearchParams({ name, filename: source.file.name, ...scaleParams(scale) })
     return req<ProjectOut>(`/projects?${q}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/zip' },
@@ -59,9 +81,16 @@ function createProject(source: Source): Promise<ProjectOut> {
       timeoutMs: 10 * 60 * 1000,
     })
   }
+  const { monthly_budget_usd, ...rest } = scaleParams(scale)
   return req<ProjectOut>(
     '/projects/github',
-    send('POST', { name, repository_url: source.url, ref: source.branch || undefined }),
+    send('POST', {
+      name,
+      repository_url: source.url,
+      ref: source.branch || undefined,
+      ...rest,
+      monthly_budget_usd: monthly_budget_usd === undefined ? undefined : Number(monthly_budget_usd),
+    }),
   )
 }
 
@@ -100,7 +129,28 @@ function toAnalysis(out: AnalysisOut): Analysis {
     isObj(e) ? [str(e.file) + (e.line ? `:${e.line}` : ''), str(e.text ?? e.reason)].filter(Boolean).join(' — ') : str(e),
   )
 
-  return { projectId: out.project_id, stack, findings, evidence }
+  return { projectId: out.project_id, stack, findings, evidence, blockers: blockersOf(r) }
+}
+
+// worker가 계획을 만들려면 꼭 있어야 하는 값 (infra/worker app_config_from_analysis)
+const REQUIRED_FOR_PLAN: Record<string, string> = {
+  container_port: '포트',
+  health_check_path: '헬스체크 경로',
+  dockerfile: 'Dockerfile',
+}
+
+/** 배포할 수 없는 이유. 미지원(supported: false)과, 계획에 꼭 필요한 값을 못 찾은 경우 */
+function blockersOf(r: Record<string, unknown>): string[] {
+  const out: string[] = []
+  if (r.supported === false) {
+    const reasons = Array.isArray(r.unsupported_reasons) ? r.unsupported_reasons.map(str).filter(Boolean) : []
+    out.push(...(reasons.length ? reasons : ['지원하지 않는 형태의 앱입니다.']))
+  }
+  const unresolved = isObj(r.unresolved) ? r.unresolved : {}
+  for (const [key, label] of Object.entries(REQUIRED_FOR_PLAN)) {
+    if (key in unresolved) out.push(`${label}: ${str(unresolved[key]) || '코드에서 찾지 못했습니다.'}`)
+  }
+  return out
 }
 
 /**
@@ -108,12 +158,15 @@ function toAnalysis(out: AnalysisOut): Analysis {
  * 백엔드 API는 LLM 분석을 직접 돌리지 않음 → 분석 담당 모듈이 POST /analyses 로 결과를 남겨야 끝남
  * 사용 규모·예산(scale)은 백엔드 API에 받는 곳이 없어 화면에서 추천을 거를 때만 씀
  */
-export async function analyze(source: Source, _scale: ScaleInput): Promise<Analysis> {
-  const project = await createProject(source)
+/** 프로젝트 등록 → 분석 결과 대기. 등록(업로드)이 끝나면 onUploaded 로 알림 (화면 진행 표시용) */
+export async function analyze(source: Source, scale: ScaleInput, onUploaded?: () => void): Promise<Analysis> {
+  const project = await createProject(source, scale)
+  onUploaded?.()
   const out = await poll(() => reqOrNull<AnalysisOut>(`/projects/${project.id}/analyses/latest`), {
     intervalMs: 2000,
     timeoutMs: 5 * 60 * 1000,
     what: '분석 결과',
+    hint: '분석 프로그램(ai/runner.py)이 실행 중인지 확인해 주세요.',
   })
   return toAnalysis(out)
 }
@@ -216,7 +269,13 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
         const waiting = list.filter((p) => p.status === 'awaiting_approval' && p.target === 'aws')
         return waiting.length ? waiting : null
       },
-      { intervalMs: 2000, timeoutMs: 5 * 60 * 1000, what: '배포 계획' },
+      {
+        intervalMs: 2000,
+        timeoutMs: 5 * 60 * 1000,
+        what: '배포 계획',
+        // 계획은 AI가 아니라 인프라 worker가 만듦. 분석은 이미 끝난 상태
+        hint: '배포 계획은 인프라 worker(infra/worker)가 만듭니다. worker가 실행 중인지 확인한 뒤 다시 기다려 주세요.',
+      },
     ),
     req<Connection[]>('/connections'),
   ])
@@ -257,7 +316,8 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
     reason: pick
       ? str(pick[1].variables.reason) || pick[1].summary
       : `월 예산 ${usd(budget)} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 ${usd(planCost(sorted[0]))}입니다. 예산을 늘려 주세요.`,
-    options: [{ connectionId, provider: 'aws', name: aws?.name ?? 'AWS', tiers }],
+    // 연결이 없으면 worker가 쓰는 운영자 AWS (관리형 배포)
+    options: [{ connectionId, provider: 'aws', name: aws?.name ?? '관리형 AWS', tiers }],
     assumptions: [
       `월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`,
       pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음',
@@ -334,12 +394,13 @@ export async function status(projectId: string): Promise<DeployStatus> {
     `/projects/${projectId}/status`,
   )
   if (!s) return { state: 'running', log: ['배포 대기열에 등록했습니다. worker가 가져가기를 기다리는 중입니다.'] }
+  const domain = toDomainStatus((s as { domain?: unknown }).domain)
   const d = s.diagnosis
   const diagnosis =
     isObj(d) && typeof d.cause === 'string' && typeof d.fix === 'string' && isObj(d.patch)
       ? (d as unknown as DeployStatus['diagnosis'])
       : undefined
-  return { state: s.state, log: s.log, url: s.url ?? undefined, diagnosis }
+  return { state: s.state, log: s.log, url: s.url ?? undefined, diagnosis, domain }
 }
 
 /** 배포 이력. 백엔드가 화면용 요약 필드(app, tier, monthlyUsd 등)를 같이 줌 */
@@ -374,4 +435,56 @@ export function saveConnection(input: ConnectionInput): Promise<Connection> {
   return input.id
     ? req<Connection>(`/connections/${input.id}`, send('PUT', body))
     : req<Connection>('/connections', send('POST', body))
+}
+
+// ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------
+// 서버에 아직 없으면 404/405가 오므로 501(미지원)로 바꿔 던짐 → 화면은 미리보기 주소로 진행
+
+const DOMAIN_STATES = ['skipped', 'waiting_dns', 'issuing_cert', 'active', 'failed']
+
+async function domainReq<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
+  try {
+    return await req<T>(path, init)
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405))
+      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소)로 배포합니다. 도메인은 연결되지 않습니다.')
+    throw e
+  }
+}
+
+const toRecords = (v: unknown): DnsRecord[] =>
+  (Array.isArray(v) ? v : []).filter(isObj).map((r) => ({
+    type: str(r.type) as DnsRecord['type'],
+    name: str(r.name),
+    value: str(r.value),
+    purpose: str(r.purpose),
+  }))
+
+/**
+ * PUT /api/projects/{id}/domain { mode: auto|own, name } → { mode, name, monthly_usd, records, note }
+ * auto 는 name 을 보내지 않고, 서버가 정한 자동 주소를 name 으로 돌려받음
+ */
+export async function saveDomain(projectId: string, choice: DomainChoice): Promise<DomainPlan> {
+  const r = await domainReq<Record<string, unknown>>(
+    `/projects/${projectId}/domain`,
+    send('PUT', { mode: choice.mode, name: choice.mode === 'own' ? choice.name : null }),
+  )
+  return {
+    mode: (str(r.mode) || choice.mode) as DomainPlan['mode'],
+    name: r.name ? str(r.name) : null,
+    monthlyUsd: Number(r.monthly_usd ?? 0),
+    records: toRecords(r.records),
+    note: r.note ? str(r.note) : undefined,
+  }
+}
+
+function toDomainStatus(v: unknown): DomainStatus | undefined {
+  if (!isObj(v) || !DOMAIN_STATES.includes(str(v.state))) return undefined
+  return {
+    state: str(v.state) as DomainStatus['state'],
+    name: v.name ? str(v.name) : null,
+    message: v.message ? str(v.message) : undefined,
+    records: toRecords(v.records),
+    url: v.url ? str(v.url) : undefined,
+  }
 }
