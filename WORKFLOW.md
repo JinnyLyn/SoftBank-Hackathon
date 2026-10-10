@@ -82,7 +82,7 @@ git merge origin/main
 2. 변경 영역에 필요한 검사와 자체 리뷰를 하고, 최신 main을 반영한다.
 3. 자기 브랜치에 푸시하고 **개인 브랜치 → main** PR을 연다. `.github/PULL_REQUEST_TEMPLATE.md`를 채우며, §4.1의 컨텍스트·워크플로 보고를 반드시 포함한다.
 4. PR이 열려 있는 동안 같은 브랜치에 푸시하면 그 PR에 계속 추가된다. 매 push 시 컨텍스트·워크플로 보고를 다시 확인하고 새 변경·우회 사항을 본문에 반영한다. 관련 없는 다음 작업은 머지 이후 시작한다. 대기 중에는 읽기·조사·설계 등 독립 작업을 할 수 있다.
-5. JinnyLyn이 리뷰·머지한다. JinnyLyn 작성 PR은 팀원 승인 없이 검증·diff 확인 후 PR 화면에서 머지한다.
+5. JinnyLyn이 리뷰·머지한다. **머지 직전에 최신 head SHA의 Code Review·Security Review 완료 상태와 리뷰 본문·미해결 대화를 다시 확인한다.** CI 성공, 리뷰 댓글이 아직 없음, 리뷰 요약의 `Completed`만으로 지적 없음으로 판단하지 않는다. 진행 중 리뷰는 완료를 기다리고, 유효한 지적은 수정·검증한 뒤 처리 근거를 남긴다. 추가 push로 head가 바뀌면 해당 커밋에 대한 리뷰 확인도 다시 한다. JinnyLyn 본인 PR의 사람 승인 예외도 이 절차를 생략하지 않는다.
 6. merge commit으로 합친 뒤 개인 브랜치를 삭제하지 않는다. 같은 브랜치에서 `git fetch origin` → `git merge origin/main`을 수행하고 다음 작업을 시작한다.
 
 ```text
