@@ -122,6 +122,9 @@ export default function ReviewStep({
         </tfoot>
       </table>
       {domain?.note && <p className="hint">{domain.note}</p>}
+      {bundle.planInfo?.excludedCosts && (
+        <p className="hint">이 금액에 넣지 않은 비용: {bundle.planInfo.excludedCosts.join(', ')}</p>
+      )}
 
       {bundle.planInfo && (
         <dl className="plan-info">
