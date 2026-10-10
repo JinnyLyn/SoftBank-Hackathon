@@ -73,6 +73,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [rec, setRec] = useState<Recommendation | null>(null)
+  // 분석 결과는 먼저 보여 주고, 인프라 worker의 계획(구성·비용)은 뒤에서 기다림
+  const [recError, setRecError] = useState<string | null>(null)
   const [choice, setChoiceState] = useState<Choice | null>(null)
   // 조합별로 만들어 둔 코드. 다른 칸을 눌렀다 돌아와도 다시 만들지 않음
   const [bundles, setBundles] = useState<Record<string, TerraformBundle>>({})
@@ -98,6 +100,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
     projectRef.current = null
     setAnalysis(null)
     setRec(null)
+    setRecError(null)
     setChoiceState(null)
     setBundles({})
     setCodeErrors({})
@@ -166,7 +169,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
     ? DEPLOY
     : bundle && domainPlan
       ? REVIEW
-      : analysis && rec && domainPlan
+      : analysis && domainPlan
         ? ANALYSIS
         : source
           ? DOMAIN
@@ -285,23 +288,37 @@ export default function NewDeploy({ onShowHistory }: Props) {
 
   // 분석 → 추천(+추천 조합 코드) → 도메인 계획 저장을 한 번에
   // 이미 분석했으면 바뀐 도메인만 다시 저장
-  const analyze = () =>
-    run('analyze', async () => {
-      if (!source) return
-      if (analysis && rec) {
-        if (!domainPlan) await saveDomain(analysis.projectId)
-      } else {
-        const a = await api.analyze(source, scale)
-        const r = await api.recommend(a.projectId, scale)
-        projectRef.current = a.projectId
-        setAnalysis(a)
+  // 인프라 worker의 계획(구성·비용)을 기다림. 분석 화면은 그동안 AI 분석 결과를 먼저 보여 줌
+  const loadRec = (projectId: string) => {
+    setRecError(null)
+    api
+      .recommend(projectId, scale)
+      .then((r) => {
+        if (projectRef.current !== projectId) return
         setRec(r)
         setBundles(r.bundles ?? {})
         // 예산 안에 맞는 구성이 없으면 recommended가 null → 화면에 이유만 보여 줌
         setChoiceState(r.recommended)
         // 백엔드가 추천 조합 코드를 안 보냈으면 바로 요청
-        if (r.recommended && !r.bundles?.[keyOf(r.recommended)]) prefetch(a.projectId, r.recommended)
+        if (r.recommended && !r.bundles?.[keyOf(r.recommended)]) prefetch(projectId, r.recommended)
+      })
+      .catch((e) => {
+        if (projectRef.current === projectId) setRecError(errMsg(e))
+      })
+  }
+
+  // 분석 → 도메인 계획 저장 → 분석 화면. 계획은 뒤에서 기다림
+  const analyze = () =>
+    run('analyze', async () => {
+      if (!source) return
+      if (analysis) {
+        if (!domainPlan) await saveDomain(analysis.projectId)
+      } else {
+        const a = await api.analyze(source, scale)
+        projectRef.current = a.projectId
+        setAnalysis(a)
         await saveDomain(a.projectId)
+        loadRec(a.projectId)
       }
       setStep(ANALYSIS)
     })
@@ -381,7 +398,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
     }
   if (step === DOMAIN && locked) next = { label: '다음', onClick: () => setStep(ANALYSIS) }
   if (step === ANALYSIS && !locked) {
-    if (codeState === 'error' && analysis && choice)
+    if (!rec) next = { label: recError ? '비용 승인' : '계획 준비 중…', onClick: () => {}, disabled: true }
+    else if (codeState === 'error' && analysis && choice)
       next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
     else if (!choice) next = { label: '비용 승인', onClick: () => {}, disabled: true }
     else
@@ -462,10 +480,12 @@ export default function NewDeploy({ onShowHistory }: Props) {
               onChange={setDomainChoice}
             />
           )}
-          {step === ANALYSIS && analysis && rec && (
+          {step === ANALYSIS && analysis && (
             <AnalysisStep
               analysis={analysis}
               rec={rec}
+              recError={recError}
+              onRetryRec={() => loadRec(analysis.projectId)}
               choice={choice}
               budget={scale.monthlyBudgetUsd}
               codeState={codeState}

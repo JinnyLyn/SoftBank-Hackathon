@@ -632,6 +632,9 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .conn-status.is-error::before { background: var(--marking); }
 .conn-error { color: var(--fail); font-size: 12.5px; }
 .conn-pending { font-size: 12.5px; color: var(--marking-ink); }
+.rec-wait { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-2); font-size: 13px; }
+.rec-wait .pulse { display: inline-block; width: 8px; height: 8px; }
+.rec-wait.is-error { color: var(--fail); }
 .conn-pending .pulse { display: inline-block; width: 8px; height: 8px; margin-right: 4px; vertical-align: middle; }
 .conn-status.is-pending { color: var(--marking-ink); }
 .conn-status.is-pending::before { background: transparent; border: 2px solid var(--marking); width: 5px; height: 5px; }

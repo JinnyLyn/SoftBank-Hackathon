@@ -14,7 +14,11 @@ const CODE_TEXT: Record<CodeState, string> = {
 
 interface Props {
   analysis: Analysis
-  rec: Recommendation
+  /** 인프라 worker가 만든 구성·비용 계획. 아직 없으면 null (분석 결과는 먼저 보여 줌) */
+  rec: Recommendation | null
+  /** 계획을 기다리다 실패한 이유 */
+  recError: string | null
+  onRetryRec: () => void
   choice: Choice | null
   /** 월 예산 한도. 넘는 칸은 고를 수 없음 */
   budget: number
@@ -26,26 +30,7 @@ interface Props {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
-export default function AnalysisStep({ analysis, rec, choice, budget, codeState, codeError, locked, onChoice }: Props) {
-  const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
-  const selected = option?.tiers.find((t) => t.key === choice?.tier)
-  const isRec = (id: string, t: TierKey) => rec.recommended?.connectionId === id && rec.recommended?.tier === t
-
-  const tierOf = (o: Recommendation['options'][number], k: TierKey) => o.tiers.find((t) => t.key === k)
-  // 어느 대상에든 계획이 있는 크기만 열로 보여 줌 (계획이 1~2개뿐일 수 있음)
-  const columns = TIER_KEYS.filter((k) => rec.options.some((o) => tierOf(o, k)))
-
-  // 열(구성 크기)마다 가장 싼 대상. 계획이 있는 칸만 비교
-  const cheapest = Object.fromEntries(
-    columns.map((k) => {
-      const costs = rec.options.flatMap((o) => {
-        const t = tierOf(o, k)
-        return t ? [{ id: o.connectionId, c: tierTotal(t) }] : []
-      })
-      return [k, costs.sort((a, b) => a.c - b.c)[0]?.id]
-    }),
-  ) as Partial<Record<TierKey, string>>
-
+export default function AnalysisStep({ analysis, rec, recError, onRetryRec, ...plans }: Props) {
   return (
     <div className="stack-lg">
       <section>
@@ -76,6 +61,52 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
         </details>
       </section>
 
+      {rec ? (
+        <Plans rec={rec} {...plans} />
+      ) : (
+        <section>
+          <h3 className="sub-title">어디에, 어떤 크기로</h3>
+          {recError ? (
+            <div className="rec-wait is-error" role="alert">
+              <span>구성·비용 계획을 받지 못했습니다. {recError}</span>
+              <button className="btn btn-ghost btn-sm" onClick={onRetryRec}>
+                다시 기다리기
+              </button>
+            </div>
+          ) : (
+            <p className="rec-wait">
+              <span className="pulse" aria-hidden /> 인프라가 이 분석 결과로 구성과 비용 계획을 만들고 있습니다. 보통 몇 분 걸립니다.
+            </p>
+          )}
+        </section>
+      )}
+    </div>
+  )
+}
+
+type PlansProps = Omit<Props, 'analysis' | 'rec' | 'recError' | 'onRetryRec'> & { rec: Recommendation }
+
+function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: PlansProps) {
+  const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
+  const selected = option?.tiers.find((t) => t.key === choice?.tier)
+  const isRec = (id: string, t: TierKey) => rec.recommended?.connectionId === id && rec.recommended?.tier === t
+
+  const tierOf = (o: Recommendation['options'][number], k: TierKey) => o.tiers.find((t) => t.key === k)
+  // 어느 대상에든 계획이 있는 크기만 열로 보여 줌 (계획이 1~2개뿐일 수 있음)
+  const columns = TIER_KEYS.filter((k) => rec.options.some((o) => tierOf(o, k)))
+
+  // 열(구성 크기)마다 가장 싼 대상. 계획이 있는 칸만 비교
+  const cheapest = Object.fromEntries(
+    columns.map((k) => {
+      const costs = rec.options.flatMap((o) => {
+        const t = tierOf(o, k)
+        return t ? [{ id: o.connectionId, c: tierTotal(t) }] : []
+      })
+      return [k, costs.sort((a, b) => a.c - b.c)[0]?.id]
+    }),
+  ) as Partial<Record<TierKey, string>>
+
+  return (
       <section>
         <h3 className="sub-title">어디에, 어떤 크기로</h3>
         <p className={'rec-reason' + (rec.recommended ? '' : ' is-blocked')}>{rec.reason}</p>
@@ -198,6 +229,5 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
           </div>
         )}
       </section>
-    </div>
   )
 }
