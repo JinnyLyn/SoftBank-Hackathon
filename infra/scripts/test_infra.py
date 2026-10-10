@@ -919,6 +919,32 @@ def part_d():
                       f'cmd_build --id abcd1234 --source {P(bsrc)} --arch MIPS')
     say("ok" if rc != 0 and "--arch는 X86_64 또는 ARM64" in err and "DOCKER_CALLED" not in out else "fail", "D build --arch: X86_64·ARM64가 아니면 거부(docker 호출 없음)", err[:80])
 
+    # build: 빌드가 실패하면 로그인·push를 하지 않고 실패한다. `( ... ) ||` 안에서는 set -e가 꺼져, 빌드가 실패해도
+    # 마지막 명령(push)이 성공하면(이 PC에 같은 태그의 옛 이미지가 있으면) 전체가 성공으로 끝났었다
+    plog = WORK / "build_fail_docker.log"
+    plog.unlink(missing_ok=True)
+    code = (
+        'export_foundation() { :; }; need() { :; }; aws() { echo token; }; '
+        f'docker() {{ echo "$1" >> {P(plog)}; if [ "$1" = build ]; then return 1; fi; return 0; }}; '
+        f'cmd_build --id abcd1234 --source {P(bsrc)} --tag t1'
+    )
+    rc, out, err = sh(code)
+    logged = plog.read_text(encoding="utf-8").split() if plog.exists() else []
+    say("ok" if rc != 0 and "build" in logged and "push" not in logged and "login" not in logged and not out.strip() else "fail",
+        "D build: docker build가 실패하면 로그인·push 없이 실패하고 이미지 주소를 출력하지 않는다", f"rc={rc} docker={logged} out={out[:40]} {err[:80]}")
+    say("ok" if "rmi" in logged and "build" in logged and logged.index("rmi") < logged.index("build") else "fail",
+        "D build: 빌드 전에 같은 태그의 로컬 옛 이미지를 지운다(실패 뒤 옛 이미지가 push되지 않게)", f"docker={logged}")
+    plog.unlink(missing_ok=True)
+    code = (
+        'export_foundation() { :; }; need() { :; }; aws() { return 1; }; '
+        f'docker() {{ echo "$1" >> {P(plog)}; return 0; }}; '
+        f'cmd_build --id abcd1234 --source {P(bsrc)} --tag t1'
+    )
+    rc, out, err = sh(code)
+    logged = plog.read_text(encoding="utf-8").split() if plog.exists() else []
+    say("ok" if rc != 0 and "push" not in logged and not out.strip() else "fail",
+        "D build: ECR 토큰 조회(aws)가 실패하면 push 없이 실패한다", f"rc={rc} docker={logged} out={out[:40]} {err[:80]}")
+
     # status: 서비스 조회가 실패하면 빈 값을 정상처럼 찍지 않고 실패한다
     sdir2 = WORK / "status_fail"
     sdir2.mkdir(parents=True, exist_ok=True)

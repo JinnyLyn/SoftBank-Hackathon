@@ -69,6 +69,8 @@ class FakeBackend:
         self.event_failures = 0   # 앞으로 몇 번의 이벤트 보고를 503으로 거절할지
         self.pages = None         # 목록 페이지(리스트의 리스트). 지정하면 cursor로 넘긴다
         self.upload_failures = 0  # 앞으로 몇 번의 plan 파일 업로드를 503으로 거절할지
+        self.lose_plan_response = 0   # 앞으로 몇 번의 계획 등록을 "서버에는 등록하고 응답 없이 연결을 닫는" 방식으로 처리할지
+        self.plans_get_failures = 0   # 앞으로 몇 번의 계획 목록 조회를 503으로 거절할지
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -98,6 +100,9 @@ class FakeBackend:
                         return self._send(200, {"items": outer.pages[idx], "next_cursor": nxt})
                     return self._send(200, {"items": outer.projects, "next_cursor": None})
                 if p.endswith("/plans"):
+                    if outer.plans_get_failures > 0:
+                        outer.plans_get_failures -= 1
+                        return self._send(503, {"error": "일시 오류"})
                     return self._send(200, outer.plans.get(p.split("/")[3], []))
                 if p.endswith("/analyses/latest"):
                     a = outer.analyses.get(p.split("/")[3])
@@ -115,6 +120,10 @@ class FakeBackend:
                         return self._send(outer.plan_status, {"error": "거부"})
                     created = {"id": "plan-1", "fingerprint": "f" * 64, "status": "awaiting_approval", "terraform_plan_ready": False, **obj}
                     outer.plans.setdefault(obj["project_id"], []).append(created)
+                    if outer.lose_plan_response > 0:
+                        outer.lose_plan_response -= 1
+                        self.close_connection = True   # 서버는 등록을 끝냈지만 응답을 보내지 못한다
+                        return
                     return self._send(201, created)
                 if p.startswith("/api/worker/plans/") and p.endswith("/terraform-plan"):
                     if outer.upload_failures > 0:
@@ -491,6 +500,37 @@ class PlannerTests(Base):
             worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
         self.assertFalse((self.tmp / "deployments" / "fake0001").exists())
 
+    def test_lost_registration_response_keeps_the_plan_and_resumes_the_upload(self):
+        # 서버는 등록을 끝냈는데 응답만 유실돼도 로컬 plan 파일을 지우지 않고, 서버에서 등록된 계획을 찾아 업로드를 이어간다
+        self.backend.lose_plan_response = 1
+        plan = worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertEqual(plan["id"], "plan-1")
+        self.assertTrue((self.tmp / "deployments" / "fake0001" / "tfplan").exists())
+        self.assertEqual(len(self.backend.uploads), 1)   # 같은 계획의 plan 파일이 올라갔다
+        self.assertEqual(len(self.backend.created_plans), 1)
+
+    def test_lost_registration_response_with_unreachable_lookup_keeps_the_plan_file(self):
+        # 응답이 유실됐고 등록 여부 조회까지 실패하면 등록됐는지 모른다: 파일을 남기고, 다음 점검에서 서버 목록의 계획에 올린다
+        self.backend.lose_plan_response = 1
+        self.backend.plans_get_failures = 1
+        with self.assertRaises(worker.ApiError):
+            worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertTrue((self.tmp / "deployments" / "fake0001" / "tfplan").exists())   # 지우지 않는다
+        self.assertEqual(self.backend.uploads, [])
+        # 다음 점검: 서버 목록에 등록된 계획이 보이므로 같은 파일을 올리고 새 계획을 또 만들지 않는다
+        self.backend.projects = [PROJECT]
+        self.backend.analyses[PROJECT["id"]] = self.analysis()
+        state = worker.State(retry_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.uploads), 1)
+        self.assertEqual(len(self.backend.created_plans), 1)
+
+    def test_server_rejection_with_4xx_discards_the_folder(self):
+        self.backend.plan_status = 422
+        with self.assertRaises(worker.ApiError):
+            worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        self.assertFalse((self.tmp / "deployments" / "fake0001").exists())
+
     def test_discard_keeps_dirs_that_were_ever_applied(self):
         for marker in ["terraform.tfstate", "history.log", "applied.app.json"]:
             d = self.tmp / "deployments" / ("keep" + marker[:3])
@@ -731,6 +771,20 @@ class LoopTests(Base):
         self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
         worker.plan_pending(self.api, self.cfg, self.state)
         self.assertEqual(len(self.backend.created_plans), 1)   # 거절·대체된 계획만 남은 프로젝트에 새 계획을 만든다
+
+    def test_plan_that_becomes_superseded_in_the_same_process_is_replanned(self):
+        # 활성 계획이 있어 done에 들어간 프로젝트도 일정 간격마다 상태를 다시 조회해, 계획이 superseded로 바뀌면 다시 계획한다
+        self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}
+        self.backend.plans[PROJECT["id"]] = [{"id": "p1", "status": "awaiting_approval", "terraform_plan_ready": True}]
+        worker.plan_pending(self.api, self.cfg, self.state)
+        self.assertIn(PROJECT["id"], self.state.done)
+        self.assertEqual(self.backend.created_plans, [])
+        self.backend.plans[PROJECT["id"]] = [{"id": "p1", "status": "superseded"}]
+        worker.plan_pending(self.api, self.cfg, self.state)   # 재조회 간격 안: 아직 조회하지 않는다
+        self.assertEqual(self.backend.created_plans, [])
+        self.state.recheck_after = 0.0                        # 간격이 지났다고 본다
+        worker.plan_pending(self.api, self.cfg, self.state)
+        self.assertEqual(len(self.backend.created_plans), 1)
 
     def test_failed_plan_upload_is_repaired_on_the_next_check(self):
         self.backend.analyses[PROJECT["id"]] = {"id": "a", "result": GOOD_RESULT}

@@ -358,6 +358,16 @@ def repair_plan_uploads(api, cfg, plans):
     return pending
 
 
+def find_registered_plan(api, project_id, digest):
+    """프로젝트의 계획 중 plan 파일 SHA-256이 digest인 것을 서버에서 찾아 돌려준다. 서버에 닿았는데 없으면 None.
+    조회 자체가 실패하면 ApiError를 그대로 올린다(등록 여부를 모르는 상태와 '없음'을 구분하려고).
+    등록 요청의 응답만 유실됐는지(서버에는 등록됐는지) 확인하는 데 쓴다."""
+    for p in api.get(f"/api/projects/{project_id}/plans") or []:
+        if p.get("terraform_plan_sha256") == digest:
+            return p
+    return None
+
+
 def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     """프로젝트 하나의 배포 계획을 만들어 백엔드에 등록하고 plan 파일을 올린다. 등록한 계획(PlanOut)을 돌려준다.
     plan 파일 업로드가 끝내 실패하면 계획은 등록된 채 파일을 남기고, 돌려주는 계획에 _upload_pending=True 를 붙인다(다음 점검에서 다시 올린다)."""
@@ -433,9 +443,22 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     }
     try:
         plan = api.post("/api/plans", body)
-    except ApiError:
-        discard_unapplied(cfg, deploy_id)   # 아무것도 등록되지 않았으니 같은 프로젝트를 다시 시도할 수 있게 한다
-        raise
+    except ApiError as e:
+        if e.status != 0 and e.status < 500:
+            discard_unapplied(cfg, deploy_id)   # 서버가 거부했다(4xx) = 등록되지 않았으니 같은 프로젝트를 다시 시도할 수 있게 한다
+            raise
+        # 연결이 끊겼거나 5xx: 서버는 등록을 끝냈는데 응답만 잃었을 수 있다. 로컬 plan 파일을 지우면 올릴 파일이 없어
+        # 승인된 작업이 plan_mismatch로 영영 실패하므로, 먼저 서버에 등록됐는지 확인한다
+        try:
+            plan = find_registered_plan(api, project["id"], digest)
+        except ApiError:
+            # 확인도 못 했다: 등록됐는지 모르니 파일을 남긴다. 다음 점검에서 서버 목록에 계획이 보이면 repair_plan_uploads가 올린다
+            log(f"계획 등록 여부를 확인하지 못했습니다(파일은 남깁니다, 다음 점검에서 다시 확인): {e}")
+            raise e from None
+        if plan is None:
+            discard_unapplied(cfg, deploy_id)   # 서버에 없다 = 등록되지 않았으니 같은 프로젝트를 다시 시도할 수 있게 한다
+            raise
+        log(f"등록 응답은 유실됐지만 서버에 계획 {plan['id']}이 있습니다. plan 파일 업로드를 이어갑니다")
     try:
         upload_plan(api, plan["id"], plan_file)
     except ApiError as e:
@@ -567,8 +590,9 @@ def execute_job(api, cfg, job):
 @dataclass
 class State:
     failures: dict = field(default_factory=dict)   # 프로젝트 id → (실패 횟수, 마지막 시각)
-    done: set = field(default_factory=set)         # 이미 계획이 있는 프로젝트
+    done: dict = field(default_factory=dict)       # 프로젝트 id → 활성 계획이 있는 것을 마지막으로 확인한 시각(time.time())
     repair: set = field(default_factory=set)       # plan 파일 업로드가 남은 프로젝트(점검마다 다시 올린다)
+    recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
     retry_after: float = 120.0
     max_tries: int = 3
 
@@ -589,7 +613,8 @@ def list_projects(api, max_pages=10):
 def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
     for project in list_projects(api):
         pid = project["id"]
-        if pid in state.done and pid not in state.repair:
+        # 활성 계획이 있는 프로젝트도 recheck_after마다 다시 조회한다(같은 프로세스에서 계획이 superseded로 바뀔 수 있다)
+        if pid in state.done and pid not in state.repair and time.time() - state.done[pid] < state.recheck_after:
             continue
         tries, last = state.failures.get(pid, (0, 0.0))
         if pid not in state.repair and (tries >= state.max_tries or (tries and time.time() - last < state.retry_after)):
@@ -601,8 +626,9 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             state.repair.discard(pid)
         # 진행 중이거나 끝난 계획(승인 대기·승인·배포됨)이 하나라도 있으면 건너뛴다. 모두 superseded(대체됨)이면 다시 계획한다
         if any(p.get("status") in ACTIVE_PLAN_STATUSES for p in plans):
-            state.done.add(pid)
+            state.done[pid] = time.time()
             continue
+        state.done.pop(pid, None)   # 활성 계획이 없다: 다시 계획할 대상이다
         try:
             analysis = api.get(f"/api/projects/{pid}/analyses/latest")
         except ApiError as e:
@@ -611,7 +637,7 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             raise
         try:
             plan = plan_project(api, cfg, project, analysis, prices, arch)
-            state.done.add(pid)
+            state.done[pid] = time.time()
             if plan.get("_upload_pending"):
                 state.repair.add(pid)
         except (PlanError, ApiError, subprocess.TimeoutExpired, OSError) as e:

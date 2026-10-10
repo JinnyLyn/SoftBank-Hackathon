@@ -316,12 +316,14 @@ ensure_tools_image() {
   log "mysql 클라이언트 이미지를 ECR에 올립니다 (최초 1회)"
   cfg="$(mktemp -d)"; echo '{}' > "$cfg/config.json"
   # 사용자의 docker 설정(자격증명 도우미)을 건드리지 않으려고 임시 설정 폴더를 쓴다
+  # ( ... ) || 안에서는 set -e가 꺼지므로 단계마다 직접 검사한다
   (
+    set -o pipefail
     export DOCKER_CONFIG; DOCKER_CONFIG="$(native_path "$cfg")"
-    aws ecr get-login-password --region "$rgn" | docker login --username AWS --password-stdin "$registry" >/dev/null
-    docker pull --platform linux/amd64 public.ecr.aws/docker/library/mysql:8.4 >/dev/null
-    docker tag public.ecr.aws/docker/library/mysql:8.4 "$ecr:$TOOLS_TAG"
-    docker push "$ecr:$TOOLS_TAG" >/dev/null
+    aws ecr get-login-password --region "$rgn" | docker login --username AWS --password-stdin "$registry" >/dev/null || exit 1
+    docker pull --platform linux/amd64 public.ecr.aws/docker/library/mysql:8.4 >/dev/null || exit 1
+    docker tag public.ecr.aws/docker/library/mysql:8.4 "$ecr:$TOOLS_TAG" || exit 1
+    docker push "$ecr:$TOOLS_TAG" >/dev/null || exit 1
   ) || { rm -rf "${cfg:?}"; die "mysql 클라이언트 이미지를 올리지 못했습니다"; }
   rm -rf "${cfg:?}"
 }
@@ -963,11 +965,16 @@ cmd_build() {
   log "이미지 빌드: $image ($platform)"
   cfg="$work/docker"; mkdir -p "$cfg"; echo '{}' > "$cfg/config.json"
   # 사용자의 docker 설정(자격증명 도우미)을 건드리지 않으려고 임시 설정 폴더를 쓴다
+  # `( ... ) || ...` 안에서는 bash가 set -e를 꺼서 앞 명령이 실패해도 계속 진행하고 마지막 명령의 결과만 남는다.
+  # 그래서 단계마다 직접 검사한다(빌드가 실패했는데 push가 성공해 옛 이미지가 배포되는 것을 막는다)
   (
+    set -o pipefail
     export DOCKER_CONFIG; DOCKER_CONFIG="$(native_path "$cfg")"
-    docker build --platform "$platform" -f "$(native_path "$ctx/$dockerfile")" -t "$image" "$(native_path "$ctx")" >&2
-    aws ecr get-login-password --region "$rgn" | docker login --username AWS --password-stdin "$registry" >/dev/null
-    docker push "$image" >&2
+    # 이 PC에 같은 태그의 옛 이미지가 남아 있으면 빌드가 실패해도 그것이 push될 수 있어 태그를 먼저 지운다
+    docker rmi -f "$image" >/dev/null 2>&1 || true
+    docker build --platform "$platform" -f "$(native_path "$ctx/$dockerfile")" -t "$image" "$(native_path "$ctx")" >&2 || exit 1
+    aws ecr get-login-password --region "$rgn" | docker login --username AWS --password-stdin "$registry" >/dev/null || exit 1
+    docker push "$image" >&2 || exit 1
   ) || { rm -rf "${work:?}"; die "이미지를 빌드하거나 올리지 못했습니다"; }
   rm -rf "${work:?}"
   log "이미지를 올렸습니다. 아키텍처: $arch"
