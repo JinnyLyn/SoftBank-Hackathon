@@ -109,9 +109,8 @@ def mask_files(files: List[SourceFile]) -> MaskReport:
 # back/app/main.py 의 _SECRET_KEY·_SECRET_VALUE·_CREDENTIAL_URL·_BEARER·_AWS_ACCESS_KEY·_is_secret_key 와 같은 규칙.
 # 백엔드 규칙이 바뀌면 같이 고친다 (tests/test_masking.py 가 백엔드 소스의 정규식과 같은지 확인)
 #
-# 주의 (2026-10-10, c665956): 백엔드 _SECRET_VALUE 는 이름과 상관없이 모든 "이름=값"을 찾고, 로그 가리기(_redact)에서는
-# _is_secret_key 로 이름을 한 번 더 확인한다. 그런데 저장 거절(_reject_secret_fields)에는 이 확인이 빠져 있어
-# "FROM python:3.12" 같은 평범한 문장도 422가 된다. 백엔드에 수정을 요청했고, 여기서는 의도된 규칙(이름 확인)을 따른다.
+# 백엔드는 _SECRET_VALUE 로 모든 "이름=값"을 찾은 뒤 이름이 비밀스러울 때만 거절한다 (_contains_inline_secret, 7d1a668).
+# 그래서 "FROM python:3.12" 같은 문장은 통과하고 "SECRET_KEY=<가림>" 은 거절된다.
 
 BACKEND_SECRET_KEY = re.compile(r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)")
 BACKEND_SECRET_VALUE = re.compile(
@@ -162,17 +161,3 @@ def backend_unsafe_paths(value: object, path: str = "") -> List[str]:
     ):
         found.append(path.rstrip(".") or "value")
     return found
-
-
-def backend_rejects_today(value: object) -> bool:
-    """지금 백엔드(c665956)가 실제로 거절하는지: 이름 확인 없이 모든 "이름=값"을 거절함. 버그 보고·확인용"""
-    if isinstance(value, dict):
-        return any(backend_is_secret_key(str(k)) or backend_rejects_today(v) for k, v in value.items())
-    if isinstance(value, list):
-        return any(backend_rejects_today(v) for v in value)
-    return isinstance(value, str) and bool(
-        BACKEND_SECRET_VALUE.search(value)
-        or BACKEND_CREDENTIAL_URL.search(value)
-        or BACKEND_BEARER.search(value)
-        or BACKEND_AWS_ACCESS_KEY.search(value)
-    )

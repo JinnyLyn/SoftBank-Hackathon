@@ -62,7 +62,7 @@ python ai/runner.py --once    # 한 번만 점검
 5. 로그에는 프로젝트 ID·이름·결과 요약만 남긴다
 
 키(`ANTHROPIC_API_KEY`)와 SDK가 있으면 규칙이 못 찾은 값만 LLM에 묻는다. 없거나 실패하면 규칙 결과만 기록한다.
-백엔드 비밀값 검사 문제가 고쳐지기 전에는 기록이 422로 거절될 수 있고, 그 경우 runner가 이유를 로그에 남기고 멈춘다.
+
 
 ## LLM 보조 (`llm.py`)
 
@@ -94,7 +94,7 @@ copy .env.example .env                       # ANTHROPIC_API_KEY 채우기 (커�
 - 설정 파일(`.env*`, YAML, compose 등)의 `비밀이름=값` 은 값만 가린다. 코드에서는 문자열로 박아 둔 값만 가린다(`os.getenv("SECRET_KEY")` 같은 줄은 그대로).
 - 원본은 바꾸지 않는다.
 - 결과를 백엔드에 기록하기 전, 백엔드의 비밀값 거절 규칙(`back/app/main.py`)과 같은 검사를 먼저 한다.
-  **2026-10-10 기준 백엔드 `_reject_secret_fields` 는 이름과 상관없이 모든 "이름=값"을 거절하는 문제가 있어** 수정을 요청했다(`masking.py` 주석).
+  백엔드는 "이름=값" 중 이름이 비밀스러운 것만 거절한다(`_contains_inline_secret`). `python:3.12` 같은 근거 문장은 그대로 기록된다.
 
 ## 테스트
 
@@ -119,4 +119,4 @@ python -m unittest discover -s tests -t . -v
 
 ## 남은 일
 
-- 백엔드: 사용 규모·예산 저장 위치, `_reject_secret_fields` 수정
+- 백엔드: 사용 규모·예산 저장 위치

@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import runner
-from paved_ai.masking import backend_rejects_today, backend_unsafe_paths
+from paved_ai.masking import backend_unsafe_paths
 
 APP = {
     "requirements.txt": "fastapi==0.142.4\nuvicorn\nPyMySQL==1.1.2\n",
@@ -40,7 +40,7 @@ class FakeBackend:
         self.analyses = {}  # id → 기록된 body
         self.posts = 0
         self.page_size = 100
-        self.reject_like_today = False  # 지금 백엔드(c665956)처럼 모든 "이름=값"을 거절
+        self.force_reject = False  # 비밀값 검사 422를 강제로 냄
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -78,7 +78,7 @@ class FakeBackend:
                     return self._send(404, {"error": "프로젝트를 찾을 수 없습니다."})
                 if body["source_sha256"] != project["source_sha256"]:
                     return self._send(409, {"error": "분석한 ZIP이 현재 프로젝트 파일과 일치하지 않습니다."})
-                bad = backend_rejects_today(body["result"]) if backend.reject_like_today else backend_unsafe_paths(body["result"])
+                bad = backend.force_reject or backend_unsafe_paths(body["result"])
                 if bad:
                     return self._send(422, {"error": "비밀값으로 보이는 내용은 저장할 수 없습니다: result"})
                 backend.analyses[parts[2]] = {"id": "a-" + parts[2], "project_id": parts[2], **body}
@@ -165,12 +165,12 @@ class RunnerTests(unittest.TestCase):
         self.run_once()
         self.assertEqual(self.state.failures["gone"], 1)
 
-    def test_today_backend_rejection_is_reported_not_retried(self):
-        self.backend.reject_like_today = True
+    def test_secret_rejection_is_not_retried(self):
+        self.backend.force_reject = True
         self.add_project("p1")
         counts = self.run_once()
         self.assertEqual(counts["failed"], 1)
-        self.assertIn("백엔드 비밀값 검사", self.state.stopped["p1"])
+        self.assertIn("p1", self.state.stopped)
         self.now += runner.RETRY_AFTER * 10
         self.run_once()
         self.assertEqual(self.backend.posts, 1, "같은 결과를 계속 보내지 않음")

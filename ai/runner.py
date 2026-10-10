@@ -11,6 +11,7 @@
 | PLATFORM_API_URL / --api-url | http://127.0.0.1:8000 |
 | UPLOAD_DIR / --upload-dir    | back/data/uploads (백엔드와 같은 변수·기본값) |
 | ANTHROPIC_API_KEY            | 환경 변수 또는 ai/.env. 없으면 규칙 분석만 |
+| ANTHROPIC_WORKSPACE_ID       | 키가 워크스페이스에 묶여 있지 않을 때만 (anthropic-workspace-id 헤더) |
 | PAVED_AI_MODEL / --model     | claude-opus-5-5 |
 | --no-llm                     | LLM을 부르지 않음 |
 
@@ -159,7 +160,10 @@ def make_llm_client(enabled: bool = True):
     except ImportError:
         log.warning("anthropic SDK가 없어 규칙 분석만 합니다: pip install -r ai/requirements.txt")
         return None
-    return anthropic.Anthropic(timeout=120.0, max_retries=2)
+    # 워크스페이스에 묶이지 않은 키는 요청마다 워크스페이스 ID가 필요함 (없으면 400)
+    workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID")
+    headers = {"anthropic-workspace-id": workspace} if workspace else None
+    return anthropic.Anthropic(timeout=120.0, max_retries=2, default_headers=headers)
 
 
 def analyze_project(project: dict, upload_dir: Path, llm=None, model: str = DEFAULT_MODEL) -> Tuple[dict, str]:
@@ -238,9 +242,6 @@ def run_once(
             counts["failed"] += 1
             if e.status in (0, 429) or e.status >= 500:
                 _fail(state, pid, e.message, permanent=False, now=now)
-            elif e.status == 422 and "비밀값" in e.message:
-                # 백엔드 _reject_secret_fields 가 이름과 상관없이 모든 "이름=값"을 거절하는 문제(c665956) 때문일 수 있음
-                _fail(state, pid, f"{e.message} (백엔드 비밀값 검사가 평범한 코드 문장도 거절하는 문제일 수 있음: ai/README.md)", True, now)
             else:
                 # 404(프로젝트 삭제), 409(ZIP 변경), 422(형식) 등은 다시 보내도 같음
                 _fail(state, pid, f"{e.status} {e.message}", permanent=True, now=now)

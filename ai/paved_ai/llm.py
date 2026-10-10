@@ -209,7 +209,10 @@ def _as_unavailable(exc: Exception) -> Exception:
     if isinstance(exc, anthropic.RateLimitError):
         return LlmUnavailable("Anthropic 사용 한도에 걸렸습니다. 잠시 뒤 다시 시도합니다.")
     if isinstance(exc, anthropic.APIStatusError):
-        return LlmUnavailable(f"Anthropic API 오류 {exc.status_code}")
+        # API가 알려 준 이유를 그대로 (요청 형식·키 설정 문제를 바로 알 수 있게). 우리 요청 내용은 담기지 않음
+        body = exc.body if isinstance(exc.body, dict) else {}
+        detail = (body.get("error") or {}).get("message") or ""
+        return LlmUnavailable(f"Anthropic API 오류 {exc.status_code}: {detail[:200]}".rstrip(": "))
     if isinstance(exc, anthropic.APIConnectionError):
         return LlmUnavailable("Anthropic API에 연결하지 못했습니다.")
     return exc
