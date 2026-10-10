@@ -174,6 +174,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 
 백엔드는 실패 배포가 해당 프로젝트의 최신 배포인지와, 실제 `healthy` 전환 시각이 가장 최근인 이전 정상 버전인지 확인합니다. 후속 배포가 있으면 오래 열린 화면의 롤백 요청은 409으로 거부합니다. worker는 새 rollback plan ID로 Terraform plan을 다시 생성해 `POST /api/worker/rollback-plans/{plan_id}/terraform-plan`에 SHA-256과 함께 저장하고, `POST /api/worker/rollback-plans/{plan_id}/summary`로 diff 요약을 저장합니다. 사용자는 변경된 fingerprint·digest·diff를 확인한 뒤 `POST /api/plans/{plan_id}/approve`로 승인하며, 이후에만 `POST /api/deployments`가 별도 `operation_type: "rollback"` 실행 이력을 생성합니다.
 
+이 전제는 초안 생성 이후에도 승인·큐 등록·claim·진행 상태 보고에서 재검증합니다. 같은 프로젝트에 후속 배포 또는 다른 대기·진행 작업이 생기면 승인·등록·진행 보고는 409입니다. claim에서는 오래된 롤백을 `failed`로 바꾸고 `rollback_context_invalidated` 이벤트를 남긴 뒤 다음 작업을 찾습니다. 실패 보고는 계속 허용합니다. 롤백 실행이 `provisioning`·`deploying`인 동안 같은 프로젝트의 새 배포 등록도 409이며 종료 후 재요청할 수 있습니다. 다른 프로젝트의 배포는 영향을 주지 않습니다.
+
 ## AWS 연결 API
 
 - `GET /api/connections`: AWS 연결 목록
@@ -196,6 +198,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.
 
 worker 이벤트의 `message`와 `details`는 DB 저장 전에 비밀값을 마스킹합니다. `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey`, `SessionToken`처럼 snake_case, kebab-case, camelCase/PascalCase로 표기된 민감 키를 처리하며, 이벤트 및 프로젝트 상태 로그를 조회할 때도 기존 저장 데이터의 값이 다시 노출되지 않도록 마스킹합니다.
+
+`environment: API_KEY=...`, 인용·이스케이프 JSON 문자열 안의 민감 키, 배열·객체 형태의 비밀값도 같은 경계에서 처리합니다. 분석 결과·계획 변수/설명·연결 설정·롤백 diff의 비밀값은 422로 거부하며 `python:3.12` 같은 일반 Docker 태그는 허용합니다.
 
 현재 API는 Terraform, Docker 또는 AWS 명령을 직접 실행하지 않습니다. 실제 worker 구현과 AWS 배포 검증은 별도 작업입니다.
 

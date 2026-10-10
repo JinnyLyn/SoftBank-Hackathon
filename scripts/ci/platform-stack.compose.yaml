@@ -1,0 +1,42 @@
+# CI 전용 구성: 호스트의 .env·서비스 키·포트·기존 DB를 사용하지 않는다.
+services:
+  db:
+    image: mysql:8.4.11
+    environment:
+      MYSQL_DATABASE: paved_ci
+      MYSQL_USER: paved_ci
+      MYSQL_PASSWORD: ci-database-only
+      MYSQL_ROOT_PASSWORD: ci-root-only
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+      start_period: 20s
+  api:
+    build:
+      context: ../../back
+    environment:
+      DATABASE_URL: mysql://paved_ci:ci-database-only@db:3306/paved_ci
+      WORKER_API_TOKEN: ci-worker-only
+      UPLOAD_DIR: /var/lib/paved-clouds/uploads
+      PLAN_ARTIFACT_DIR: /var/lib/paved-clouds/plans
+      AWS_EC2_METADATA_DISABLED: 'true'
+    volumes:
+      - uploads:/var/lib/paved-clouds/uploads
+      - plans:/var/lib/paved-clouds/plans
+      - .:/ci:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  mysql_data:
+  uploads:
+  plans:
