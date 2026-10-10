@@ -1,5 +1,6 @@
 import ProviderMark from '../components/ProviderMark'
 import WorkProgress from '../components/WorkProgress'
+import DockerfileDraft from '../components/DockerfileDraft'
 import { STAGE_SIZE } from '../progress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
@@ -49,6 +50,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
           <span>코드를 고친 뒤 처음 화면에서 다시 올려 주세요.</span>
         </div>
       )}
+      {analysis.dockerfileDraft && <DockerfileDraft draft={analysis.dockerfileDraft} />}
       <section>
         <h3 className="sub-title">코드에서 찾은 것</h3>
         <dl className="kv">

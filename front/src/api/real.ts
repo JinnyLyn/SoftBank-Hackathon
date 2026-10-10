@@ -129,7 +129,13 @@ function toAnalysis(out: AnalysisOut): Analysis {
     isObj(e) ? [str(e.file) + (e.line ? `:${e.line}` : ''), str(e.text ?? e.reason)].filter(Boolean).join(' — ') : str(e),
   )
 
-  return { projectId: out.project_id, stack, findings, evidence, blockers: blockersOf(r) }
+  const d = isObj(r.dockerfile_draft) ? r.dockerfile_draft : null
+  const dockerfileDraft =
+    d && typeof d.content === 'string' && d.content
+      ? { content: d.content, port: Number(d.port) || 0, basedOn: Array.isArray(d.based_on) ? d.based_on.map(str) : [] }
+      : undefined
+
+  return { projectId: out.project_id, stack, findings, evidence, blockers: blockersOf(r), dockerfileDraft }
 }
 
 // worker가 계획을 만들려면 꼭 있어야 하는 값 (infra/worker app_config_from_analysis)
