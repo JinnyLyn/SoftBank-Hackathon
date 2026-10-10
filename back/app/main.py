@@ -37,6 +37,9 @@ from app.schemas import (
     PlanOut,
     ProjectListOut,
     ProjectOut,
+    RollbackCandidateOut,
+    RollbackPlanSummaryIn,
+    RollbackRequestIn,
     WorkerEventIn,
 )
 from app.settings import ConfigurationError
@@ -461,6 +464,8 @@ def approve_plan(plan_id: UUID, body: ApproveIn) -> PlanOut:
             raise HTTPException(status.HTTP_409_CONFLICT, "승인하려는 계획이 표시된 계획과 다릅니다.")
         if row["target"] == "aws" and not _terraform_plan_is_valid(row):
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 SHA-256과 일치하는 저장 Terraform plan이 없습니다.")
+        if row.get("operation_type") == "rollback" and row.get("terraform_plan_summary") is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "롤백 Terraform plan의 diff 요약을 먼저 저장해야 합니다.")
         cursor.execute(
             """UPDATE deployment_plans
                SET status = 'approved', approved_at = CURRENT_TIMESTAMP(6), approved_fingerprint = %s
@@ -498,6 +503,8 @@ def queue_deployment(body: DeploymentCreateIn) -> DeploymentOut:
             raise HTTPException(status.HTTP_409_CONFLICT, "승인 후 배포 계획이 변경되었습니다.")
         if plan["target"] == "aws" and not _terraform_plan_is_valid(plan):
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 Terraform plan이 없거나 SHA-256 검증에 실패했습니다.")
+        if plan.get("operation_type") == "rollback" and plan.get("terraform_plan_summary") is None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "롤백 Terraform plan의 diff 요약이 없어 실행 대기열에 넣을 수 없습니다.")
         cursor.execute(
             """UPDATE deployment_plans SET status = 'consumed'
                WHERE id = %s AND status = 'approved' AND approved_fingerprint = %s""",
@@ -506,9 +513,14 @@ def queue_deployment(body: DeploymentCreateIn) -> DeploymentOut:
         if cursor.rowcount != 1:
             raise HTTPException(status.HTTP_409_CONFLICT, "이 승인으로 이미 배포가 등록되었거나 계획 상태가 변경되었습니다.")
         cursor.execute(
-            """INSERT INTO deployments (id, plan_id, project_id, target, status)
-               VALUES (%s, %s, %s, %s, 'queued')""",
-            (str(deployment_id), plan["id"], plan["project_id"], plan["target"]),
+            """INSERT INTO deployments
+               (id, plan_id, project_id, target, operation_type, rollback_from_deployment_id,
+                rollback_to_deployment_id, status)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 'queued')""",
+            (
+                str(deployment_id), plan["id"], plan["project_id"], plan["target"], plan.get("operation_type", "deploy"),
+                plan.get("rollback_from_deployment_id"), plan.get("rollback_to_deployment_id"),
+            ),
         )
         _insert_event(cursor, deployment_id, "info", "queued", "승인된 배포 계획을 실행 대기열에 등록했습니다.", None)
         connection.commit()
@@ -548,12 +560,140 @@ def list_deployments(
             "version": str(row["id"])[:8],
             "tier": variables.get("tier", row["module_id"]),
             "provider": "aws" if row["target"] == "aws" else "onprem",
-            "target": variables.get("connection_name", "AWS" if row["target"] == "aws" else "로컬 Docker"),
+            "target": variables.get("connection_name", "AWS"),
             "monthlyUsd": float(cost.get("amount", 0)),
             "status": status_alias,
             "createdAt": _as_utc(row["created_at"]).isoformat(),
         })
     return result
+
+
+@app.get(
+    "/api/deployments/{deployment_id}/rollback-candidate",
+    response_model=RollbackCandidateOut,
+    tags=["deployments"],
+)
+def rollback_candidate(deployment_id: UUID) -> RollbackCandidateOut:
+    """Return only the immediately previous healthy AWS deployment as a rollback candidate."""
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM deployments WHERE id = %s", (str(deployment_id),))
+        failed = cursor.fetchone()
+        if failed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
+        if failed["operation_type"] != "deploy" or failed["status"] != "failed":
+            return RollbackCandidateOut(rollback_available=False, reason="not_failed")
+        cursor.execute(
+            "SELECT id FROM deployments WHERE project_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
+            (failed["project_id"],),
+        )
+        latest = cursor.fetchone()
+        if latest is None or latest["id"] != str(deployment_id):
+            return RollbackCandidateOut(rollback_available=False, reason="not_failed")
+        cursor.execute(
+            "SELECT id FROM deployments WHERE project_id = %s AND created_at < %s LIMIT 1",
+            (failed["project_id"], failed["created_at"]),
+        )
+        if cursor.fetchone() is None:
+            return RollbackCandidateOut(rollback_available=False, reason="first_deployment")
+        cursor.execute(
+            """SELECT d.*, p.terraform_plan_sha256, p.terraform_plan_path
+               FROM deployments d
+               JOIN deployment_plans p ON p.id = d.plan_id
+               WHERE d.project_id = %s AND d.target = 'aws' AND d.status = 'healthy'
+                 AND d.updated_at <= %s
+               ORDER BY d.updated_at DESC, d.id DESC LIMIT 1""",
+            (failed["project_id"], failed["updated_at"]),
+        )
+        candidate = cursor.fetchone()
+    if candidate is None:
+        return RollbackCandidateOut(rollback_available=False, reason="no_previous_healthy")
+    return RollbackCandidateOut(
+        rollback_available=True,
+        reason="available",
+        target_deployment_id=UUID(candidate["id"]),
+        target_plan_id=UUID(candidate["plan_id"]),
+    )
+
+
+@app.post(
+    "/api/deployments/{deployment_id}/rollback",
+    response_model=PlanOut,
+    status_code=status.HTTP_201_CREATED,
+    tags=["deployments"],
+)
+def queue_rollback(deployment_id: UUID, body: RollbackRequestIn) -> PlanOut:
+    """Create a fresh rollback plan draft; approval happens only after worker uploads its plan and diff."""
+    plan_id = uuid4()
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
+        failed = cursor.fetchone()
+        if failed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
+        if failed["operation_type"] != "deploy" or failed["status"] != "failed":
+            raise HTTPException(status.HTTP_409_CONFLICT, "실패한 일반 배포에 대해서만 롤백을 요청할 수 있습니다.")
+        cursor.execute(
+            """SELECT id FROM deployments WHERE project_id = %s
+               ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+            (failed["project_id"],),
+        )
+        latest = cursor.fetchone()
+        if latest is None or latest["id"] != str(deployment_id):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "후속 배포가 있어 이전 실패 배포의 롤백 승인이 무효화되었습니다.",
+            )
+        cursor.execute(
+            """SELECT d.*, p.module_id, p.variables, p.cost_estimate
+               FROM deployments d
+               JOIN deployment_plans p ON p.id = d.plan_id
+               WHERE d.project_id = %s AND d.target = 'aws' AND d.status = 'healthy'
+                 AND d.updated_at <= %s
+               ORDER BY d.updated_at DESC, d.id DESC LIMIT 1 FOR UPDATE""",
+            (failed["project_id"], failed["updated_at"]),
+        )
+        candidate = cursor.fetchone()
+        if candidate is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "검증된 이전 정상 버전이 없어 롤백할 수 없습니다. 분석·수정 후 새 계획을 승인해 재배포하세요.",
+            )
+        if candidate["id"] != str(body.expected_target_deployment_id):
+            raise HTTPException(status.HTTP_409_CONFLICT, "사용자가 확인한 롤백 대상이 현재 이전 정상 버전과 다릅니다.")
+        cursor.execute(
+            """SELECT id FROM deployment_plans
+               WHERE rollback_from_deployment_id = %s AND status IN ('awaiting_approval', 'approved')
+               LIMIT 1 FOR UPDATE""",
+            (str(deployment_id),),
+        )
+        if cursor.fetchone() is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "이 실패 배포에 대한 새 롤백 계획이 이미 승인 대기 또는 승인 상태입니다.")
+        variables = _json_value(candidate["variables"])
+        cost_estimate = _json_value(candidate["cost_estimate"])
+        payload = {
+            "project_id": failed["project_id"], "target": "aws", "operation_type": "rollback",
+            "rollback_from_deployment_id": str(deployment_id), "rollback_to_deployment_id": candidate["id"],
+            "module_id": candidate["module_id"], "variables": variables,
+            "cost_estimate": cost_estimate, "terraform_plan_sha256": None,
+        }
+        cursor.execute(
+            """INSERT INTO deployment_plans
+               (id, project_id, target, operation_type, rollback_from_deployment_id, rollback_to_deployment_id,
+                module_id, variables, summary, cost_estimate, fingerprint)
+               VALUES (%s, %s, 'aws', 'rollback', %s, %s, %s, %s, %s, %s, %s)""",
+            (
+                str(plan_id), failed["project_id"], str(deployment_id), candidate["id"], candidate["module_id"],
+                _json(variables), "사용자가 요청한 이전 정상 버전 롤백 계획", _json(cost_estimate), _fingerprint(payload),
+            ),
+        )
+        _insert_event(
+            cursor, deployment_id, "info", "rollback_plan_requested",
+            "사용자가 롤백 계획 생성을 요청했습니다. 새 Terraform plan과 diff 승인이 필요합니다.",
+            {"rollback_plan_id": str(plan_id), "target_deployment_id": candidate["id"]},
+        )
+        connection.commit()
+        cursor.execute("SELECT * FROM deployment_plans WHERE id = %s", (str(plan_id),))
+        rollback_plan = cursor.fetchone()
+    return _plan_out(rollback_plan)
 
 
 @app.get("/api/deployments/{deployment_id}", response_model=DeploymentDetailOut, tags=["deployments"])
@@ -603,7 +743,8 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
     with connect() as connection, connection.cursor() as cursor:
         while True:
             cursor.execute(
-                """SELECT d.id AS deployment_id, d.status, d.target, d.plan_id, d.project_id,
+                """SELECT d.id AS deployment_id, d.status, d.target, d.operation_type,
+                          d.rollback_from_deployment_id, d.rollback_to_deployment_id, d.plan_id, d.project_id,
                           p.module_id, p.variables, p.summary, p.cost_estimate, p.terraform_plan_sha256,
                           p.terraform_plan_path,
                           pr.source_path, pr.source_filename, pr.source_sha256
@@ -647,7 +788,7 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
                 UUID(job["deployment_id"]),
                 "info",
                 "provisioning",
-                "배포 작업자가 실행을 시작했습니다.",
+                "롤백 작업자가 실행을 시작했습니다." if job["operation_type"] == "rollback" else "배포 작업자가 실행을 시작했습니다.",
                 None,
             )
             connection.commit()
@@ -719,6 +860,74 @@ async def upload_terraform_plan(
     return {"plan_id": str(plan_id), "sha256": stored.sha256, "size_bytes": stored.size_bytes, "ready": True}
 
 
+@app.post("/api/worker/rollback-plans/{plan_id}/terraform-plan", tags=["worker"])
+async def upload_rollback_terraform_plan(
+    plan_id: UUID,
+    request: Request,
+    x_terraform_plan_sha256: str | None = Header(default=None),
+    x_worker_token: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Store a newly generated rollback plan before it can be shown for approval."""
+    _require_worker(x_worker_token)
+    if not x_terraform_plan_sha256 or not re.fullmatch(r"[a-f0-9]{64}", x_terraform_plan_sha256):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "X-Terraform-Plan-SHA256은 64자리 소문자 hex여야 합니다.")
+    content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0].strip().lower()
+    if content_type != "application/octet-stream":
+        raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "Content-Type은 application/octet-stream이어야 합니다.")
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM deployment_plans WHERE id = %s", (str(plan_id),))
+        plan = cursor.fetchone()
+    if plan is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "롤백 계획을 찾을 수 없습니다.")
+    if plan.get("operation_type") != "rollback" or plan["status"] != "awaiting_approval" or plan["terraform_plan_path"]:
+        raise HTTPException(status.HTTP_409_CONFLICT, "새 Terraform plan을 받을 수 있는 롤백 승인 대기 계획이 아닙니다.")
+    stored = await save_terraform_plan(request.stream(), plan_id, x_terraform_plan_sha256)
+    try:
+        with connect() as connection, connection.cursor() as cursor:
+            payload = _plan_fingerprint_payload(plan, terraform_plan_sha256=stored.sha256)
+            cursor.execute(
+                """UPDATE deployment_plans SET terraform_plan_sha256 = %s, terraform_plan_path = %s, fingerprint = %s
+                   WHERE id = %s AND operation_type = 'rollback' AND status = 'awaiting_approval'
+                     AND terraform_plan_path IS NULL""",
+                (stored.sha256, str(stored.path), _fingerprint(payload), str(plan_id)),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                stored.path.unlink(missing_ok=True)
+                raise HTTPException(status.HTTP_409_CONFLICT, "롤백 계획 상태가 변경되어 Terraform plan을 저장하지 못했습니다.")
+            connection.commit()
+    except Exception:
+        stored.path.unlink(missing_ok=True)
+        raise
+    return {"plan_id": str(plan_id), "sha256": stored.sha256, "size_bytes": stored.size_bytes, "ready": False}
+
+
+@app.post("/api/worker/rollback-plans/{plan_id}/summary", response_model=PlanOut, tags=["worker"])
+def save_rollback_plan_summary(
+    plan_id: UUID, body: RollbackPlanSummaryIn, x_worker_token: str | None = Header(default=None)
+) -> PlanOut:
+    _require_worker(x_worker_token)
+    _reject_secret_fields(body.summary)
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM deployment_plans WHERE id = %s FOR UPDATE", (str(plan_id),))
+        plan = cursor.fetchone()
+        if plan is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "롤백 계획을 찾을 수 없습니다.")
+        if plan.get("operation_type") != "rollback" or plan["status"] != "awaiting_approval":
+            raise HTTPException(status.HTTP_409_CONFLICT, "diff를 저장할 수 있는 롤백 승인 대기 계획이 아닙니다.")
+        if not _terraform_plan_is_valid(plan) or not hmac.compare_digest(plan["terraform_plan_sha256"] or "", body.terraform_plan_sha256):
+            raise HTTPException(status.HTTP_409_CONFLICT, "저장된 Terraform plan과 일치하는 diff만 기록할 수 있습니다.")
+        payload = _plan_fingerprint_payload(plan, terraform_plan_summary=body.summary)
+        cursor.execute(
+            "UPDATE deployment_plans SET terraform_plan_summary = %s, fingerprint = %s WHERE id = %s",
+            (_json(body.summary), _fingerprint(payload), str(plan_id)),
+        )
+        connection.commit()
+        cursor.execute("SELECT * FROM deployment_plans WHERE id = %s", (str(plan_id),))
+        updated = cursor.fetchone()
+    return _plan_out(updated)
+
+
 @app.post("/api/worker/deployments/{deployment_id}/events", response_model=DeploymentOut, tags=["worker"])
 def record_worker_event(
     deployment_id: UUID,
@@ -730,7 +939,7 @@ def record_worker_event(
     body_dict["message"] = _redact(body.message)
     body_dict["details"] = _redact_tree(body.details) if body.details is not None else None
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT status FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
+        cursor.execute("SELECT status, operation_type FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
         current = cursor.fetchone()
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
@@ -744,6 +953,8 @@ def record_worker_event(
             "rolled_back": set(),
         }
         same_status = body.status == current["status"]
+        if current["operation_type"] == "rollback" and body.status in {"rolling_back", "rolled_back"}:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "롤백 실행은 일반 배포와 같은 상태 흐름을 사용합니다.")
         if not same_status and body.status not in allowed[current["status"]]:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -815,7 +1026,7 @@ def _reject_secret_fields(value: Any, path: str = "") -> None:
         for item in value:
             _reject_secret_fields(item, path)
     elif isinstance(value, str) and (
-        _SECRET_VALUE.search(value)
+        _contains_inline_secret(value)
         or _CREDENTIAL_URL.search(value)
         or _BEARER.search(value)
         or _AWS_ACCESS_KEY.search(value)
@@ -843,6 +1054,17 @@ def _redact(text: str) -> str:
     return _SECRET_VALUE.sub(replace_secret, text)
 
 
+def _contains_inline_secret(text: str) -> bool:
+    """Return whether inline key/value text contains a value for a secret key.
+
+    `_SECRET_VALUE` intentionally recognizes generic ``key: value`` and
+    ``key=value`` forms so that log redaction can preserve their original
+    formatting.  A generic match alone is not sensitive, though: Docker image
+    references such as ``python:3.12`` must remain valid analysis input.
+    """
+    return any(_is_secret_key(match.group("key")) for match in _SECRET_VALUE.finditer(text))
+
+
 def _is_secret_key(key: str) -> bool:
     # Normalize camelCase/PascalCase and acronym boundaries before checking
     # the same sensitive-name list used for snake_case and kebab-case keys.
@@ -867,6 +1089,24 @@ def _redact_tree(value: Any) -> Any:
 def _fingerprint(payload: dict[str, Any]) -> str:
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _plan_fingerprint_payload(
+    row: dict[str, Any], *, terraform_plan_sha256: str | None = None, terraform_plan_summary: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """The exact fields a user approves; rollback artifacts receive their digest only after generation."""
+    return {
+        "project_id": row["project_id"], "analysis_id": row.get("analysis_id"), "target": row["target"],
+        "operation_type": row.get("operation_type", "deploy"),
+        "rollback_from_deployment_id": row.get("rollback_from_deployment_id"),
+        "rollback_to_deployment_id": row.get("rollback_to_deployment_id"),
+        "module_id": row["module_id"], "variables": _json_value(row["variables"]),
+        "summary": row["summary"], "cost_estimate": _json_value(row["cost_estimate"]),
+        "terraform_plan_sha256": terraform_plan_sha256 if terraform_plan_sha256 is not None else row.get("terraform_plan_sha256"),
+        "terraform_plan_summary": (terraform_plan_summary if terraform_plan_summary is not None
+                                   else (_json_value(row["terraform_plan_summary"])
+                                         if row.get("terraform_plan_summary") else None)),
+    }
 
 
 def _json(value: Any) -> str:
@@ -931,9 +1171,16 @@ def _plan_out(row: dict[str, Any]) -> PlanOut:
     return PlanOut(
         id=UUID(row["id"]), project_id=UUID(row["project_id"]),
         analysis_id=UUID(row["analysis_id"]) if row["analysis_id"] else None,
-        target=row["target"], module_id=row["module_id"], variables=_json_value(row["variables"]),
+        target=row["target"], operation_type=row.get("operation_type", "deploy"),
+        rollback_from_deployment_id=(UUID(row["rollback_from_deployment_id"])
+                                     if row.get("rollback_from_deployment_id") else None),
+        rollback_to_deployment_id=(UUID(row["rollback_to_deployment_id"])
+                                   if row.get("rollback_to_deployment_id") else None),
+        module_id=row["module_id"], variables=_json_value(row["variables"]),
         summary=row["summary"], cost_estimate=_json_value(row["cost_estimate"]),
-        terraform_plan_sha256=row["terraform_plan_sha256"], fingerprint=row["fingerprint"],
+        terraform_plan_sha256=row["terraform_plan_sha256"],
+        terraform_plan_summary=_json_value(row["terraform_plan_summary"]) if row.get("terraform_plan_summary") else None,
+        fingerprint=row["fingerprint"],
         terraform_plan_ready=(
             row["target"] != "aws"
             or bool(row.get("terraform_plan_path") and Path(row["terraform_plan_path"]).is_file())
@@ -946,7 +1193,12 @@ def _plan_out(row: dict[str, Any]) -> PlanOut:
 def _deployment_out(row: dict[str, Any]) -> DeploymentOut:
     return DeploymentOut(
         id=UUID(row["id"]), plan_id=UUID(row["plan_id"]), project_id=UUID(row["project_id"]),
-        target=row["target"], status=row["status"], url=row["url"],
+        target=row["target"], operation_type=row.get("operation_type", "deploy"),
+        rollback_from_deployment_id=(UUID(row["rollback_from_deployment_id"])
+                                     if row.get("rollback_from_deployment_id") else None),
+        rollback_to_deployment_id=(UUID(row["rollback_to_deployment_id"])
+                                   if row.get("rollback_to_deployment_id") else None),
+        status=row["status"], url=row["url"],
         created_at=_as_utc(row["created_at"]), updated_at=_as_utc(row["updated_at"]),
     )
 
