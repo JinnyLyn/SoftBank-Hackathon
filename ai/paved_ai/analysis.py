@@ -522,6 +522,11 @@ def _parse_command(value: str) -> Optional[List[str]]:
     return parts or None
 
 
+# compose 보조 서비스 중 배포에서 대신하거나 필요 없는 이미지
+_COMPOSE_REPLACED = {"mysql", "mariadb"}  # 공용 RDS MySQL이 대신함
+_COMPOSE_DEV_ONLY = {"adminer", "phpmyadmin"}  # 개발용 DB 관리 화면
+
+
 def _check_shape(a: Analysis, repo: Repo, family: Optional[str]) -> None:
     dockerfiles = sorted((f.path for f in repo.named("Dockerfile")), key=lambda p: (p.count("/"), p))
     a.has_dockerfile = bool(dockerfiles)
@@ -539,6 +544,22 @@ def _check_shape(a: Analysis, repo: Repo, family: Optional[str]) -> None:
         if len(images) > 1:
             a.supported = False
             a.unsupported_reasons.append(f"서로 다른 이미지를 빌드하는 서비스가 여러 개입니다({', '.join(built)}). 앱 1개 배포만 지원합니다.")
+            continue
+        # 빌드 없이 이미지만 쓰는 보조 서비스(Redis 등)는 배포하지 않으므로 앱이 실패함 → 미지원 (PR #25 재리뷰).
+        # MySQL·MariaDB는 공용 DB가 대신하고, DB 관리 화면은 배포에 필요 없음
+        extra = []
+        for name, svc in _compose_services(f.text).items():
+            if name in built or not svc.get("image"):
+                continue
+            base = svc["image"].strip("\"'").split("@")[0].rsplit("/", 1)[-1].split(":")[0].lower()
+            if base not in _COMPOSE_REPLACED and base not in _COMPOSE_DEV_ONLY:
+                extra.append(f"{name}({svc['image'].strip(chr(34) + chr(39))})")
+        if extra:
+            a.supported = False
+            a.unsupported_reasons.append(
+                f"앱 말고도 따로 띄우는 서비스가 있습니다: {', '.join(extra)}. 지금은 앱 1개와 공용 MySQL만 배포합니다.")
+            i, line = _line_of(f, "image:")
+            a.evidence.append(Evidence(f.path, i, line))
             continue
         # 같은 이미지로 command만 바꿔 한 번 도는 서비스 = 초기화 작업 (포트를 열지 않음)
         for name, svc in built.items():

@@ -55,7 +55,10 @@ _ENV_ASSIGN = re.compile(
 _CONFIG_FILE = re.compile(r"(?i)(^|/)(\.env(\.[\w-]+)?|[^/]+\.(ya?ml|ini|cfg|conf|toml|properties|json)|dockerfile)$")
 # 코드에서 비밀 이름 변수에 문자열 그대로 넣은 것만 (password = request.form[...] 같은 코드는 그대로 둠)
 # 키에 따옴표가 있는 객체 문법("password": "...")도 포함
-_CODE_ASSIGN = re.compile(r"(?i)\b(" + _SECRET_NAME + r")([\"']?\s*[:=]\s*)([\"'])([^\"'\n]{4,})\3")
+# JavaScript 백틱(`...`)과 Python 문자열 접두사(b"", r"", f"", rb"" 등)도 포함 (PR #25 재리뷰)
+_CODE_ASSIGN = re.compile(
+    r"(?i)\b(" + _SECRET_NAME + r")([\"'`]?\s*[:=]\s*)((?:[bru]|[bf]r|r[bf]|f)?)([\"'`])([^\"'`\n]{4,})\4"
+)
 
 
 @dataclass(frozen=True)
@@ -92,7 +95,7 @@ def mask_text(text: str, config_file: bool = False) -> Tuple[str, int]:
     if config_file:
         text, n = _ENV_ASSIGN.subn(lambda m: m.group(1) + MASK, text)
         count += n
-    text, n = _CODE_ASSIGN.subn(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{MASK}{m.group(3)}", text)
+    text, n = _CODE_ASSIGN.subn(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{MASK}{m.group(4)}", text)
     count += n
     return text, count
 

@@ -54,9 +54,10 @@ python ai/runner.py --once    # 한 번만 점검
 |---|---|
 | `PLATFORM_API_URL` / `--api-url` | `http://127.0.0.1:8000` |
 | `UPLOAD_DIR` / `--upload-dir` | `back/data/uploads` (백엔드와 같은 변수·기본값) |
+| `WORKER_API_TOKEN` | 백엔드가 소스를 S3에 저장할 때(`ARTIFACT_S3_BUCKET`)만. 백엔드와 같은 값. 로그에 남기지 않음 |
 
 1. `GET /api/projects` 로 프로젝트를 읽고(`next_cursor` 따라 최대 10페이지), `GET /analyses/latest` 가 404인 것만 처리
-2. `{UPLOAD_DIR}/{project_id}.zip` 을 읽고 **SHA-256이 프로젝트에 기록된 값과 같을 때만** 분석 (다르면 멈춤)
+2. `{UPLOAD_DIR}/{project_id}.zip` 을 읽고(없으면 `WORKER_API_TOKEN`으로 `GET /api/worker/projects/{id}/source`에서 받음) **SHA-256이 프로젝트에 기록된 값과 같을 때만** 분석 (다르면 멈춤)
 3. 분석 결과에 비밀값이 남지 않았는지 확인한 뒤 `POST /api/projects/{id}/analyses`
 4. 실패하면 2분 뒤 다시, 3번 실패하면 그 프로젝트는 멈춤. 지문 불일치·삭제·형식 오류처럼 다시 보내도 같은 실패는 바로 멈춤
 5. 로그에는 프로젝트 ID·이름·결과 요약만 남긴다

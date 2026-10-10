@@ -41,6 +41,9 @@ class FakeBackend:
         self.posts = 0
         self.page_size = 100
         self.force_reject = False  # 비밀값 검사 422를 강제로 냄
+        self.sources = {}  # id → ZIP 바이트 (S3 저장 모드: 로컬 파일 없이 다운로드 API로만 줌)
+        self.token = "test-worker-token"
+        self.downloads = 0
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -64,6 +67,18 @@ class FakeBackend:
                     nxt = start + backend.page_size
                     return self._send(200, {"items": items, "next_cursor": str(nxt) if nxt < len(backend.projects) else None})
                 parts = u.path.strip("/").split("/")
+                if len(parts) == 5 and parts[1] == "worker" and parts[4] == "source":
+                    if self.headers.get("X-Worker-Token") != backend.token:
+                        return self._send(401, {"error": "작업자 인증에 실패했습니다."})
+                    data = backend.sources.get(parts[3])
+                    if data is None:
+                        return self._send(404, {"error": "없음"})
+                    backend.downloads += 1
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/zip")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    return self.wfile.write(data)
                 if len(parts) == 5 and parts[3] == "analyses" and parts[4] == "latest":
                     found = backend.analyses.get(parts[2])
                     return self._send(200, found) if found else self._send(404, {"error": "분석 결과가 아직 없습니다."})
@@ -118,6 +133,34 @@ class RunnerTests(unittest.TestCase):
 
     def run_once(self):
         return runner.run_once(self.api, self.uploads, self.state, clock=lambda: self.now)
+
+    def add_s3_project(self, pid: str, files: dict = APP) -> bytes:
+        """백엔드가 S3에 저장한 프로젝트: 로컬 업로드 폴더에는 파일이 없음"""
+        data = make_zip(files)
+        self.backend.sources[pid] = data
+        self.backend.projects.append({"id": pid, "name": pid, "source_sha256": hashlib.sha256(data).hexdigest()})
+        return data
+
+    def test_downloads_source_when_backend_stores_in_s3(self):
+        # PR #25 재리뷰: S3 모드에서는 로컬 ZIP이 지워져 모든 프로젝트가 실패했음
+        self.add_s3_project("s1")
+        api = runner.Api(self.backend.url, timeout=5, worker_token=self.backend.token)
+        counts = runner.run_once(api, self.uploads, self.state, clock=lambda: self.now)
+        self.assertEqual(counts["recorded"], 1)
+        self.assertEqual(self.backend.downloads, 1)
+        self.assertNotIn(self.backend.token, repr(api))
+
+    def test_s3_source_needs_token_and_matching_fingerprint(self):
+        self.add_s3_project("s2")
+        # 토큰이 없으면 내려받지 않고 이유와 함께 실패
+        self.assertEqual(self.run_once()["failed"], 1)
+        self.assertEqual(self.backend.downloads, 0)
+        # 지문이 다르면 분석하지 않음
+        self.add_s3_project("s3")
+        self.backend.projects[-1]["source_sha256"] = "0" * 64
+        api = runner.Api(self.backend.url, timeout=5, worker_token=self.backend.token)
+        runner.run_once(api, self.uploads, runner.State(), clock=lambda: self.now)
+        self.assertNotIn("s3", self.backend.analyses)
 
     def test_records_analysis_once(self):
         self.add_project("p1")

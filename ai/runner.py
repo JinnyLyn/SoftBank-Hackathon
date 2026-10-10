@@ -9,6 +9,7 @@
 | 설정 | 기본값 |
 |---|---|
 | PLATFORM_API_URL / --api-url | http://127.0.0.1:8000 |
+| WORKER_API_TOKEN             | 백엔드가 소스를 S3에 저장할 때만. 로컬에 ZIP이 없으면 GET /api/worker/projects/{id}/source 로 받음 |
 | UPLOAD_DIR / --upload-dir    | back/data/uploads (백엔드와 같은 변수·기본값) |
 | OLLAMA_API_KEY               | 환경 변수 또는 ai/.env. 있으면 Ollama 클라우드를 씀(기본) |
 | OLLAMA_BASE_URL              | https://ollama.com |
@@ -73,10 +74,35 @@ class RunnerError(Exception):
         self.permanent = permanent
 
 
+# 소스 다운로드 상한. 백엔드 업로드 한도(200 MiB)보다 조금 크게
+MAX_SOURCE_BYTES = 256 * 1024 * 1024
+
+
 class Api:
-    def __init__(self, base_url: str, timeout: int = REQUEST_TIMEOUT):
+    def __init__(self, base_url: str, timeout: int = REQUEST_TIMEOUT, worker_token: Optional[str] = None):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
+        # 소스 다운로드(worker 전용 API)에만 씀. repr·로그에 남기지 않음
+        self._worker_token = worker_token or None
+
+    @property
+    def can_download(self) -> bool:
+        return self._worker_token is not None
+
+    def download_source(self, project_id: str) -> bytes:
+        """GET /api/worker/projects/{id}/source. 백엔드가 S3에 저장해도 API가 읽어 줌 (back/API.md)"""
+        req = urllib.request.Request(f"{self.base}/api/worker/projects/{urllib.parse.quote(project_id)}/source")
+        req.add_header("X-Worker-Token", self._worker_token or "")
+        try:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as res:
+                data = res.read(MAX_SOURCE_BYTES + 1)
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, "소스를 내려받지 못했습니다" + (" (worker 토큰 확인)" if e.code in (401, 403) else "")) from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            raise ApiError(0, f"백엔드에 연결하지 못했습니다: {getattr(e, 'reason', e)}") from None
+        if len(data) > MAX_SOURCE_BYTES:
+            raise RunnerError("소스 ZIP이 너무 큽니다.", permanent=True)
+        return data
 
     def _request(self, method: str, path: str, body: Optional[dict] = None):
         data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
@@ -213,17 +239,26 @@ def _make_anthropic():
     return anthropic.Anthropic(timeout=120.0, max_retries=2, default_headers=headers)
 
 
-def analyze_project(project: dict, upload_dir: Path, llm=None, model: str = DEFAULT_MODEL) -> Tuple[dict, str]:
+def analyze_project(
+    project: dict, upload_dir: Path, llm=None, model: str = DEFAULT_MODEL, api: Optional["Api"] = None
+) -> Tuple[dict, str]:
     """업로드된 ZIP을 읽어 분석. 백엔드가 기록한 지문과 같은 파일일 때만 분석한다.
+    로컬 업로드 폴더에 없으면(백엔드가 S3에 저장) worker 토큰으로 백엔드의 소스 다운로드 API에서 받는다.
     llm(OllamaClient 또는 Anthropic client)이 있으면 규칙이 못 찾은 값만 LLM에 묻는다. LLM이 실패해도 규칙 결과는 기록한다."""
     path = upload_dir / f"{project['id']}.zip"
-    if not path.is_file():
-        raise RunnerError(f"소스 ZIP이 없습니다({path}). runner를 백엔드와 같은 PC에서 돌리고 UPLOAD_DIR을 맞춰 주세요.")
-    digest = sha256_file(path)
+    if path.is_file():
+        data = path.read_bytes()
+    elif api is not None and api.can_download:
+        data = api.download_source(project["id"])
+    else:
+        raise RunnerError(
+            f"소스 ZIP이 없습니다({path}). 백엔드와 같은 PC에서 UPLOAD_DIR을 맞추거나, "
+            "백엔드가 S3에 저장하면 WORKER_API_TOKEN을 설정해 다운로드 API로 받게 해 주세요.")
+    digest = hashlib.sha256(data).hexdigest()
     if digest != project.get("source_sha256"):
         raise RunnerError("소스 ZIP의 지문(SHA-256)이 프로젝트에 기록된 값과 다릅니다. 분석하지 않습니다.", permanent=True)
     try:
-        files = files_from_zip(path.read_bytes())
+        files = files_from_zip(data)
     except SourceError as e:
         raise RunnerError(str(e), permanent=True) from None
 
@@ -279,7 +314,7 @@ def run_once(
                 state.done.add(pid)
                 counts["skipped"] += 1
                 continue
-            result, digest = analyze_project(project, upload_dir, llm, model)
+            result, digest = analyze_project(project, upload_dir, llm, model, api)
             api.record_analysis(pid, digest, result)
         except RunnerError as e:
             counts["failed"] += 1
@@ -317,7 +352,8 @@ def main(argv=None) -> int:
     load_dotenv()
     llm, default_model = make_llm_client(enabled=not args.no_llm)
     args.model = args.model or os.getenv("PAVED_AI_MODEL") or default_model or DEFAULT_MODEL
-    api, state = Api(args.api_url), State()
+    # 백엔드가 소스를 S3에 저장하면 worker 다운로드 API로 받음 (토큰 값은 로그에 남기지 않음)
+    api, state = Api(args.api_url, worker_token=os.environ.get("WORKER_API_TOKEN")), State()
     upload_dir = args.upload_dir.expanduser().resolve()
     log.info("시작: 백엔드 %s, 업로드 폴더 %s, LLM %s", api.base, upload_dir, args.model if llm else "끔")
 

@@ -170,6 +170,19 @@ class SmallAppTests(unittest.TestCase):
         a = analyze_files(files(**{"docker-compose.yml": compose, "web/Dockerfile": "FROM nginx\n", "api/Dockerfile": "FROM python:3.12\n"}))
         self.assertFalse(a.supported)
 
+    def test_compose_extra_image_services_are_unsupported(self):
+        # PR #25 재리뷰: build 서비스만 세서 redis 같은 보조 서비스가 있는 앱도 지원으로 판정했음
+        base = {"Dockerfile": "FROM python:3.12-slim\nCOPY . .\nCMD [\"python\", \"app.py\"]\n",
+                "requirements.txt": "flask==3.0.0\n", "app.py": "app.run(port=5000)\n"}
+        redis = analyze_files(files(**base, **{"docker-compose.yml": (
+            "services:\n  web:\n    build: .\n    ports:\n      - \"5000:5000\"\n  cache:\n    image: redis:7\n")}))
+        self.assertFalse(redis.supported)
+        self.assertIn("redis", " ".join(redis.unsupported_reasons))
+        # MySQL은 공용 DB가 대신하고, DB 관리 화면은 무시
+        ok = analyze_files(files(**base, **{"docker-compose.yml": (
+            "services:\n  web:\n    build: .\n  db:\n    image: mysql:8.4\n  admin:\n    image: adminer\n")}))
+        self.assertTrue(ok.supported, ok.unsupported_reasons)
+
     def fastapi_app(self, main: str, routes: str):
         return analyze_files(files(**{
             "requirements.txt": "fastapi==0.111.0\nuvicorn==0.30.0\n",

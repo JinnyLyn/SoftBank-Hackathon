@@ -57,6 +57,11 @@ class MaskTextTests(unittest.TestCase):
             ('db_pass="hunter22"', False),
             ("SENTRY_DSN=https://k@o1.ingest.sentry.io/1", True),
             ("MYSQL_PWD=hunter2", True),
+            # PR #25 재리뷰: JavaScript 백틱과 Python 문자열 접두사
+            ("const DB_PASSWORD = `hunter2`", False),
+            ('SECRET_KEY = b"hunter2"', False),
+            ("api_token = rb'hunter2'", False),
+            ('PASSWORD = f"hunter2"', False),
         ]:
             with self.subTest(text=text):
                 masked, n = mask_text(text, config_file=config)
