@@ -61,7 +61,7 @@ python ai/runner.py --once    # 한 번만 점검
 4. 실패하면 2분 뒤 다시, 3번 실패하면 그 프로젝트는 멈춤. 지문 불일치·삭제·형식 오류처럼 다시 보내도 같은 실패는 바로 멈춤
 5. 로그에는 프로젝트 ID·이름·결과 요약만 남긴다
 
-키(`ANTHROPIC_API_KEY`)와 SDK가 있으면 규칙이 못 찾은 값만 LLM에 묻는다. 없거나 실패하면 규칙 결과만 기록한다.
+LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 못 찾은 값만 LLM에 묻는다. 없거나 실패하면 규칙 결과만 기록한다.
 
 
 ## LLM 보조 (`llm.py`)
@@ -69,21 +69,22 @@ python ai/runner.py --once    # 한 번만 점검
 | 항목 | 값 |
 |---|---|
 | 묻는 것 | `unresolved` 중 `container_port`, `health_check_path`, `dockerfile`, `framework` 만. 규칙이 찾은 값은 덮어쓰지 않음 |
-| 모델 | `claude-opus-5-5` (`PAVED_AI_MODEL` 로 변경), effort `medium` |
-| 출력 | `output_config.format` JSON 스키마 (`answers`, `notes`) |
-| 거절 대비 | 서버 측 대체 모델 `fallbacks: "default"` (베타 `server-side-fallback-2026-07-01`) |
+| 기본 | Ollama 클라우드 `glm-5.3` (`ollama.py`, 표준 라이브러리로 `POST https://ollama.com/api/chat`). `OLLAMA_API_KEY` 가 있으면 이것을 씀 |
+| 대안 | Anthropic `claude-opus-5-5`, effort `medium`, SDK 필요. `PAVED_AI_PROVIDER=anthropic` 이거나 Ollama 키가 없을 때 |
+| 모델 변경 | `PAVED_AI_MODEL` 또는 `--model` (예: `glm-5.3-flash`) |
+| 출력 | JSON 스키마 (`answers`, `notes`). Ollama는 `format` 에 스키마를 주지만 강제되지 않아(코드 블록으로 감싸거나 필드를 빼먹음) 코드 블록을 벗기고 필드가 빠진 답은 버림. Anthropic은 `output_config.format` 으로 강제, 거절 시 `fallbacks: "default"` |
 | 검증 | 근거 파일·줄이 실제로 있고 그 줄에 값이 들어 있어야 받아들임. 아니면 버리고 `unresolved` 유지 |
 | 비밀값 | 보내기 직전에 다시 가림. 업로드 코드 속 문장은 지시가 아니라 데이터라고 프롬프트에 밝힘 |
 | 표시 | 결과의 `ai.filled` 에 LLM이 채운 값 이름, `findings` 에 "AI가 채운 값" 안내 |
 | 실패 | 키 없음·인증·한도·연결 오류는 규칙 결과만 기록 (`findings` 에 이유) |
 
-설치 (LLM을 쓸 때만):
+설치 (Ollama는 설치할 것이 없음. `requirements.txt` 는 Anthropic을 쓸 때만):
 
 ```bash
 cd ai
 py -3.12 -m venv .venv                       # 백엔드와 맞추려면 3.13 권장, 3.10 이상
-.venv\Scripts\python -m pip install -r requirements.txt
-copy .env.example .env                       # ANTHROPIC_API_KEY 채우기 (커밋 안 됨)
+.venv\Scripts\python -m pip install -r requirements.txt   # Anthropic을 쓸 때만
+copy .env.example .env                       # OLLAMA_API_KEY 채우기 (커밋 안 됨)
 .venv\Scripts\python runner.py --once
 ```
 
@@ -112,9 +113,9 @@ python -m unittest discover -s tests -t . -v
 ## 환경
 
 - Python: 백엔드와 같은 3.13 (`.python-version`). 3.9 이상에서 돌게 짠다.
-- 의존성: 분석·runner·테스트는 표준 라이브러리만. LLM 보조만 `anthropic==1.13.0` (`requirements.txt`).
+- 의존성: 분석·runner·테스트·Ollama 호출은 표준 라이브러리만. Anthropic을 쓸 때만 `anthropic==1.13.0` (`requirements.txt`).
   테스트는 가짜 client로 돌아서 SDK 없이도 통과한다.
-- Anthropic 키는 환경 변수 `ANTHROPIC_API_KEY` 또는 `ai/.env`(커밋 안 됨)로만 넣는다. 로그·문서·채팅에 값을 남기지 않는다.
+- LLM 키(`OLLAMA_API_KEY`, `ANTHROPIC_API_KEY`)는 환경 변수 또는 `ai/.env`(커밋 안 됨)로만 넣는다. 로그·문서·채팅에 값을 남기지 않는다.
 - 아직 팀 CI 검사 대상이 아니다. 등록은 CI 담당과 상의.
 
 ## 남은 일

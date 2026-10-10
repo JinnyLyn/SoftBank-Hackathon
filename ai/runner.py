@@ -10,9 +10,12 @@
 |---|---|
 | PLATFORM_API_URL / --api-url | http://127.0.0.1:8000 |
 | UPLOAD_DIR / --upload-dir    | back/data/uploads (백엔드와 같은 변수·기본값) |
-| ANTHROPIC_API_KEY            | 환경 변수 또는 ai/.env. 없으면 규칙 분석만 |
+| OLLAMA_API_KEY               | 환경 변수 또는 ai/.env. 있으면 Ollama 클라우드를 씀(기본) |
+| OLLAMA_BASE_URL              | https://ollama.com |
+| ANTHROPIC_API_KEY            | Ollama 키가 없을 때, 또는 PAVED_AI_PROVIDER=anthropic 일 때 |
 | ANTHROPIC_WORKSPACE_ID       | 키가 워크스페이스에 묶여 있지 않을 때만 (anthropic-workspace-id 헤더) |
-| PAVED_AI_MODEL / --model     | claude-opus-5-5 |
+| PAVED_AI_PROVIDER            | ollama / anthropic. 비우면 있는 키로 고름(Ollama 먼저). 둘 다 없으면 규칙 분석만 |
+| PAVED_AI_MODEL / --model     | Ollama glm-5.3, Anthropic claude-opus-5-5 |
 | --no-llm                     | LLM을 부르지 않음 |
 
 백엔드로 옮길 때는 이 파일을 버리고 paved_ai 를 직접 부른다 (paved_ai 에는 HTTP 코드가 없음).
@@ -38,6 +41,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from paved_ai.analysis import SCHEMA_VERSION, analyze_files  # noqa: E402
 from paved_ai.llm import DEFAULT_MODEL, LlmUnavailable, fill_unresolved  # noqa: E402
+from paved_ai.ollama import DEFAULT_BASE_URL as OLLAMA_BASE_URL  # noqa: E402
+from paved_ai.ollama import DEFAULT_MODEL as OLLAMA_MODEL  # noqa: E402
+from paved_ai.ollama import OllamaClient  # noqa: E402
 from paved_ai.masking import backend_unsafe_paths  # noqa: E402
 from paved_ai.source import SourceError, files_from_zip  # noqa: E402
 
@@ -174,12 +180,27 @@ def load_dotenv(path: Path = DOTENV) -> None:
 
 
 def make_llm_client(enabled: bool = True):
-    """키와 SDK가 있으면 Anthropic client, 없으면 None (규칙 분석만)"""
+    """(client, 기본 모델). 쓸 수 있는 키가 없으면 (None, None) → 규칙 분석만"""
     if not enabled:
         log.info("LLM을 쓰지 않습니다 (--no-llm). 규칙 분석만 합니다.")
-        return None
+        return None, None
+    provider = os.environ.get("PAVED_AI_PROVIDER", "").strip().lower()
+    if provider not in ("", "ollama", "anthropic"):
+        log.warning("PAVED_AI_PROVIDER=%s 는 모르는 값이라 규칙 분석만 합니다 (ollama 또는 anthropic).", provider[:20])
+        return None, None
+    if provider == "ollama" or (not provider and os.environ.get("OLLAMA_API_KEY")):
+        key = os.environ.get("OLLAMA_API_KEY")
+        if not key:
+            log.info("OLLAMA_API_KEY가 없어 규칙 분석만 합니다 (ai/.env 또는 환경 변수).")
+            return None, None
+        return OllamaClient(key, base_url=os.environ.get("OLLAMA_BASE_URL") or OLLAMA_BASE_URL), OLLAMA_MODEL
+    client = _make_anthropic()
+    return (client, DEFAULT_MODEL) if client else (None, None)
+
+
+def _make_anthropic():
     if not os.environ.get("ANTHROPIC_API_KEY"):
-        log.info("ANTHROPIC_API_KEY가 없어 규칙 분석만 합니다 (ai/.env 또는 환경 변수).")
+        log.info("LLM 키(OLLAMA_API_KEY, ANTHROPIC_API_KEY)가 없어 규칙 분석만 합니다 (ai/.env 또는 환경 변수).")
         return None
     try:
         import anthropic
@@ -194,7 +215,7 @@ def make_llm_client(enabled: bool = True):
 
 def analyze_project(project: dict, upload_dir: Path, llm=None, model: str = DEFAULT_MODEL) -> Tuple[dict, str]:
     """업로드된 ZIP을 읽어 분석. 백엔드가 기록한 지문과 같은 파일일 때만 분석한다.
-    llm(Anthropic client)이 있으면 규칙이 못 찾은 값만 LLM에 묻는다. LLM이 실패해도 규칙 결과는 기록한다."""
+    llm(OllamaClient 또는 Anthropic client)이 있으면 규칙이 못 찾은 값만 LLM에 묻는다. LLM이 실패해도 규칙 결과는 기록한다."""
     path = upload_dir / f"{project['id']}.zip"
     if not path.is_file():
         raise RunnerError(f"소스 ZIP이 없습니다({path}). runner를 백엔드와 같은 PC에서 돌리고 UPLOAD_DIR을 맞춰 주세요.")
@@ -288,13 +309,14 @@ def main(argv=None) -> int:
     parser.add_argument("--upload-dir", type=Path, default=Path(os.getenv("UPLOAD_DIR", DEFAULT_UPLOAD_DIR)))
     parser.add_argument("--poll", type=float, default=5.0, help="점검 간격(초)")
     parser.add_argument("--once", action="store_true", help="한 번만 점검")
-    parser.add_argument("--model", default=os.getenv("PAVED_AI_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--model", default=None, help="비우면 PAVED_AI_MODEL, 그다음 고른 LLM의 기본 모델")
     parser.add_argument("--no-llm", action="store_true", help="LLM을 부르지 않고 규칙 분석만")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     load_dotenv()
-    llm = make_llm_client(enabled=not args.no_llm)
+    llm, default_model = make_llm_client(enabled=not args.no_llm)
+    args.model = args.model or os.getenv("PAVED_AI_MODEL") or default_model or DEFAULT_MODEL
     api, state = Api(args.api_url), State()
     upload_dir = args.upload_dir.expanduser().resolve()
     log.info("시작: 백엔드 %s, 업로드 폴더 %s, LLM %s", api.base, upload_dir, args.model if llm else "끔")

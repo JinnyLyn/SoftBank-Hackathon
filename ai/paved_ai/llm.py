@@ -6,7 +6,9 @@
   근거로 든 파일·줄이 실제로 있고 그 줄에 값이 들어 있어야 받아들인다. 아니면 버리고 unresolved에 그대로 둔다.
 - 금액·구성 단계는 묻지 않는다 (인프라 worker의 cost.py가 계산).
 
-SDK(anthropic)는 실제로 부를 때만 필요하다. client를 밖에서 넘겨받으므로 테스트는 가짜 client로 돈다.
+client를 밖에서 넘겨받으므로 테스트는 가짜 client로 돈다.
+- OllamaClient(ollama.py, 표준 라이브러리): 기본. Ollama 클라우드의 glm-5.3
+- Anthropic client(SDK): 실제로 부를 때만 SDK가 필요
 """
 
 from __future__ import annotations
@@ -18,9 +20,10 @@ from typing import Dict, List, Optional
 
 from .analysis import Analysis, Evidence
 from .masking import mask_files
+from .ollama import OllamaClient, OllamaError
 from .source import SourceFile
 
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_MODEL = "claude-opus-5-5"  # Anthropic client일 때 (Ollama 기본 모델은 ollama.DEFAULT_MODEL)
 # 안전 분류기가 거절하면 서버가 권장 모델로 다시 돌림 (Claude API 전용 베타)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 EFFORT = "medium"
@@ -197,7 +200,9 @@ def _check(field_name: str, value: str, file: str, line: int, files: Dict[str, L
 
 
 def _as_unavailable(exc: Exception) -> Exception:
-    """SDK 오류를 사람이 읽을 이유로 바꿈. SDK가 없는 환경(가짜 client 테스트)에서는 그대로 둠"""
+    """API 오류를 사람이 읽을 이유로 바꿈. SDK가 없는 환경(가짜 client 테스트)에서는 그대로 둠"""
+    if isinstance(exc, OllamaError):
+        return LlmUnavailable(str(exc))
     try:
         import anthropic
     except ImportError:
@@ -222,6 +227,43 @@ def _response_text(response) -> str:
     return next((b.text for b in response.content if getattr(b, "type", None) == "text"), "")
 
 
+_FENCE = re.compile(r"^```[A-Za-z]*\s*\n?(.*?)\n?```$", re.S)
+
+
+def _parse_json(text: str):
+    """답 JSON. 스키마를 강제하지 않는 모델은 코드 블록으로 감싸거나 앞뒤에 말을 붙여서, 가장 바깥 {...}만 읽음"""
+    text = (text or "").strip()
+    m = _FENCE.match(text)
+    if m:
+        text = m.group(1).strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        return json.loads(text[start:end + 1])
+
+
+def _ask(client, model: str, prompt: str):
+    """(답 텍스트, stop_reason, 응답 모델, request_id)"""
+    if isinstance(client, OllamaClient):
+        # 스키마를 강제하지 않으므로 형식을 시스템 프롬프트에도 적음
+        system = SYSTEM + "\n\n다른 말 없이 아래 JSON 스키마에 맞는 JSON 하나만 출력하세요.\n" + json.dumps(OUTPUT_SCHEMA, ensure_ascii=False)
+        reply = client.chat(model, system, prompt, OUTPUT_SCHEMA, MAX_TOKENS)
+        return reply.text, reply.stop_reason, reply.model, reply.request_id
+    response = client.beta.messages.create(
+        model=model,
+        max_tokens=MAX_TOKENS,
+        betas=[FALLBACK_BETA],
+        fallbacks="default",
+        output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
+        system=SYSTEM,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return _response_text(response), response.stop_reason, getattr(response, "model", model), getattr(response, "_request_id", None)
+
+
 def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: str = DEFAULT_MODEL) -> LlmOutcome:
     """unresolved 중 물어볼 수 있는 값을 LLM에 묻고, 검증을 통과한 답만 analysis에 반영한다."""
     targets = [t for t in FILLABLE if t in analysis.unresolved]
@@ -237,40 +279,35 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
         return outcome
 
     try:
-        response = client.beta.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS,
-            betas=[FALLBACK_BETA],
-            fallbacks="default",
-            output_config={"effort": EFFORT, "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA}},
-            system=SYSTEM,
-            messages=[{"role": "user", "content": build_prompt(analysis, picked, targets)}],
-        )
-    except Exception as exc:  # SDK 오류만 LlmUnavailable로 바꾸고 나머지(코드 버그)는 그대로 올림
+        text, stop_reason, outcome.model, outcome.request_id = _ask(client, model, build_prompt(analysis, picked, targets))
+    except Exception as exc:  # API 오류만 LlmUnavailable로 바꾸고 나머지(코드 버그)는 그대로 올림
         raise _as_unavailable(exc) from exc
 
-    outcome.request_id = getattr(response, "_request_id", None)
-    outcome.model = getattr(response, "model", model)
-    outcome.stop_reason = response.stop_reason
-    if response.stop_reason != "end_turn":
-        reason = {"refusal": "모델이 답을 거절함", "max_tokens": "답이 길이 제한에 걸림"}.get(response.stop_reason, f"stop_reason={response.stop_reason}")
+    outcome.stop_reason = stop_reason
+    if stop_reason != "end_turn":
+        reason = {"refusal": "모델이 답을 거절함", "max_tokens": "답이 길이 제한에 걸림"}.get(stop_reason, f"stop_reason={stop_reason}")
         for t in targets:
             outcome.rejected[t] = reason
         return outcome
 
     try:
-        data = json.loads(_response_text(response))
+        data = _parse_json(text)
     except ValueError:
+        data = None
+    if not isinstance(data, dict):
         for t in targets:
             outcome.rejected[t] = "LLM 답이 JSON이 아님"
         return outcome
 
     by_path = {f.path: f.text.splitlines() for f in masked}
-    for ans in data.get("answers", []):
+    answers = data.get("answers") if isinstance(data.get("answers"), list) else []
+    for ans in answers:
+        if not isinstance(ans, dict):
+            continue
         name = ans.get("field")
         if name not in targets or name in outcome.filled:
             continue
-        value, evidence = _check(name, ans.get("value", ""), ans.get("file", ""), ans.get("line", 0), by_path)
+        value, evidence = _check(name, str(ans.get("value") or ""), str(ans.get("file") or ""), ans.get("line", 0), by_path)
         if value is None:
             outcome.rejected[name] = evidence
             continue
@@ -283,7 +320,8 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
         if t not in outcome.filled and t not in outcome.rejected:
             outcome.rejected[t] = "LLM이 답하지 않음"
 
-    for note in data.get("notes", [])[:MAX_NOTES]:
+    notes = data.get("notes") if isinstance(data.get("notes"), list) else []
+    for note in [n for n in notes if isinstance(n, dict)][:MAX_NOTES]:
         title, detail = str(note.get("title", ""))[:80], str(note.get("detail", ""))[:300]
         if title:
             (analysis.warn if note.get("level") == "warn" else analysis.info)(title, detail)

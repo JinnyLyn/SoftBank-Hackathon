@@ -1,2 +1,2 @@
-# LLM 보조 분석에만 필요. 없으면 runner는 규칙 분석만 한다 (테스트는 SDK 없이 돈다)
+# Anthropic을 LLM으로 쓸 때만 필요(기본인 Ollama는 표준 라이브러리). 없으면 runner는 규칙 분석만 한다 (테스트는 SDK 없이 돈다)
 anthropic==1.13.0
