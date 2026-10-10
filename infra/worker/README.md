@@ -195,6 +195,6 @@ python infra/worker/worker.py --once             # 한 번만 점검
 ## 시험
 
 ```bash
-python infra/worker/test_worker.py      # 159개(약 3분). 실제 AWS·Docker 없이 돈다. Windows 한글 콘솔(cp949)이면 python -X utf8 로 돌린다
+python infra/worker/test_worker.py      # 161개(약 3분). 실제 AWS·Docker 없이 돈다. Windows 한글 콘솔(cp949)이면 python -X utf8 로 돌린다
 python infra/scripts/test_infra.py      # deploy.sh와 Terraform 모듈 시험
 ```
