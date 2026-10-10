@@ -281,11 +281,20 @@ function toTier(p: PlanOut, key: TierKey): Tier {
   }
 }
 
+/** 소스에 Dockerfile이 없어 worker가 초안으로 빌드하는 계획이면, 초안을 코드 검토 탭 맨 앞에 보여 줌 (승인 대상) */
+function draftFile(p: PlanOut): { name: string; content: string }[] {
+  const d = p.variables.dockerfile_draft
+  return isObj(d) && typeof d.content === 'string' && d.content ? [{ name: 'Dockerfile (초안)', content: d.content }] : []
+}
+
 function toBundle(p: PlanOut): TerraformBundle {
   return {
     tool: 'terraform',
     // AGENTS.md: 제품 LLM은 Terraform 변수값까지만 바꿈 → 검토 대상은 변수값과 계획 설명
-    files: [{ name: 'variables.auto.tfvars.json', content: JSON.stringify(p.variables, null, 2) }],
+    files: [
+      ...draftFile(p),
+      { name: 'variables.auto.tfvars.json', content: JSON.stringify(p.variables, null, 2) },
+    ],
     plan: {
       add: null,
       change: null,

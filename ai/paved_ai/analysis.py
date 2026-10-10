@@ -89,8 +89,12 @@ class Analysis:
 
     def app_config(self) -> dict:
         """worker가 읽는 앱 설정. 못 찾은 값이 있으면 None으로 두고 unresolved에 이유가 있음 → worker 검증에서 걸러짐"""
+        # 코드에서 포트를 못 찾았어도 Dockerfile 초안이 포트를 정하면(서버 바인드·PORT) 배포 설정에는 그 포트를 씀
+        port = self.container_port
+        if port is None and self.dockerfile_draft:
+            port = self.dockerfile_draft["port"]
         cfg: dict = {
-            "container_port": self.container_port,
+            "container_port": port,
             "health_check_path": self.health_check_path,
             "use_database": self.use_database,
             "environment": self.environment,
@@ -108,7 +112,8 @@ class Analysis:
         stack = [
             ("프레임워크", self.framework or "확인 안 됨"),
             ("런타임", self.runtime or "확인 안 됨"),
-            ("포트", str(self.container_port) if self.container_port else "확인 안 됨"),
+            ("포트", str(self.container_port) if self.container_port
+             else f"{self.dockerfile_draft['port']} (Dockerfile 초안)" if self.dockerfile_draft else "확인 안 됨"),
             ("DB", self.database or ("사용" if self.use_database else "사용 안 함" if self.use_database is False else "확인 안 됨")),
             ("헬스체크", self.health_check_path or "확인 안 됨"),
             ("환경 변수", f"{len(self.environment)}개" if self.environment else "없음"),
@@ -647,9 +652,14 @@ def _suggest_dockerfile(a: Analysis, files: List[SourceFile], family: Optional[s
         a.info("Dockerfile이 없습니다", f"배포하려면 Dockerfile이 필요합니다. 초안도 만들지 못했습니다: {why}")
         return
     a.dockerfile_draft = draft.as_dict()
-    a.unresolved["dockerfile"] = "Dockerfile이 없습니다. 아래 초안을 저장소 루트에 Dockerfile 로 추가하고 다시 올려 주세요."
+    # 초안이 앱이 들을 포트를 정함(uvicorn·gunicorn 바인드, Node 는 PORT 환경 변수) → 포트를 못 찾았으면 초안의 포트를 씀.
+    # worker가 초안을 승인 대상에 넣어 빌드하면 그대로 배포 설정이 됨 (dockerfile 은 null 로 두어 소스 안 경로가 없음을 알림)
+    # 코드에서 찾은 포트(a.container_port)는 그대로 두고(추측하지 않음), 배포 설정만 초안의 포트를 씀(Analysis.app_config)
+    if a.container_port is None:
+        a.unresolved.pop("container_port", None)
+    a.unresolved["dockerfile"] = "저장소에 Dockerfile이 없어 코드를 보고 초안을 만들었습니다. 초안을 확인한 뒤 그대로 쓰거나 저장소에 추가해 주세요."
     a.info("Dockerfile 초안을 만들었습니다",
-           f"코드를 보고 {a.framework}용 초안을 만들었습니다(포트 {draft.port}). 내용을 확인하고 저장소에 추가한 뒤 다시 올리면 배포할 수 있습니다.")
+           f"코드를 보고 {a.framework}용 초안을 만들었습니다(포트 {draft.port}). 비용 승인 화면에서 초안 내용을 확인할 수 있습니다.")
 
 
 def analyze_files(files: List[SourceFile]) -> Analysis:

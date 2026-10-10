@@ -1,6 +1,7 @@
 import ProviderMark from '../components/ProviderMark'
 import WorkProgress from '../components/WorkProgress'
 import DockerfileDraft from '../components/DockerfileDraft'
+import { DRAFT_BUILD } from '../api'
 import { STAGE_SIZE } from '../progress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
@@ -83,7 +84,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
         </details>
       </section>
 
-      {blockers.length > 0 || analysis.dockerfileDraft ? null : rec ? (
+      {blockers.length > 0 || (analysis.dockerfileDraft && !DRAFT_BUILD) ? null : rec ? (
         <Plans rec={rec} {...plans} />
       ) : (
         <section>
