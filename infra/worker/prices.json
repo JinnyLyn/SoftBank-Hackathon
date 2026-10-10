@@ -1,0 +1,30 @@
+{
+  "region": "sa-east-1",
+  "currency": "USD",
+  "pricing_as_of": "2026-10-10",
+  "source": "AWS Price List API(온디맨드, 리전 sa-east-1). 항목별 게시일: Fargate 2026-09-11, ALB 2026-10-08, RDS 2026-10-06",
+  "hours_per_month": 730,
+  "fargate": {
+    "X86_64": { "vcpu_hour": 0.0696, "gb_hour": 0.0076 },
+    "ARM64": { "vcpu_hour": 0.0557, "gb_hour": 0.00612 }
+  },
+  "alb_hour": 0.034,
+  "public_ipv4_hour": 0.005,
+  "foundation_assumptions": {
+    "alb_azs": 3,
+    "nat_eips": 3,
+    "note": "foundation을 읽을 수 없을 때의 기본 가정: foundation 변수 기본값(az_count=3, nat_high_availability=true → NAT 인스턴스 3대). 배포된 foundation 출력(task_subnet_ids, assign_public_ip, nat_instance_count)이 있으면 그 값을 쓴다"
+  },
+  "rds": {
+    "instance_class": "db.t4g.micro",
+    "instance_hour": 0.034,
+    "storage_gb": 20,
+    "storage_gb_month": 0.219
+  },
+  "excluded": [
+    "NAT 인스턴스(t4g.small) EC2 시간당 요금: 가격 조회에 실패해 제외",
+    "ALB 처리 용량 단위(LCU)와 데이터 전송 비용",
+    "CloudWatch 로그와 ECR 저장 비용",
+    "RDS 백업 저장 비용"
+  ]
+}

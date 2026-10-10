@@ -18,11 +18,13 @@
 """
 import copy
 import json
+import re
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 INFRA = Path(__file__).resolve().parents[1]
@@ -83,11 +85,14 @@ def find_bash():
     for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")):
         if base:
             cands += [os.path.join(base, "Git", "bin", "bash.exe"), os.path.join(base, "Programs", "Git", "bin", "bash.exe")]
+    # WSL bash도 산술 식은 계산하지만 Windows 경로(C:/...·/c/...)를 열지 못한다. deploy.sh를 실제로 보는지까지 확인한다
+    sh = (INFRA / "scripts" / "deploy.sh").as_posix()
+    probe = f'[ -f "$(cygpath -u "{sh}" 2>/dev/null || echo "{sh}")" ] && echo $((40+2))'
     for c in cands:
         if not c or not os.path.exists(c):
             continue
         try:
-            r = subprocess.run([c, "-c", "echo $((40+2))"], capture_output=True, text=True, timeout=30)
+            r = subprocess.run([c, "-c", probe], capture_output=True, text=True, timeout=30)
             if r.returncode == 0 and r.stdout.strip() == "42":
                 return c
         except Exception:
@@ -739,7 +744,7 @@ def part_d():
     # apply_saved 전체 흐름(terraform·헬스체크는 모의): 입력이 바뀌었으면 terraform apply에 도달하지 않는다
     mock_tf = (f'tf() {{ case "$2" in apply) echo APPLY_CALLED >> "$1/calls.log";; output) '
                f'if [ "$3" = -raw ]; then echo IMG:a; else echo "{{}}"; fi;; esac; }}; '
-               'export_foundation() { :; }; confirm() { :; }')
+               'export_foundation() { :; }; confirm() { :; }; check_image_exists() { :; }; app_init_task() { :; }')
     pdir = pin_dir("pin_apply_changed", appA, "IMG:a")
     rc, out, err = sh(f'{mock_tf}; wait_healthy() {{ return 0; }}; d={P(pdir)}; pin_plan_inputs "$d"')
     (pdir / "app.auto.tfvars.json").write_text(json.dumps({"app": appB}), encoding="utf-8")
@@ -770,6 +775,297 @@ def part_d():
     pdir = pin_dir("pin_failplan", appA, "IMG:a")   # 옛 tfplan이 있는 상태
     rc, out, err = sh('tf() { case "$2" in plan) return 1;; esac; }; confirm() { :; }; PLAN_ONLY=1; plan_confirm_apply ' + P(pdir) + ' abcd1234')
     say("ok" if rc != 0 and not (pdir / "tfplan").exists() else "fail", "D plan: 새 plan이 실패하면 옛 계획을 지운다(새 입력과 어긋난 계획을 적용하지 못하게)", f"rc={rc}")
+
+    # ---- 창업자 입력 자동화: 배포 ID 생성, 아키텍처 감지, 앱 초기화 작업, ZIP 풀기, 이미지 확인 시점 ----
+    ids = {}
+    for nm in ["Launchpad", "런치패드 아이디어", "ab", "My Cool App!!", "같은 이름"]:
+        rc, out, err = sh(f'make_id "{nm}"')
+        ids[nm] = out.strip()
+    ok = all(re.fullmatch(r"[a-z0-9]{8}", v) for v in ids.values())
+    say("ok" if ok else "fail", "D 이름→배포 ID: 영문·한글·기호가 섞인 이름도 소문자·숫자 8자 규칙을 지킨다", str(ids)[:120])
+    say("ok" if ids["Launchpad"].startswith("laun") and ids["My Cool App!!"].startswith("myco") else "fail", "D 이름→배포 ID: 영문·숫자는 앞 4자를 그대로 쓴다")
+    rc, out, err = sh('make_id "런치패드 아이디어"')
+    say("ok" if out.strip() == ids["런치패드 아이디어"] and len(set(ids.values())) == len(ids) else "fail", "D 이름→배포 ID: 같은 이름은 같은 ID, 다른 이름(한글만 있어도)은 다른 ID")
+    rc, out, err = sh('make_id "   "')
+    say("ok" if rc != 0 and "비어" in err else "fail", "D 이름→배포 ID: 빈 이름은 거부")
+    for arch_out, want in [("aarch64", "ARM64"), ("arm64", "ARM64"), ("x86_64", "X86_64"), ("", "X86_64")]:
+        rc, out, err = sh(f'docker() {{ echo "{arch_out}"; }}; detect_arch')
+        say("ok" if out.strip() == want else "fail", f"D 아키텍처 감지: docker가 '{arch_out}'이면 {want}", out.strip())
+    rc, out, err = sh('docker() { return 1; }; detect_arch')
+    say("ok" if out.strip() == "X86_64" else "fail", "D 아키텍처 감지: docker를 못 쓰면 X86_64")
+
+    # init_command 읽기
+    def icmd(app_cfg):
+        f = WORK / "icmd.json"
+        f.write_text(json.dumps({"app": app_cfg}), encoding="utf-8")
+        return sh(f'init_command_json {P(f)}')
+    rc, out, err = icmd({"container_port": 8000, "init_command": ["python", "-m", "backend.app.initialize_database"]})
+    say("ok" if rc == 0 and json.loads(out) == ["python", "-m", "backend.app.initialize_database"] else "fail", "D init_command: 문자열 배열을 한 줄 JSON으로 낸다", out[:80])
+    rc, out, err = icmd({"container_port": 8000})
+    say("ok" if rc == 0 and out.strip() == "" else "fail", "D init_command: 없으면 아무것도 내지 않는다(초기화 작업을 건너뜀)")
+    for bad in ["python", ["ok", ""], ["a"] * 11, [1, 2]]:
+        rc, out, err = icmd({"init_command": bad})
+        say("ok" if rc != 0 else "fail", f"D init_command: 잘못된 값 거부 {str(bad)[:20]}", err[:60])
+
+    # 앱 초기화 작업: 앱과 같은 작업 정의에 명령만 바꿔 1회 실행한다
+    idir = WORK / "inittask"
+    idir.mkdir(parents=True, exist_ok=True)
+    ilog = WORK / "init-calls.log"
+
+    def init_run(exit_code, with_cmd=True, keep_done=False):
+        if not keep_done:
+            (idir / "init.done").unlink(missing_ok=True)   # 이전 시험의 성공 기록이 건너뛰기를 일으키지 않게 한다
+        cfg = {"container_port": 8000}
+        if with_cmd:
+            cfg["init_command"] = ["python", "-m", "backend.app.initialize_database"]
+        (idir / "plan.app.json").write_text(json.dumps({"app": cfg}), encoding="utf-8")
+        ilog.unlink(missing_ok=True)
+        code = (
+            'tf() { case "$4" in cluster_name) echo clus;; task_definition_arn) echo arn:aws:ecs:td/app:3;; '
+            'task_security_group_id) echo sg-111;; log_group_name) echo /paved/app;; esac; }; '
+            f'aws() {{ echo "$*" >> {P(ilog)}; case "$2" in run-task) '
+            'prev=""; for a in "$@"; do if [ "$prev" = "--overrides" ]; then cat "${a#file://}" >> ' + P(ilog) + '; echo >> ' + P(ilog) + '; fi; prev="$a"; done; echo arn:aws:ecs:task/clus/abc123;; '
+            'wait) return 0;; '
+            f'describe-tasks) case "$*" in *lastStatus*) echo STOPPED;; *exitCode*) echo {exit_code};; *) echo "Essential container exited";; esac;; '
+            'get-log-events) echo "creating tables";; esac; }; '
+            f'app_init_task {P(idir)} abcd1234'
+        )
+        return sh(code)
+
+    rc, out, err = init_run(0)
+    calls = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    ok = (rc == 0 and "run-task" in calls and "--task-definition arn:aws:ecs:td/app:3" in calls and "sg-111" in calls
+          and '"command":["python", "-m", "backend.app.initialize_database"]' in calls and '"name":"app"' in calls and "app/app/abc123" in calls)
+    say("ok" if ok else "fail", "D 앱 초기화 작업: 앱 작업 정의에 명령만 바꿔 실행하고(앱 컨테이너 이름·보안 그룹·로그 위치 포함) 성공이면 통과", f"rc={rc} {err[:100]} {calls[:200]}")
+    rc, out, err = init_run(1)
+    say("ok" if rc != 0 and "종료 코드 1" in err and "creating tables" in err else "fail", "D 앱 초기화 작업: 종료 코드가 0이 아니면 실패로 처리하고 로그를 보여 준다", err[:120])
+    rc, out, err = init_run(0, with_cmd=False)
+    calls = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    say("ok" if rc == 0 and "run-task" not in calls else "fail", "D 앱 초기화 작업: init_command가 없으면 AWS를 부르지 않는다", calls[:60])
+    say("ok" if not (idir / "init-overrides.json").exists() else "fail", "D 앱 초기화 작업: 임시 overrides 파일을 남기지 않는다")
+
+    # 앱 초기화: 같은 (이미지, 명령)으로 이미 성공했으면 다시 돌리지 않는다. 성공하면 기록을 남긴다
+    (idir / "plan.platform.json").write_text(json.dumps({"platform": {"image": "IMG:one"}}), encoding="utf-8")
+    (idir / "init.done").unlink(missing_ok=True)
+    rc, out, err = init_run(0)
+    calls = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    say("ok" if rc == 0 and "run-task" in calls and (idir / "init.done").exists() else "fail", "D 앱 초기화: 성공하면 init.done에 (이미지, 명령) 지문을 남긴다", err[:80])
+    rc, out, err = init_run(0, keep_done=True)
+    calls = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    say("ok" if rc == 0 and "run-task" not in calls and "건너뜀" in err else "fail", "D 앱 초기화: 같은 이미지·명령으로 이미 실행했으면 건너뛴다(설정만 바꾸는 update·같은 이미지 재배포)", err[:80])
+    (idir / "plan.platform.json").write_text(json.dumps({"platform": {"image": "IMG:two"}}), encoding="utf-8")
+    rc, out, err = init_run(0, keep_done=True)
+    calls = ilog.read_text(encoding="utf-8") if ilog.exists() else ""
+    say("ok" if rc == 0 and "run-task" in calls else "fail", "D 앱 초기화: 이미지가 바뀌면 다시 실행한다")
+    (idir / "init.done").write_text("stale-fingerprint\n", encoding="utf-8")
+    rc, out, err = init_run(1, keep_done=True)
+    say("ok" if rc != 0 and (idir / "init.done").read_text(encoding="utf-8").strip() == "stale-fingerprint" else "fail", "D 앱 초기화: 실패하면 성공 기록을 갱신하지 않는다")
+    (idir / "init.done").unlink(missing_ok=True)
+
+    # 앱 초기화: 제한 시간을 넘기면 작업을 멈추고(stop-task) 실패 처리한다
+    tdir = WORK / "inittimeout"
+    tdir.mkdir(parents=True, exist_ok=True)
+    (tdir / "plan.app.json").write_text(json.dumps({"app": {"container_port": 8000, "init_command": ["sleep", "999"]}}), encoding="utf-8")
+    (tdir / "plan.platform.json").write_text(json.dumps({"platform": {"image": "IMG:t"}}), encoding="utf-8")
+    tlog = WORK / "init-timeout-calls.log"
+    tlog.unlink(missing_ok=True)
+    code = (
+        'tf() { case "$4" in cluster_name) echo clus;; task_definition_arn) echo arn:td;; task_security_group_id) echo sg-1;; log_group_name) echo /lg;; esac; }; '
+        f'aws() {{ echo "$*" >> {P(tlog)}; case "$2" in run-task) echo arn:aws:ecs:task/clus/zzz;; describe-tasks) echo RUNNING;; esac; }}; '
+        f'app_init_task {P(tdir)} abcd1234'
+    )
+    t0 = time.time()
+    rc, out, err = sh(code, {"INIT_TIMEOUT": "2", "INIT_POLL": "1"})
+    calls = tlog.read_text(encoding="utf-8") if tlog.exists() else ""
+    ok = rc != 0 and "stop-task" in calls and "안에 끝나지 않아 멈췄습니다" in err and time.time() - t0 < 60 and not (tdir / "init.done").exists()
+    say("ok" if ok else "fail", "D 앱 초기화: 제한 시간을 넘기면 작업을 멈추고(stop-task) 시간 초과로 실패 처리한다(틀린 사유로 보고하지 않음)", f"rc={rc} {err[:100]}")
+
+    # update·rollback은 --plan-only 여도 이미지를 확인한다(rollback 대상이 지워졌으면 승인 전에 알린다). up만 건너뛴다
+    rdir = WORK / "redeploy_check"
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"deploy_id": "abcd1234", "image": "IMG:gone", "foundation": {}}}), encoding="utf-8")
+    code = (f'existing_dir() {{ echo {P(rdir)}; }}; need() {{ :; }}; refresh_foundation() {{ :; }}; reset_inputs() {{ :; }}; '
+            'check_image_exists() { echo CHECK_IMAGE; exit 7; }; plan_confirm_apply() { echo PLANNED; }; '
+            'PLAN_ONLY=1; redeploy abcd1234 "" ""')
+    rc, out, err = sh(code)
+    say("ok" if rc == 7 and "CHECK_IMAGE" in out and "PLANNED" not in out else "fail", "D update·rollback: --plan-only 여도 이미지를 확인한다(지워진 이미지는 계획 단계에서 막는다)", f"rc={rc} {out[:60]}")
+
+    # build: 종료 신호를 받아도 docker 로그인 토큰이 든 임시 폴더를 지운다
+    bsrc = WORK / "build_src"
+    bsrc.mkdir(parents=True, exist_ok=True)
+    (bsrc / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    cfg_note = WORK / "build_docker_config.txt"
+    cfg_note.unlink(missing_ok=True)
+    code = (
+        'export_foundation() { :; }; need() { :; }; '
+        f'docker() {{ echo "$DOCKER_CONFIG" > {P(cfg_note)}; kill -TERM $$; sleep 2; }}; '
+        f'cmd_build --id abcd1234 --source {P(bsrc)}'
+    )
+    rc, out, err = sh(code)
+    note = cfg_note.read_text(encoding="utf-8").strip() if cfg_note.exists() else ""
+    left = Path(note).parent.exists() if note else None
+    say("ok" if note and left is False else "fail", "D build: 종료 신호(SIGTERM)를 받아도 docker 로그인 토큰이 든 임시 폴더를 지운다", f"rc={rc} note={note[:50]} 남음={left}")
+
+    # build --arch: 계획(up --arch)과 같은 아키텍처로 빌드한다. 지정하지 않으면 이 PC의 docker 기준
+    dlog = WORK / "build_arch_docker.log"
+    for arch_arg, want in [("ARM64", "linux/arm64"), ("X86_64", "linux/amd64")]:
+        dlog.unlink(missing_ok=True)
+        code = (
+            'export_foundation() { :; }; need() { :; }; aws() { echo token; }; '
+            f'docker() {{ echo "$*" >> {P(dlog)}; }}; '
+            f'cmd_build --id abcd1234 --source {P(bsrc)} --tag t1 --arch {arch_arg} >/dev/null'
+        )
+        rc, out, err = sh(code)
+        logged = dlog.read_text(encoding="utf-8") if dlog.exists() else ""
+        say("ok" if rc == 0 and f"--platform {want}" in logged else "fail", f"D build --arch {arch_arg}: {want}로 빌드한다", f"rc={rc} {logged[:100]} {err[:80]}")
+    rc, out, err = sh('export_foundation() { :; }; need() { :; }; docker() { echo DOCKER_CALLED; }; '
+                      f'cmd_build --id abcd1234 --source {P(bsrc)} --arch MIPS')
+    say("ok" if rc != 0 and "--arch는 X86_64 또는 ARM64" in err and "DOCKER_CALLED" not in out else "fail", "D build --arch: X86_64·ARM64가 아니면 거부(docker 호출 없음)", err[:80])
+
+    # build: 빌드가 실패하면 로그인·push를 하지 않고 실패한다. `( ... ) ||` 안에서는 set -e가 꺼져, 빌드가 실패해도
+    # 마지막 명령(push)이 성공하면(이 PC에 같은 태그의 옛 이미지가 있으면) 전체가 성공으로 끝났었다
+    plog = WORK / "build_fail_docker.log"
+    plog.unlink(missing_ok=True)
+    code = (
+        'export_foundation() { :; }; need() { :; }; aws() { echo token; }; '
+        f'docker() {{ echo "$1" >> {P(plog)}; if [ "$1" = build ]; then return 1; fi; return 0; }}; '
+        f'cmd_build --id abcd1234 --source {P(bsrc)} --tag t1'
+    )
+    rc, out, err = sh(code)
+    logged = plog.read_text(encoding="utf-8").split() if plog.exists() else []
+    say("ok" if rc != 0 and "build" in logged and "push" not in logged and "login" not in logged and not out.strip() else "fail",
+        "D build: docker build가 실패하면 로그인·push 없이 실패하고 이미지 주소를 출력하지 않는다", f"rc={rc} docker={logged} out={out[:40]} {err[:80]}")
+    say("ok" if "rmi" in logged and "build" in logged and logged.index("rmi") < logged.index("build") else "fail",
+        "D build: 빌드 전에 같은 태그의 로컬 옛 이미지를 지운다(실패 뒤 옛 이미지가 push되지 않게)", f"docker={logged}")
+    plog.unlink(missing_ok=True)
+    code = (
+        'export_foundation() { :; }; need() { :; }; aws() { return 1; }; '
+        f'docker() {{ echo "$1" >> {P(plog)}; return 0; }}; '
+        f'cmd_build --id abcd1234 --source {P(bsrc)} --tag t1'
+    )
+    rc, out, err = sh(code)
+    logged = plog.read_text(encoding="utf-8").split() if plog.exists() else []
+    say("ok" if rc != 0 and "push" not in logged and not out.strip() else "fail",
+        "D build: ECR 토큰 조회(aws)가 실패하면 push 없이 실패한다", f"rc={rc} docker={logged} out={out[:40]} {err[:80]}")
+
+    # status: 서비스 조회가 실패하면 빈 값을 정상처럼 찍지 않고 실패한다
+    sdir2 = WORK / "status_fail"
+    sdir2.mkdir(parents=True, exist_ok=True)
+    code = (f'existing_dir() {{ echo {P(sdir2)}; }}; tf() {{ echo x; }}; aws() {{ if [ "$2" = describe-services ]; then return 255; fi; }}; cmd_status abcd1234')
+    rc, out, err = sh(code)
+    say("ok" if rc != 0 and "조회하지 못했습니다" in (out + err) else "fail", "D status: 서비스 조회가 실패하면 오류로 끝난다(빈 값을 정상 응답처럼 찍지 않음)", f"rc={rc} {(out + err)[-80:]}")
+
+    # ZIP 풀기: 경로 이탈·절대 경로·심볼릭 링크를 거부하고, 최상위 폴더가 하나면 그 폴더를 기준으로 삼는다
+    import zipfile
+    zdir = WORK / "zips"
+    zdir.mkdir(parents=True, exist_ok=True)
+
+    def make_zip(name, entries):
+        zp = zdir / name
+        with zipfile.ZipFile(zp, "w") as z:
+            for en, data, attr in entries:
+                zi = zipfile.ZipInfo(en)
+                if attr:
+                    zi.external_attr = attr
+                z.writestr(zi, data)
+        return zp
+
+    zp = make_zip("ok.zip", [("repo-main/Dockerfile", "FROM scratch", 0), ("repo-main/app/a.py", "x", 0)])
+    rc, out, err = sh(f'extract_zip {P(zp)} {P(zdir / "out_ok")}')
+    say("ok" if rc == 0 and out.strip().endswith("repo-main") and (zdir / "out_ok" / "repo-main" / "Dockerfile").exists() else "fail", "D ZIP 풀기: 정상 ZIP을 풀고 최상위 폴더 하나를 기준 폴더로 삼는다", f"{out[:80]} {err[:80]}")
+    zp = make_zip("flat.zip", [("Dockerfile", "x", 0), ("a.py", "x", 0)])
+    rc, out, err = sh(f'extract_zip {P(zp)} {P(zdir / "out_flat")}')
+    say("ok" if rc == 0 and out.strip().endswith("out_flat") else "fail", "D ZIP 풀기: 최상위에 파일이 바로 있으면 그 폴더가 기준", out[:80])
+    for nm, entries, why in [("trav.zip", [("../evil.txt", "x", 0)], "../ 경로 이탈"),
+                             ("abs.zip", [("/etc/evil", "x", 0)], "절대 경로"),
+                             ("mid.zip", [("a/../../evil", "x", 0)], "중간 ../"),
+                             ("link.zip", [("repo/ln", "/etc/passwd", (0o120777 << 16))], "심볼릭 링크")]:
+        zp = make_zip(nm, entries)
+        rc, out, err = sh(f'extract_zip {P(zp)} {P(zdir / ("out_" + nm))}')
+        escaped = (zdir / "evil.txt").exists() or (zdir / "evil").exists()
+        say("ok" if rc != 0 and not escaped else "fail", f"D ZIP 풀기: {why} 거부", err[:80])
+
+    # image-ref: plan에 쓸 이미지 주소를 미리 정한다(build --tag 와 짝)
+    rc, out, err = sh('export_foundation() { :; }; aws() { :; }; cmd_image_ref abcd1234')
+    say("ok" if rc == 0 and re.fullmatch(re.escape(ECR) + r":abcd1234-r[0-9]+", out.strip()) else "fail", "D image-ref: ECR 주소:배포ID-r시각 형태로 출력", f"{out.strip()[:90]} {err[:60]}")
+    rc, out, err = sh('export_foundation() { :; }; cmd_image_ref "../foundation"')
+    say("ok" if rc != 0 and "deploy id" in err and out.strip() == "" else "fail", "D image-ref: 배포 ID 형식이 아니면 거부", err[:60])
+
+    # foundation-info: 최신 foundation 출력을 compact JSON 한 줄로 낸다(worker가 비용을 계산하기 전에 읽는다)
+    rc, out, err = sh('need() { :; }; export_foundation() { :; }; cmd_foundation_info')
+    try:
+        parsed = json.loads(out.strip())
+    except ValueError:
+        parsed = None
+    say("ok" if rc == 0 and len(out.strip().splitlines()) == 1 and parsed == FAKE_FOUNDATION else "fail",
+        "D foundation-info: foundation 출력을 JSON 한 줄로 낸다", f"rc={rc} {out.strip()[:80]} {err[:60]}")
+    rc, out, err = sh('need() { :; }; export_foundation() { die "foundation 출력을 읽지 못했습니다"; }; cmd_foundation_info')
+    say("ok" if rc != 0 and out.strip() == "" and "foundation 출력을 읽지 못했습니다" in err else "fail",
+        "D foundation-info: foundation 출력을 읽지 못하면 비정상 종료(캐시로 대신하지 않음)", f"rc={rc} {err[:60]}")
+    rc, out, err = sh('main detect-arch')
+    say("ok" if out.strip() in ("X86_64", "ARM64") else "fail", "D detect-arch 명령은 X86_64 또는 ARM64를 출력", out.strip()[:30] + err[:60])
+
+    # DB 작업: foundation에 Lambda가 있으면 Lambda로, 없으면(옛 foundation) Fargate 작업으로 한다
+    lam_foundation = dict(FAKE_FOUNDATION, db_provisioner_lambda_name="paved-clouds-db-provisioner")
+    plog = WORK / "lambda-calls.log"
+
+    def lambda_run(ok_json, function_error="None", force_fargate=False):
+        fj.write_text(json.dumps(lam_foundation), encoding="utf-8")
+        plog.unlink(missing_ok=True)
+        code = (
+            f'aws() {{ if [ "$1" = lambda ]; then for a in "$@"; do case "$a" in file://*) cat "${{a#file://}}" >> {P(plog)};; esac; done; '
+            f'echo "$*" >> {P(plog)}; out="${{@: -1}}"; printf \'%s\' \'{ok_json}\' > "$out"; echo {function_error}; fi; }}; '
+            'db_task_fargate() { echo FARGATE_CALLED; }; '
+            'db_task provision abcd1234; echo "LOG=[$DB_TASK_LOG]"'
+        )
+        res = sh(code, {"PAVED_DB_VIA_FARGATE": "1"} if force_fargate else None)
+        fj.write_text(json.dumps(FAKE_FOUNDATION), encoding="utf-8")
+        return res
+
+    rc, out, err = lambda_run('{"ok": true, "log": "PROVISION_OK"}')
+    calls = plog.read_text(encoding="utf-8") if plog.exists() else ""
+    ok = (rc == 0 and "LOG=[PROVISION_OK]" in out and "FARGATE_CALLED" not in out
+          and '"mode":"provision"' in calls and '"id":"abcd1234"' in calls and "--function-name paved-clouds-db-provisioner" in calls)
+    say("ok" if ok else "fail", "D DB 작업: foundation에 Lambda가 있으면 Lambda를 호출한다(mode·배포 ID 전달, Fargate 안 씀)", f"rc={rc} {out[:80]} {err[:80]}")
+    say("ok" if "password" not in calls.lower() and "mysql://" not in calls else "fail", "D DB 작업(Lambda): 호출 내용에 비밀번호·접속 URL이 없다")
+    rc, out, err = lambda_run('{"ok": false, "log": "OperationalError: boom"}')
+    say("ok" if rc != 0 and "실패했습니다 (Lambda)" in err and "boom" in err else "fail", "D DB 작업(Lambda): 함수가 ok=false를 돌려주면 실패로 처리하고 사유를 보여 준다", err[:100])
+    rc, out, err = lambda_run('{"errorMessage": "Task timed out"}', function_error="Unhandled")
+    say("ok" if rc != 0 and "Task timed out" in err else "fail", "D DB 작업(Lambda): Lambda 자체 오류(FunctionError)는 실패로 처리", err[:100])
+    rc, out, err = lambda_run('{"ok": true, "log": "x"}', force_fargate=True)
+    say("ok" if "FARGATE_CALLED" in out and not plog.exists() else "fail", "D DB 작업: PAVED_DB_VIA_FARGATE=1 이면 Lambda가 있어도 Fargate 작업으로 한다")
+    rc, out, err = sh('aws() { echo AWS_CALLED; }; db_task_fargate() { echo FARGATE_CALLED; }; db_task provision abcd1234')
+    say("ok" if "FARGATE_CALLED" in out and "AWS_CALLED" not in out else "fail", "D DB 작업: foundation에 Lambda 정보가 없으면(옛 foundation) Fargate 작업으로 대신한다", out[:60])
+
+    # ZIP: 압축률이 비정상적으로 높거나 풀린 바이트가 한도를 넘으면 거부한다(헤더의 크기만 믿지 않는다)
+    zp = zdir / "bomb.zip"
+    import zipfile as _zf
+    with _zf.ZipFile(zp, "w", compression=_zf.ZIP_DEFLATED) as z:
+        z.writestr("a/big.bin", b"\x00" * (6 << 20))
+    rc, out, err = sh(f'extract_zip {P(zp)} {P(zdir / "out_bomb")}')
+    say("ok" if rc != 0 and "압축" in err else "fail", "D ZIP 풀기: 압축률이 비정상적으로 높은 파일(압축 폭탄)을 거부", err[:80])
+    zp2 = zdir / "limit.zip"
+    import os as _os
+    with _zf.ZipFile(zp2, "w", compression=_zf.ZIP_STORED) as z:
+        z.writestr("a/x.bin", _os.urandom(2 << 20))
+    rc, out, err = sh(f'extract_zip {P(zp2)} {P(zdir / "out_limit")}', {"ZIP_MAX_BYTES": str(1 << 20)})
+    say("ok" if rc != 0 and "너무 큽니다" in err else "fail", "D ZIP 풀기: 풀리는 총 바이트가 한도(ZIP_MAX_BYTES)를 넘으면 거부", err[:80])
+
+    # 계획 단계에서는 이미지가 없어도 되고, 적용 직전에 반드시 확인한다
+    pdir = pin_dir("pin_noimage", appA, "IMG:missing")
+    mock_noimg = mock_tf.replace("check_image_exists() { :; }", 'check_image_exists() { echo "오류: ECR에 이미지가 없습니다" >&2; exit 1; }')
+    rc, out, err = sh(f'{mock_noimg}; wait_healthy() {{ return 0; }}; d={P(pdir)}; pin_plan_inputs "$d"; apply_saved "$d" abcd1234')
+    att = (pdir / "attempts.log").read_text(encoding="utf-8") if (pdir / "attempts.log").exists() else ""
+    ok = rc != 0 and not (pdir / "calls.log").exists() and "|fail|" in att and "ECR에 이미지가 없음" in att and (pdir / "tfplan").exists()
+    say("ok" if ok else "fail", "D apply: 이미지가 ECR에 없으면 terraform apply에 도달하지 않고 실패를 기록한다(계획은 남겨 이미지를 올린 뒤 다시 적용 가능)", f"rc={rc} {att[:80]}")
+
+    # 앱 초기화가 실패하면 정상 이력을 남기지 않는다
+    pdir = pin_dir("pin_initfail", appA, "IMG:a")
+    mock_initfail = mock_tf.replace("app_init_task() { :; }", 'app_init_task() { echo "초기화 실패" >&2; exit 1; }')
+    rc, out, err = sh(f'{mock_initfail}; wait_healthy() {{ echo HEALTH_CALLED >> {P(pdir / "health.log")}; return 0; }}; d={P(pdir)}; pin_plan_inputs "$d"; apply_saved "$d" abcd1234')
+    att = (pdir / "attempts.log").read_text(encoding="utf-8") if (pdir / "attempts.log").exists() else ""
+    ok = rc != 0 and "앱 초기화 작업 실패" in att and not (pdir / "history.log").exists() and not (pdir / "health.log").exists() and not (pdir / "plan.app.json").exists()
+    say("ok" if ok else "fail", "D apply: 앱 초기화가 실패하면 헬스체크·정상 이력 없이 실패를 기록하고 고정본을 정리한다", f"rc={rc} {att[:80]}")
 
     # update·rollback이 foundation 값을 지금 출력으로 갱신한다
     fdir = WORK / "fresh"
@@ -805,11 +1101,92 @@ def part_d():
     rc, out, err = sh('aws() { echo "An error occurred (AccessDeniedException)" >&2; return 254; }; check_image_exists "%s"' % img)
     say("ok" if rc != 0 and "확인하지 못했습니다" in err else "fail", "D ECR 이미지 확인: 권한 오류는 '없음'이 아니라 확인 실패로 구분", err[:100])
 
+    # 포트 자동 할당. 시험은 비어 있는 임시 폴더를 ROOT로 써서 이 PC의 실제 배포 폴더(예약)에 영향받지 않게 한다
+    def fresh_root(name):
+        r = WORK / name
+        shutil.rmtree(r, ignore_errors=True)
+        (r / "deployments").mkdir(parents=True)
+        return r
+
+    def with_root(r):
+        return f'ROOT={P(r)}; '
+
+    def deploy_folder(r, dep_id, port=None, reserved=None, destroyed=False):
+        d = r / "deployments" / dep_id
+        d.mkdir(parents=True, exist_ok=True)
+        if port is not None:
+            (d / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"listener_port": port}}), encoding="utf-8")
+        if reserved is not None:
+            (d / "port.reserved").write_text(f"{reserved}\n", encoding="utf-8")
+        if destroyed:
+            (d / "destroyed").write_text("x", encoding="utf-8")
+        return d
+
+    proot = fresh_root("port_root")
     # 포트 자동 할당: 조회가 실패하면 8001로 넘어가지 않고 중단
-    rc, out, err = sh('aws() { return 255; }; pick_port')
+    rc, out, err = sh(with_root(proot) + 'aws() { return 255; }; pick_port')
     say("ok" if rc != 0 and out.strip() == "" and "조회하지 못했습니다" in err else "fail", "D 포트 자동 할당: 리스너 조회 실패를 숨기고 8001을 고르지 않는다", f"rc={rc} out={out.strip()} {err[:60]}")
-    rc, out, err = sh('aws() { echo "80 8001 8002"; }; pick_port')
+    rc, out, err = sh(with_root(proot) + 'aws() { echo "80 8001 8002"; }; pick_port')
     say("ok" if out.strip() == "8003" else "fail", "D 포트 자동 할당: 쓰는 포트를 건너뛰고 가장 작은 빈 포트", out.strip())
+
+    # 회귀: 승인 전에 두 프로젝트를 순서대로 계획하면 둘 다 AWS에 아직 없는 8001을 골라, 첫 계획을 적용한 뒤 두 번째 계획이
+    # 같은 ALB 포트에 다른 대상 그룹의 리스너를 만들다 DuplicateListener로 실패했다. 미적용 계획의 포트를 예약으로 센다
+    da, db = deploy_folder(proot, "abcd0001"), deploy_folder(proot, "abcd0002")
+    rc1, o1, e1 = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0001 {P(da)}')
+    rc2, o2, e2 = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0002 {P(db)}')
+    say("ok" if (rc1, rc2) == (0, 0) and (o1.strip(), o2.strip()) == ("8001", "8002") else "fail",
+        "D 포트 예약: 승인 전에 순서대로 계획한 두 배포가 서로 다른 포트를 받는다(8001, 8002)", f"{o1.strip()} {o2.strip()} {e1[:50]} {e2[:50]}")
+    # 폴더가 지워지면(계획 폐기) 예약이 풀린다
+    shutil.rmtree(da)
+    dc = deploy_folder(proot, "abcd0003")
+    rc, out, err = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0003 {P(dc)}')
+    say("ok" if rc == 0 and out.strip() == "8001" else "fail", "D 포트 예약: 계획을 폐기해 폴더가 지워지면 그 포트를 다시 쓴다", out.strip())
+    # destroy 표식이 생기면 풀린다
+    (db / "destroyed").write_text("x", encoding="utf-8")
+    dd = deploy_folder(proot, "abcd0004")
+    rc, out, err = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0004 {P(dd)}')
+    say("ok" if rc == 0 and out.strip() == "8002" else "fail", "D 포트 예약: destroy된 배포(destroyed 표식)의 포트는 풀린다", out.strip())
+    # 입력 파일(platform.auto.tfvars.json)로 남은 예약, 자기 자신·보관 폴더(_)는 세지 않는다
+    deploy_folder(proot, "abcd0005", port=8003)
+    deploy_folder(proot, "_destroyed", port=8010)
+    rc, out, err = sh(with_root(proot) + 'local_reserved_ports abcd0004')
+    say("ok" if rc == 0 and out.split() == ["8001", "8003"] else "fail",
+        "D 포트 예약: 입력 파일의 포트는 세고, 자기 자신·_보관 폴더·destroy된 배포는 세지 않는다", out.strip())
+    # AWS 리스너와 로컬 예약을 함께 피한다
+    de = deploy_folder(proot, "abcd0006")
+    rc, out, err = sh(with_root(proot) + f'aws() {{ echo "80 8002"; }}; reserve_port abcd0006 {P(de)}')
+    say("ok" if rc == 0 and out.strip() == "8004" else "fail", "D 포트 예약: AWS에 적용된 리스너(8002)와 로컬 예약(8001, 8003)을 모두 피한다", out.strip())
+    # 잠금이 남아 있으면 기다리다 실패하고, 그때 폴더에 예약을 남기지 않는다
+    (proot / "deployments" / ".port.lock").mkdir()
+    df = deploy_folder(proot, "abcd0007")
+    rc, out, err = sh(with_root(proot) + f'PORT_LOCK_WAIT=1; aws() {{ echo 80; }}; reserve_port abcd0007 {P(df)}')
+    say("ok" if rc != 0 and "잠금" in err and not (df / "port.reserved").exists() else "fail", "D 포트 예약: 잠금을 얻지 못하면 포트를 정하지 않고 실패", f"rc={rc} {err[:70]}")
+    (proot / "deployments" / ".port.lock").rmdir()
+
+    # cmd_up 통합: 계획만 만드는 up을 두 번 순서대로 실행하면 서로 다른 포트가 계획 입력에 고정된다
+    r2 = fresh_root("port_root_up")
+    appf = WORK / "port_app.json"
+    appf.write_text(json.dumps({"container_port": 8000, "health_check_path": "/health", "use_database": False}), encoding="utf-8")
+    stubs = ('need() { :; }; export_foundation() { :; }; nat_preflight() { :; }; aws() { echo 80; }; '
+             'tf() { :; }; state_setup() { :; }; plan_confirm_apply() { :; }; PLAN_ONLY=1; ')
+    up = lambda i, extra="": f'cmd_up --id {i} --image {ECR}:{i}-r1 --app {P(appf)} --arch X86_64 --plan-only {extra}'
+    rc, out, err = sh(with_root(r2) + stubs + up("abcd0011") + "; " + up("abcd0012"))
+    ports = []
+    for i in ("abcd0011", "abcd0012"):
+        try:
+            ports.append(json.loads((r2 / "deployments" / i / "platform.auto.tfvars.json").read_text(encoding="utf-8"))["platform"]["listener_port"])
+        except (OSError, ValueError, KeyError):
+            ports.append(None)
+    say("ok" if rc == 0 and ports == [8001, 8002] else "fail", "D up --plan-only: 승인 전에 계획한 두 배포의 리스너 포트가 서로 다르다(8001, 8002)", f"rc={rc} ports={ports} {err[-90:]}")
+    # 지정한 포트가 다른 배포의 미적용 계획과 겹치면 계획 단계에서 막는다(apply에서야 DuplicateListener로 실패하지 않게)
+    rc, out, err = sh(with_root(r2) + stubs + up("abcd0013", "--port 8001"))
+    say("ok" if rc != 0 and "이미 예약" in err and not (r2 / "deployments" / "abcd0013").exists() else "fail",
+        "D up --port: 다른 배포가 예약한 포트를 지정하면 계획 단계에서 거부하고 폴더를 남기지 않는다", f"rc={rc} {err[-90:]}")
+    # 계획 준비가 실패해 폴더가 정리되면 예약도 풀린다
+    rc, out, err = sh(with_root(r2) + stubs.replace("tf() { :; }", "tf() { return 1; }") + up("abcd0014"))
+    rc2, out2, err2 = sh(with_root(r2) + 'local_reserved_ports abcd0099')
+    say("ok" if rc != 0 and not (r2 / "deployments" / "abcd0014").exists() and out2.split() == ["8001", "8002"] else "fail",
+        "D up 실패: 만들다 만 폴더가 정리되면 그 포트 예약도 풀린다", f"rc={rc} reserved={out2.strip()}")
 
     # S3 state: 버전 확인, 이미 있는 원격 state를 덮어쓰지 않는다
     for ver, want in [("1.9.8", False), ("1.10.0", True), ("1.16.5", True), ("1.10.0-beta1", True)]:

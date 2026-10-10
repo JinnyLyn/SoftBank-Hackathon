@@ -49,5 +49,7 @@ variable "app" {
     max_tasks         = optional(number, 1)
     use_database      = optional(bool, false)
     environment       = optional(map(string), {})
+    # 앱 이미지로 1회 실행할 초기화 명령(테이블 생성 등). Terraform은 쓰지 않고 deploy.sh가 apply 뒤에 실행한다
+    init_command = optional(list(string), [])
   })
 }
