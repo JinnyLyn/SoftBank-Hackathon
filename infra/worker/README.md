@@ -1,6 +1,6 @@
 # worker (planner + executor)
 
-플랫폼 백엔드(`back/`, PR #10)와 `infra/scripts/deploy.sh`를 잇는 프로그램이다. 표준 라이브러리만 쓴다(Python 3.12 이상).
+플랫폼 백엔드(`back/`, PR #10·#23)와 `infra/scripts/deploy.sh`를 잇는 프로그램이다. 표준 라이브러리만 쓴다(Python 3.12 이상).
 
 현재 제품 기준은 [PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`이다. 아래 AWS 자격 증명과 foundation 준비는 운영자/worker 환경용이며 사용자 계정·IAM 키 입력을 전제하지 않는다. 계정 이전은 [OPERATOR_AWS.md](../../docs/OPERATOR_AWS.md)를 따른다.
 
@@ -98,6 +98,26 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 **현재 worker에는 rollback plan 생성·업로드·diff 등록과 롤백 전용 실행 연동이 구현돼 있지 않다.** 위 내용은 연결해야 할 계약이며 현재 end-to-end 지원을 뜻하지 않는다. 연동 전에는 제품 롤백 실행을 제공하지 않고 미지원 상태를 알린다. 이 공백을 사람이 `deploy.sh rollback`을 직접 실행하는 방식으로 대체하지 않는다. 저수준 CLI의 확인 프롬프트도 백엔드의 사용자 승인을 대신하지 않는다.
 
+## connector: 사용자 AWS 연결 확인
+
+백엔드(PR #23)에는 사용자가 CloudFormation 스택으로 만든 AWS 역할을 확인하는 worker 경로가 있다([back/API.md](../../back/API.md)). 사용자 AWS 연결은 기본 제품 흐름이 아니므로([PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)) 기존 연결 화면·API와의 호환을 위한 부분이다. 템플릿과 운영자 준비는 [infra/README.md](../README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용)를 따른다.
+
+매 점검에서 **배포 작업을 가져와 실행한 뒤**(계획 만들기 전)에 `GET /api/worker/connections/pending`을 읽고 연결마다 다음을 한다. 호환용 일이 승인된 배포를 기다리게 하지 않도록 배포가 먼저다.
+
+1. `account_id`·`role_arn`이 아직 `null`이면(CloudFormation 콜백 전) **아무것도 하지 않고 기다린다.**
+2. 역할 ARN·계정 ID·`external_id`의 형식을 백엔드와 같은 규칙으로 확인한다. 어긋나면 AWS를 부르지 않고 건너뛴다.
+3. `aws sts assume-role --role-arn … --external-id …`로 실제로 맡아 본다. 임시 자격 증명은 출력하지 않고(`--query AssumedRoleUser.Arn`) 맡은 역할의 계정이 보고된 계정과 같은지만 본다.
+4. 성공하면 `POST /api/worker/connections/{id}/complete`에 `account_id`·`role_arn`만 보낸다.
+5. **사용자 쪽 거부**(`ValidationError`·`RegionDisabledException`, 다른 계정의 역할, 그리고 아래 조건을 만족한 `AccessDenied`)가 `conn_max_tries`(8회, 시도 간격 15초 ≈ 2분) 이어지면 `POST …/fail`로 보고한다. 방금 만든 역할은 IAM 전파 전에 잠깐 거부될 수 있어 바로 실패로 만들지 않는다.
+   **`AccessDenied`는 worker 권한이 증명된 뒤에만 사용자 쪽 거부로 센다.** AWS는 신뢰 정책·ExternalId 불일치, 없는 역할, worker 주체의 `sts:AssumeRole` 권한 누락에 같은 `AccessDenied`를 돌려줘 구분할 수 없다. 그래서 이 프로세스에서 `AssumeRole`이 한 번이라도 성공하기 전에는 `fail`을 보내지 않고 횟수도 올리지 않으며, 연결마다 한 번 운영자가 볼 경고 로그만 남기고 계속 다시 시도한다. 올바른 스택까지 영구 오류로 만드는 것을 막기 위해서다. 대신 worker 권한이 없는 채로 잘못된 스택 하나만 있으면 그 연결은 `pending`으로 남는다(운영자가 로그로 확인한다).   사용자에게 보이는 오류에는 AWS 원문(운영자 계정의 IAM 주체 이름 포함)과 ExternalId를 넣지 않고 오류 코드와 역할 ARN, 확인할 곳만 적는다.
+6. **worker 쪽 문제**(만료된 자격 증명, 네트워크, CLI 없음, 15초 시간 초과)는 연결을 실패로 만들지 않고 횟수도 올리지 않는다. 복구되면 이어서 확인한다. 거부·오류 모두 같은 연결은 15초 간격을 두고 다시 확인한다.
+7. **시간 예산**: 한 점검에서 연결 확인에 쓰는 시간은 15초(`conn_budget`)로 묶는다. AWS CLI·네트워크가 멈춰도 연결 수만큼 배포가 밀리지 않고, 예산을 넘으면 남은 연결은 다음 점검으로 미룬다. 멈춘 연결은 재시도 간격 동안 건너뛰어 다른 연결이 차례를 얻는다.
+
+- 보고가 연결 실패·5xx면 최대 4번 다시 보내고, 4xx(저장된 콜백 값과 불일치 등)는 다시 보내도 같아서 이 프로세스에서 그 연결을 더 다루지 않는다. 사람이 백엔드의 값을 확인한다.
+- 대기 연결 목록을 읽지 못해도(연결 API가 없는 백엔드, 일시 오류) 배포 작업 가져오기와 계획 만들기는 계속한다. 처음 한 번만 로그로 알린다.
+- worker의 AWS 자격 증명은 사용자 역할에 대한 `sts:AssumeRole` 권한이 있어야 한다. 없으면 `AssumeRole`이 한 번도 성공하지 못해 모든 연결이 `pending`으로 남고 로그에 경고가 찍힌다(`fail`로 확정하지 않는다). 운영자는 연결을 켜기 전에 `aws sts get-caller-identity`와 권한을 먼저 확인한다.
+- 연결 ID·계정 ID·역할 ARN은 로그에 남지만 `external_id`와 임시 자격 증명은 남기지 않는다. 단, `aws` 명령 인자에는 `external_id`가 들어가므로 worker를 도는 PC의 프로세스 목록에서는 보인다.
+
 ## 지키는 규칙
 
 - 승인된 저장 plan만 적용한다. 승인 뒤에 새 plan을 만들어 적용하지 않는다.
@@ -108,6 +128,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 ## 한계 (정직하게)
 
 - **실제 백엔드(PR #10)와 연결해서 시험하지 않았다.** `test_worker.py`는 `back/API.md`를 흉내 낸 서버와 가짜 `deploy.sh`로 돌고, `deploy.sh`와의 연결은 진짜 AWS로 따로 확인했다(상파울루, 가짜 백엔드).
+- **연결 확인(connector)**: `test_worker.py`는 가짜 `aws` CLI로 돈다. 별도로 시험 계정에서 실제 AWS(스택 생성, `sts:AssumeRole` 성공·거부)와 로컬 Docker 백엔드(PR #23)로 한 번씩 확인했다. 확인하지 못한 것은 콜백 Lambda의 성공 경로, 공개 주소의 백엔드, 계정이 다른 교차 계정 구성이다([infra/README.md](../README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용) 참고).
 - 한 번에 작업 하나씩 순서대로 처리한다(동시 배포 없음). worker가 작업 도중 죽으면 그 배포는 `provisioning` 상태로 남는다.
 - 비용은 `prices.json`의 가격표로 계산한다. 공용 ALB·RDS·**공인 IPv4(ALB 가용 영역별 + NAT용 탄력적 IP, 기준 구성 3개)** 를 포함하고, NAT 인스턴스 EC2 요금(가격 조회 실패)·ALB 처리 용량·데이터 전송·로그·백업은 제외했다(제외 항목은 계획 요약에 적힌다). 공인 IPv4 개수는 **배포된 foundation의 출력**(`infra/deployments/foundation.json`의 `task_subnet_ids` 개수 = 가용 영역 수, `assign_public_ip`, `nat_instance_count`)에서 센다. 읽을 수 없으면 `prices.json`의 `foundation_assumptions`(foundation 기본값: 가용 영역 3개 + NAT 3대)를 쓴다. 기준일 2026-10-10.
 - 계획 만들기가 약 30초, 승인 뒤 배포가 약 2분(DB 준비 Lambda 사용, 빌드 포함 124초 실측)이다. 프런트의 5분 대기 제한 안에 들어온다.
@@ -115,6 +136,6 @@ python infra/worker/worker.py --once             # 한 번만 점검
 ## 시험
 
 ```bash
-python infra/worker/test_worker.py      # 70개(약 1.5분). 실제 AWS·Docker 없이 돈다
+python infra/worker/test_worker.py      # 106개(약 2.5분). 실제 AWS·Docker 없이 돈다
 python infra/scripts/test_infra.py      # deploy.sh와 Terraform 모듈 시험
 ```
