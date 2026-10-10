@@ -446,6 +446,10 @@ def extract_zip(src, dst):
                     if written > max_bytes:
                         bad("ZIP이 너무 큽니다(풀었을 때 크기 한도 초과)")
                     out_f.write(chunk)
+            # ZIP의 실행 비트만 더한다. 기본 권한(umask)을 유지하고 특권·쓰기 비트는 복원하지 않는다.
+            executable = (i.external_attr >> 16) & 0o111
+            if executable:
+                os.chmod(target, stat.S_IMODE(os.stat(target).st_mode) | executable)
     entries = [e for e in os.listdir(root) if e != "__MACOSX"]
     one = os.path.join(root, entries[0]) if len(entries) == 1 else None
     return Path(one) if one and os.path.isdir(one) else Path(root)
@@ -571,12 +575,14 @@ def probe(url, timeout=3):
         return None
 
 
-def wait_healthy(lc, deploy_id, host_port, health_path):
+def wait_healthy(lc, deploy_id, host_port, health_path, *, bind=None):
     """앱이 헬스체크에 응답할 때까지 기다린다. AWS 경로(infra/README.md)와 같은 판정이다.
 
     통과: 응답 코드 200~399. 실패: 4xx가 4번 연속(기다려도 나아지지 않는다), 앱 컨테이너가 종료(exited·dead)되거나 재시작을 3번 연속 확인,
     제한 시간(health_timeout) 초과. 5xx와 연결 실패는 시작 중일 수 있어 계속 기다린다."""
-    url = f"http://127.0.0.1:{host_port}{health_path}"
+    bind = lc.bind if bind is None else bind
+    host = "127.0.0.1" if bind == "0.0.0.0" else bind
+    url = f"http://{host}:{host_port}{health_path}"
     deadline = time.monotonic() + lc.health_timeout
     four_xx = restarting = 0
     last = None
@@ -605,7 +611,7 @@ def wait_healthy(lc, deploy_id, host_port, health_path):
 PORT_BUSY_RE = re.compile(r"(?i)port is already allocated|address already in use|bind for .* failed|ports are not available")
 
 
-def apply(lc, deploy_id, compose_text, *, host_port, health_path, init_command=None, use_database=False, on_deploying=None):
+def apply(lc, deploy_id, compose_text, *, host_port, health_path, bind=None, init_command=None, use_database=False, on_deploying=None):
     """승인된 compose 파일을 이 PC의 Docker로 올리고 헬스체크를 통과할 때까지 기다린다. 실패는 LocalError이고, 이때 컨테이너는 멈춘다."""
     d = deploy_dir(lc, deploy_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -628,7 +634,7 @@ def apply(lc, deploy_id, compose_text, *, host_port, health_path, init_command=N
                 raise LocalError("init_failed", f"앱 초기화 작업이 실패했습니다({why})", {"log_tail": tail(out, 40, known)})
         if on_deploying:
             on_deploying()
-        wait_healthy(lc, deploy_id, host_port, health_path)
+        wait_healthy(lc, deploy_id, host_port, health_path, bind=bind)
     except LocalError as e:
         if e.event_type not in ("docker_missing",):
             _stop(lc, deploy_id)
