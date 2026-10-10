@@ -54,7 +54,7 @@ interface ProjectOut {
 /** ZIP은 원본 바이트를 그대로, GitHub는 주소와 ref를 JSON으로 */
 /**
  * 사용 규모·예산. 인프라 worker가 구성 단계와 예산 검사에 쓰는 사용자 입력이라 그대로 보냄 (AI가 바꾸지 않음).
- * 백엔드가 저장하면 AI runner가 분석 결과 scale 로 복사해 worker에 넘김
+ * 백엔드가 프로젝트에 저장하고, AI runner가 분석 결과 scale 로 복사해 worker에 넘김
  */
 function scaleParams(scale: ScaleInput): Record<string, string> {
   const p: Record<string, string> = { expected_users: scale.expectedUsers, traffic_pattern: scale.pattern }
@@ -66,7 +66,7 @@ function scaleParams(scale: ScaleInput): Record<string, string> {
 function createProject(source: Source, scale: ScaleInput): Promise<ProjectOut> {
   const name = sourceName(source)
   if (source.kind === 'zip') {
-    // 본문이 ZIP 원본이라 사용 규모는 쿼리로. 아직 저장하지 않는 백엔드는 모르는 쿼리를 무시함
+    // 본문이 ZIP 원본이라 사용 규모는 쿼리로
     const q = new URLSearchParams({ name, filename: source.file.name, ...scaleParams(scale) })
     return req<ProjectOut>(`/projects?${q}`, {
       method: 'POST',
@@ -76,10 +76,16 @@ function createProject(source: Source, scale: ScaleInput): Promise<ProjectOut> {
       timeoutMs: 10 * 60 * 1000,
     })
   }
-  // GitHub 본문에는 아직 scale 을 넣지 않음: 백엔드가 정의 밖 필드를 422로 거절함. 백엔드가 받기 시작하면 추가
+  const { monthly_budget_usd, ...rest } = scaleParams(scale)
   return req<ProjectOut>(
     '/projects/github',
-    send('POST', { name, repository_url: source.url, ref: source.branch || undefined }),
+    send('POST', {
+      name,
+      repository_url: source.url,
+      ref: source.branch || undefined,
+      ...rest,
+      monthly_budget_usd: monthly_budget_usd === undefined ? undefined : Number(monthly_budget_usd),
+    }),
   )
 }
 

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -106,15 +107,19 @@ def mask_files(files: List[SourceFile]) -> MaskReport:
 
 
 # ---------- 백엔드 기록용 ----------
-# back/app/main.py 의 _SECRET_KEY·_SECRET_VALUE·_CREDENTIAL_URL·_BEARER·_AWS_ACCESS_KEY·_is_secret_key 와 같은 규칙.
+# back/app/main.py 의 _SECRET_KEY·_KEY_ASSIGNMENT·_ASSIGNMENT_VALUE·_CREDENTIAL_URL·_BEARER·_AWS_ACCESS_KEY·
+# _is_secret_key·_inline_secret_values 와 같은 규칙.
 # 백엔드 규칙이 바뀌면 같이 고친다 (tests/test_masking.py 가 백엔드 소스의 정규식과 같은지 확인)
 #
-# 백엔드는 _SECRET_VALUE 로 모든 "이름=값"을 찾은 뒤 이름이 비밀스러울 때만 거절한다 (_contains_inline_secret, 7d1a668).
-# 그래서 "FROM python:3.12" 같은 문장은 통과하고 "SECRET_KEY=<가림>" 은 거절된다.
+# 백엔드는 "이름=" 자리를 모두 찾고(값을 먹지 않아서 "environment: API_KEY=..." 안쪽도 봄), 이름이 비밀스러우면 거절한다.
+# 값이 JSON 문자열이면 풀어서 안쪽도 본다. 그래서 "FROM python:3.12" 는 통과하고 "SECRET_KEY=<가림>" 은 거절된다.
 
 BACKEND_SECRET_KEY = re.compile(r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)")
-BACKEND_SECRET_VALUE = re.compile(
-    r"""(?ix)(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)(?P<separator>\s*[:=]\s*)(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"""
+BACKEND_KEY_ASSIGNMENT = re.compile(
+    r"""(?ix)(?<![A-Z0-9_-])(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)\s*[:=]\s*"""
+)
+BACKEND_ASSIGNMENT_VALUE = re.compile(
+    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]"']+"""
 )
 BACKEND_CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
 BACKEND_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -128,8 +133,29 @@ def backend_is_secret_key(key: str) -> bool:
     return BACKEND_SECRET_KEY.search(separated) is not None
 
 
+def _inline_secrets(text: str):
+    """백엔드 _inline_secret_values 와 같은 순서로 찾음. (이름 시작, 값 끝, 이름, 풀린 JSON 문자열 또는 None)"""
+    for assignment in BACKEND_KEY_ASSIGNMENT.finditer(text):
+        start = assignment.end()
+        value = BACKEND_ASSIGNMENT_VALUE.match(text, start)
+        if not value:
+            continue
+        decoded = None
+        stop = value.end()
+        if text[start] in '{["':
+            try:
+                decoded, stop = json.JSONDecoder().raw_decode(text, start)
+            except (ValueError, RecursionError):
+                if text[start] in "{[":
+                    stop = len(text)
+        if backend_is_secret_key(assignment.group("key")):
+            yield assignment.start(), stop, assignment.group("key"), None
+        elif isinstance(decoded, str) and _secret_assignments(decoded):
+            yield start, stop, None, decoded
+
+
 def _secret_assignments(text: str):
-    return [m for m in BACKEND_SECRET_VALUE.finditer(text) if backend_is_secret_key(m.group("key"))]
+    return list(_inline_secrets(text))
 
 
 def backend_safe_text(text: str) -> str:
@@ -137,9 +163,16 @@ def backend_safe_text(text: str) -> str:
     text = BACKEND_CREDENTIAL_URL.sub(lambda m: f"{m.group(1)}://{MASK}@", text)
     text = BACKEND_BEARER.sub("Bearer (값 가림)", text)
     text = BACKEND_AWS_ACCESS_KEY.sub("(AWS 키 가림)", text)
-    return BACKEND_SECRET_VALUE.sub(
-        lambda m: f"{m.group('key')} (값 가림)" if backend_is_secret_key(m.group("key")) else m.group(0), text
-    )
+    # 겹치지 않게 앞에서부터 고른 뒤 뒤에서부터 바꿈 (앞쪽 위치가 밀리지 않게)
+    spans, end = [], -1
+    for start, stop, key, decoded in _inline_secrets(text):
+        if start >= end:
+            spans.append((start, stop, key, decoded))
+            end = stop
+    for start, stop, key, decoded in reversed(spans):
+        repl = f"{key} (값 가림)" if key is not None else json.dumps(backend_safe_text(decoded), ensure_ascii=False)
+        text = text[:start] + repl + text[stop:]
+    return text
 
 
 def backend_unsafe_paths(value: object, path: str = "") -> List[str]:

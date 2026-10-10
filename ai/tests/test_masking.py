@@ -74,6 +74,14 @@ class BackendGuardTests(unittest.TestCase):
         self.assertEqual(safe, "SECRET_KEY (값 가림)")
         self.assertEqual(backend_unsafe_paths({"x": safe}), [])
 
+    def test_nested_and_json_string_assignments(self):
+        # 백엔드가 Issue #16 에서 새로 막은 모양: 바깥 이름이 평범해도 안쪽 비밀 이름을 봄
+        for text in ('environment: API_KEY=<가림>', '{"log": "{\\"API_KEY\\": \\"<가림>\\"}"}'):
+            with self.subTest(text=text):
+                self.assertTrue(backend_unsafe_paths({"x": text}))
+                self.assertEqual(backend_unsafe_paths({"x": backend_safe_text(text)}), [])
+        self.assertEqual(backend_unsafe_paths({"x": "FROM python:3.12"}), [], "일반 Docker 태그는 허용")
+
     def test_field_names_checked(self):
         self.assertTrue(backend_unsafe_paths({"api_key": "x"}))
         self.assertEqual(backend_unsafe_paths({"masking": {"withheld_files": [], "redactions": 1}}), [])
@@ -84,7 +92,8 @@ class BackendGuardTests(unittest.TestCase):
         src = BACKEND_MAIN.read_text(encoding="utf-8")
         pairs = {
             "_SECRET_KEY": masking.BACKEND_SECRET_KEY,
-            "_SECRET_VALUE": masking.BACKEND_SECRET_VALUE,
+            "_KEY_ASSIGNMENT": masking.BACKEND_KEY_ASSIGNMENT,
+            "_ASSIGNMENT_VALUE": masking.BACKEND_ASSIGNMENT_VALUE,
             "_CREDENTIAL_URL": masking.BACKEND_CREDENTIAL_URL,
             "_BEARER": masking.BACKEND_BEARER,
             "_AWS_ACCESS_KEY": masking.BACKEND_AWS_ACCESS_KEY,
