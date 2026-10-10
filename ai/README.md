@@ -43,11 +43,11 @@
 
 ## Dockerfile 초안의 적용 범위 (PR #29)
 
-10/11 확인한 [PR #29](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/29) `618dc17` 기준이다. 당시 main `f506966`에는 초안 생성·표시가 아직 통합되지 않았으며, 아래 설명은 PR 구현의 사용 방법과 한계다.
+10/11 재확인한 최신 main `f506966`과 머지 대기 중인 [PR #29](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/29) `9aeee5b` 기준이다. main에는 초안 생성·표시가 아직 없으며, 아래는 PR 통합 후의 기본 사용 흐름이다. 연관된 [PR #33](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/33) `4ef78bd`의 로컬 Docker 선택 기능도 미통합 제안이며 초안 자동 빌드 완료의 근거로 삼지 않는다. 전체 상태는 [최신 main·머지 대기 PR 기준](../docs/OPEN_QUESTIONS.md#1011-최신-main머지-대기-pr-확인-기준)을 따른다.
 
 - `dockerfile_draft`는 코드에서 찾은 근거로 만든 제안이다. 업로드 원본을 수정하거나 worker에 자동 적용하지 않는다.
 - 기본 흐름은 **초안 확인·다운로드 → 저장소 루트에 `Dockerfile`로 추가 → "새 배포"로 소스 재업로드 → 새 구성·비용 계획 확인·승인**이다. 초안 표시만으로 계획 생성·빌드·배포가 완료된 것은 아니다.
-- 프런트의 `VITE_DOCKERFILE_DRAFT_BUILD` 기본값은 `false`다. 이를 `true`로 바꾸는 것만으로 worker의 초안 빌드 기능이 구현되지는 않는다. 직접 사용하려면 승인할 초안 내용 또는 해시를 계획에 연결하고, 승인된 내용 그대로 worker가 빌드하도록 인프라 계약·검증을 먼저 완료해야 한다.
+- PR #29는 계획 변수에 `dockerfile_draft`가 있을 때 승인 화면에 초안을 표시하고, `VITE_DOCKERFILE_DRAFT_BUILD=true`이면 초안 앱의 계획을 기다리는 프런트 경로를 준비했다. 기본값은 `false`이며 플래그 변경만으로 worker 지원이 생기지는 않는다. 직접 빌드하려면 초안 내용·해시를 승인할 계획에 연결하고 승인된 내용 그대로 worker가 빌드하는 인프라 변경을 먼저 통합·검증한 뒤 플래그를 켠다. 그 전에는 재업로드 흐름을 사용한다.
 - 이 문서 갱신은 PR #29의 코드 승인·머지나 실제 AWS 배포 검증을 대신하지 않는다. 초안 직접 빌드와 승인 경계의 후속 확인은 인프라 담당·JinnyLyn이 맡는다.
 
 ## runner (`runner.py`)
