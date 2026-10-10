@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api, sourceName } from '../api'
+import { api, NEEDS_CONNECTION, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
@@ -324,7 +324,8 @@ export default function NewDeploy({
     next = {
       label: busy === 'analyze' ? '분석하고 코드 준비 중…' : analysis ? '다음' : '분석 시작',
       onClick: analyze,
-      disabled: !source || !budgetValid(scale.monthlyBudgetUsd) || (!analysis && usable.length === 0),
+      disabled:
+        !source || !budgetValid(scale.monthlyBudgetUsd) || (NEEDS_CONNECTION && !analysis && usable.length === 0),
     }
   if (step === 1 && !locked) {
     if (codeState === 'error' && analysis && choice)

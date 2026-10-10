@@ -1,5 +1,5 @@
 import { useRef, useState } from 'react'
-import { api } from '../api'
+import { api, NEEDS_CONNECTION } from '../api'
 import { shortTime } from '../format'
 import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
@@ -110,6 +110,12 @@ export default function Connections({ connections, loadError, onReload, onChange
       <div className="page-head">
         <div>
           <h1>연결 관리</h1>
+          {!NEEDS_CONNECTION && (
+            <p className="readonly-note">
+              개인 AWS 계정 연결은 준비 중입니다. 지금은 연결 없이도 새 배포를 할 수 있고, 플랫폼이 실행 중인 팀 AWS
+              계정으로 배포합니다.
+            </p>
+          )}
           <p>
             {ONPREM_ENABLED
               ? 'AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할 위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.'
@@ -155,9 +161,9 @@ export default function Connections({ connections, loadError, onReload, onChange
                           콘솔에서 연결 스택 만들기
                         </a>
                       ) : (
-                        '콘솔 주소를 받지 못했습니다. 다시 저장해 주세요.'
-                      )}{' '}
-                      → 끝나면 "다시 확인"
+                        '콘솔 연결 링크가 아직 준비되지 않았습니다 (서버의 AWS 연결 템플릿 설정 필요).'
+                      )}
+                      {c.setupUrl ? ' → 끝나면 "다시 확인"' : ''}
                     </span>
                   )}
                 </div>

@@ -1,3 +1,4 @@
+import { NEEDS_CONNECTION } from '../api'
 import type { Connection } from '../types'
 
 export type Page = 'new' | 'history' | 'targets'
@@ -49,8 +50,12 @@ export default function Header({ page, onChange, connections, loadFailed }: Prop
           ))}
         </nav>
         <button className="account" onClick={() => onChange('targets')} title="연결 관리">
-          <span className={'dot' + (broken || loadFailed ? ' is-warn' : '')} />
-          {loadFailed ? '연결 정보 조회 실패' : `대상 ${connections.length}곳${broken ? ` · 확인 필요 ${broken}` : ''}`}
+          <span className={'dot' + (NEEDS_CONNECTION && (broken || loadFailed) ? ' is-warn' : '')} />
+          {!NEEDS_CONNECTION
+            ? '배포: 팀 AWS 계정'
+            : loadFailed
+              ? '연결 정보 조회 실패'
+              : `대상 ${connections.length}곳${broken ? ` · 확인 필요 ${broken}` : ''}`}
         </button>
       </div>
     </header>

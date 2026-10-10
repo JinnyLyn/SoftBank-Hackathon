@@ -270,7 +270,8 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
     reason: pick
       ? str(pick[1].variables.reason) || pick[1].summary
       : `월 예산 ${usd(budget)} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 ${usd(planCost(sorted[0]))}입니다. 예산을 늘려 주세요.`,
-    options: [{ connectionId, provider: 'aws', name: aws?.name ?? 'AWS', tiers }],
+    // 개인 계정 연결이 없으면 worker가 쓰는 팀 AWS 계정으로 표시
+    options: [{ connectionId, provider: 'aws', name: aws?.name ?? '팀 AWS 계정', tiers }],
     assumptions: [
       `월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`,
       pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음',

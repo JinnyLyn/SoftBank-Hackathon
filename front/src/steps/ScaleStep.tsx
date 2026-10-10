@@ -2,6 +2,7 @@ import ProviderMark from '../components/ProviderMark'
 import QuickConnect from '../components/QuickConnect'
 import LoadError from '../components/LoadError'
 import { ONPREM_ENABLED } from '../providers'
+import { NEEDS_CONNECTION } from '../api'
 import type { Connection, ExpectedUsers, ScaleInput, TrafficPattern } from '../types'
 
 const USERS: { value: ExpectedUsers; note: string }[] = [
@@ -135,7 +136,16 @@ export default function ScaleStep({
         <p className="hint">몰리는 시간이나 저장하는 데이터 양을 적어 주면 사양을 더 알맞게 고릅니다.</p>
       </div>
 
-      {connectionsError ? (
+      {!NEEDS_CONNECTION ? (
+        <div className="compare-note">
+          <div>
+            <strong>팀 AWS 계정에 배포합니다</strong>
+            <span className="hint">
+              플랫폼이 실행 중인 팀 AWS 계정으로 배포합니다. 개인 AWS 계정 연결은 준비 중입니다.
+            </span>
+          </div>
+        </div>
+      ) : connectionsError ? (
         <LoadError what="연결 목록" message={connectionsError} onRetry={onReloadConnections} />
       ) : usable.length === 0 && !locked ? (
         <QuickConnect connections={connections} onChange={onConnectionsChange} />

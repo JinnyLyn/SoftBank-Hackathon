@@ -751,6 +751,8 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .poll-actions { display: flex; gap: 6px; }
 .fail-note { margin: 10px 0 0; font-size: 13px; color: var(--ink-2); }
 
+.readonly-note { margin-top: 10px; background: var(--sunken); border-radius: 8px; padding: 10px 14px; color: var(--ink-2); font-size: 13px; }
+
 /* ---------- 조회 실패 ---------- */
 .load-error {
   display: flex;
