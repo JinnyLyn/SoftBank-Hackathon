@@ -5,7 +5,7 @@
 소스(zip 또는 GitHub public 저장소)와 사용 규모를 한 화면에서 받음 → 분석·구성 추천·추천 조합 코드까지 미리 생성 → 코드 검토·승인 → 배포.
 코드 검토 단계에서는 AI를 돌리지 않고 앞에서 만든 결과를 바로 보여 줌. 추천과 다른 칸을 고르면 고르는 순간 뒤에서 그 조합 코드를 만듦.
 
-제품 배포 대상은 AWS만이다. 새 배포는 사용자 AWS 연결 없이 운영자가 준비한 AWS(관리형)로 진행한다(mock 포함, `QuickConnect` 제거). "연결 관리" 화면은 운영자가 역할 위임으로 계정을 연결할 때 쓰며 계정 ID·역할 ARN을 보여 준다. 온프레미스 코드는 남아 있지만 범위 밖이다.
+제품 배포 대상은 AWS만이다. 새 배포는 사용자 AWS 연결 없이 운영자가 준비한 AWS(관리형)로 진행한다(mock 포함, `QuickConnect` 제거). "연결 관리" 화면은 운영자가 역할 위임으로 계정을 연결할 때 쓰며 계정 ID·역할 ARN을 보여 준다. 온프레미스는 팀이 확정한 제품 범위가 아니다. 다만 발표자 PC의 로컬 Docker로 올리는 **선택 기능**을 실제 백엔드에 연결해 두었고(아래 "온프레미스(로컬 Docker)"), 기본은 꺼져 있다.
 React + TypeScript + Vite.
 
 ## 도메인 작업의 현재 경계
@@ -28,7 +28,7 @@ npm run build
 
 - **기본은 실제 백엔드.** 백엔드 없이 화면만 볼 때는 `.env` 에 `VITE_USE_MOCK=true` → `src/api/mock.ts` 의 가짜 응답으로 끝까지 돌아감. 이때 화면 상단에 **MOCK** 띠가 뜨고 배포 결과에도 MOCK 표시가 붙음.
   zip 파일 이름이나 저장소 주소에 `fail` 이 들어가면 헬스체크 실패 + AI 진단 화면이 나옴.
-- 기존 배포 대상 화면은 `VITE_PROVIDERS` 로 켜고 끔. 기본은 `aws` 만. `aws,onprem` 코드가 남아 있어도 온프레미스는 현재 제품 범위 밖이다.
+- 배포 대상 화면은 `VITE_PROVIDERS` 로 켜고 끔. 기본은 `aws` 만. `aws,onprem`(또는 `onprem`)은 아래 "온프레미스(로컬 Docker)" 선택 기능을 켠다. 온프레미스는 현재 제품 범위가 아니다.
 - 실제 백엔드: dev 서버가 `/api` 를 `http://127.0.0.1:8000` 으로 넘김(다른 주소면 `API_TARGET` 환경 변수). 같은 출처가 되므로 백엔드 CORS 설정이 필요 없음.
 - 연동 코드는 `src/api/real.ts` 한 파일. 구현된 계약은 [back/API.md](../back/API.md) 기준이고, 화면 타입(`src/types.ts`)으로 바꾸는 일도 여기서만 함. 아래 "도메인"의 제안 API는 서버 계약과 구분한다.
 
@@ -45,6 +45,16 @@ npm run build
 | 배포 진행 | `GET /api/projects/{id}/status` 0.7초 간격 (404는 대기열 대기로 표시) |
 | 배포 이력 | `GET /api/deployments?limit=50` |
 | 사용 규모·월 예산 | ZIP은 업로드 쿼리, GitHub는 등록 본문의 `expected_users`·`traffic_pattern`·`monthly_budget_usd`·`purpose`. 백엔드가 저장하고 AI runner가 분석 결과 `scale` 로 복사해 인프라 worker가 구성·예산 검사에 씀 |
+
+### 온프레미스(로컬 Docker) — 선택 기능
+
+`VITE_PROVIDERS=aws,onprem`(또는 `onprem`만)이면 실제 백엔드 모드(`real.ts`)에서 분석 뒤 **AWS와 온프레미스 계획을 한 비교표에** 보여 준다. 온프레미스는 worker를 `python infra/worker/worker.py --targets aws,local_docker`(또는 `local_docker`)로 실행했을 때만 계획이 생긴다([infra/worker/README.md](../infra/worker/README.md)). 백엔드의 `target`은 `local_docker`이고 화면의 `provider`는 `onprem`이다.
+
+- 비교표의 칸은 계획 하나이고, 연결(`connections`) 기록과 무관하다(고정 id `local-docker`). AWS는 예전과 같다.
+- 승인 대상은 `variables.compose_yaml`(코드 검토 화면의 `docker-compose.yml` 탭)이다. 승인 식별자(`fingerprint`)에 그 SHA-256이 들어 있다. plan 파일 업로드가 없어 `terraform_plan_ready`는 항상 `true`다.
+- 추천: 월 예산 안에 드는 AWS 계획이 있으면 AWS의 추천 안, 없으면 추가 비용이 없는 온프레미스. 한쪽 계획만 먼저 오면 다른 쪽을 최대 90초 더 기다린 뒤 있는 것만으로 진행한다(`OTHER_TARGET_GRACE_MS`). 켜 둔 대상만 기다린다(기본 AWS만이면 예전과 같다).
+- 연결 관리 화면의 온프레미스 "서버 연결"(설치 명령)은 mock에만 있다. 실제 백엔드는 `aws` 연결만 받는다(`CONNECTABLE_PROVIDERS`). `onprem`만 켜면(AWS 없음) 연결 관리 화면은 등록 폼 대신 "배포 위치" 안내만 보여 주고, 도메인 단계는 도메인·HTTPS를 지원하지 않는다는 안내를 먼저 보여 준다(선택은 반영되지 않는다). 헤더·안내 문구도 켜 둔 대상을 따른다.
+- 접속 주소는 `http://localhost:<포트>`다(도메인·HTTPS 없음). 비용 0에는 전기·회선·PC 사용 비용이 들어 있지 않다고 화면에 적는다.
 
 ### 아직 백엔드와 맞춰야 할 것
 

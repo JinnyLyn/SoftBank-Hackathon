@@ -109,7 +109,7 @@ export default function ReviewStep({
           </tr>
           <tr>
             <td>주소</td>
-            <td className="muted mono">{domainDetail(domain)}</td>
+            <td className="muted mono">{domainDetail(domain, isServer)}</td>
             <td className="num">{domain && domain.monthlyUsd > 0 ? usd(domain.monthlyUsd) : '-'}</td>
           </tr>
         </tbody>
@@ -141,7 +141,7 @@ export default function ReviewStep({
             </dd>
           </div>
           <div>
-            <dt>Terraform plan 파일</dt>
+            <dt>{bundle.tool === 'terraform' ? 'Terraform plan 파일' : '승인할 compose 파일'}</dt>
             <dd className={bundle.planInfo.ready ? 'c-add' : 'c-del'}>{bundle.planInfo.ready ? '준비됨' : '아직 없음'}</dd>
           </div>
         </dl>
@@ -181,7 +181,7 @@ export default function ReviewStep({
               : `만들어질 리소스 ${plan.add}개와 월 예상 비용 ${costText(cost)}을 확인했습니다.`}
           <small>
             {isServer
-              ? '승인하면 SSH로 서버에 접속해 docker compose up 을 실행합니다.'
+              ? `승인하면 ${target.name}의 Docker에서 이미지를 빌드하고 docker compose up 을 실행합니다.`
               : `승인하면 ${target.name}에 실제로 리소스가 생기고 비용이 나가기 시작합니다.`}
           </small>
         </span>
@@ -196,7 +196,8 @@ function domainSummary(domain: DomainPlan | null) {
   return domain.mode === 'auto' ? '자동 주소 (플랫폼)' : '보유 도메인'
 }
 
-function domainDetail(domain: DomainPlan | null) {
-  if (!domain || domain.mode === 'none') return 'AWS 기본 주소 (미리보기, 도메인 미연결)'
+function domainDetail(domain: DomainPlan | null, isServer: boolean) {
+  if (!domain || domain.mode === 'none')
+    return isServer ? '이 PC의 로컬 주소 (HTTP, 도메인·HTTPS 없음)' : 'AWS 기본 주소 (미리보기, 도메인 미연결)'
   return `${domain.name ?? '배포 뒤 확정'} (${domain.mode === 'auto' ? '플랫폼 도메인의 자동 주소' : '가지고 있는 도메인 연결'})`
 }

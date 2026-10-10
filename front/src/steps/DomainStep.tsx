@@ -1,3 +1,4 @@
+import { isEnabled } from '../providers'
 import type { DomainChoice, DomainMode } from '../types'
 
 // 소문자 영문·숫자·하이픈, 점으로 나뉜 이름 (예: myapp.com, shop.myapp.co.kr)
@@ -27,6 +28,18 @@ interface Props {
 export default function DomainStep({ choice, locked, onChange }: Props) {
   const name = choice.name
   const valid = domainValid(name)
+
+  // 온프레미스(로컬 Docker)만 켰으면 도메인·HTTPS를 만들 수 없다. 고를 수 없는 선택지를 보여 주지 않고 이유만 알린다
+  // (기본값 auto는 그대로 두지만 백엔드가 도메인 기능이 없어 미리보기 주소로 진행한다)
+  if (!isEnabled('aws'))
+    return (
+      <div className="compare-note">
+        <div>
+          <strong>온프레미스(로컬 Docker)는 도메인·HTTPS를 지원하지 않습니다</strong>
+          <span className="hint">이 PC의 로컬 주소(http://localhost:포트)로만 접속합니다. 도메인은 연결되지 않습니다.</span>
+        </div>
+      </div>
+    )
 
   return (
     <div className="stack">
