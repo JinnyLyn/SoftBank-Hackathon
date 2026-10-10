@@ -35,11 +35,18 @@ locals {
     }
   ]
 
-  # DB 접속 정보는 평문 environment가 아니라 secrets로만 주입한다 (CLAUDE.md 3.2)
-  secrets = var.use_database ? [{
-    name      = "DATABASE_URL"
-    valueFrom = local.database_param_arn
-  }] : []
+  # DB 접속 정보와 토큰 같은 비밀은 평문 environment가 아니라 secrets로만 주입한다 (CLAUDE.md 3.2).
+  # 앞의 것은 앱 전용 DB, 뒤의 것은 secret_parameter_arns(이 배포의 /apps/<id>/secrets/<이름> 파라미터만. ecs.tf의 사전 조건이 강제한다)
+  secrets = concat(
+    var.use_database ? [{
+      name      = "DATABASE_URL"
+      valueFrom = local.database_param_arn
+    }] : [],
+    [for k in sort(keys(var.secret_parameter_arns)) : {
+      name      = k
+      valueFrom = var.secret_parameter_arns[k]
+    }],
+  )
 
   autoscaling_enabled = var.max_tasks > var.min_tasks
 

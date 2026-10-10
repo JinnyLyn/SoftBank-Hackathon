@@ -21,6 +21,7 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 | `modules/ecs-web-app/` | 검증된 모듈. 배포 1건 = 앱 전용 보안 그룹, 로그 그룹, 태스크 정의, 대상 그룹, 전용 포트 리스너, ECS 서비스, 오토스케일링 | 배포 루트가 호출 |
 | `modules/ecs-web-app/app-config.schema.json` | LLM 출력이 따라야 할 JSON 스키마. `variables.tf`의 LLM 입력과 규칙이 같다 | LLM 계층이 3·5단계 출력 검증에 사용 |
 | `deployments/_template/` | 배포 건별 루트 모듈 템플릿 | 플랫폼이 `deployments/<deploy_id>/`로 복사해서 사용 |
+| `platform/` | **플랫폼 자체**(백엔드+프런트)를 같은 모듈로 AWS에 올리는 이미지 정의와 설정. 시연용 서버 실행이며 로그인이 없다. 한계는 [platform/README.md](platform/README.md) | 운영자가 `deploy.sh up --secret`으로 |
 | `connection/` | 사용자 AWS 계정 연결용 CloudFormation 템플릿(`paved-clouds-connection.yaml`). 백엔드의 빠른 생성 링크가 파라미터(`ExternalId`·`PlatformAccountId`·`RoleCallbackUrl`)를 채우고, 템플릿이 읽기 전용 역할을 만든 뒤 계정 ID·역할 ARN을 백엔드 콜백으로 보낸다. 기본 제품 흐름이 아니다 | 운영자가 공개 HTTPS(S3)에 올린 뒤 `AWS_CONNECTION_TEMPLATE_URL`에 지정. 아래 "사용자 AWS 연결" 참고 |
 | `scripts/deploy.sh` | 배포 1건을 만들고(`up`) 바꾸고(`update`) 되돌리고(`rollback`) 지우는(`destroy`) 자동화. 앱별 DB, 실패 분석 정보 수집(`diagnose`) 포함 | 플랫폼 백엔드 또는 담당자가 호출. 아래 "배포 스크립트" 참고 |
 | `scripts/test_infra.py` | 회귀 시험(AWS에 리소스를 만들지 않음). 입력 검증, 계획 내용, 스크립트 함수, 정적 검사 | 인프라를 바꾼 뒤 실행: `python infra/scripts/test_infra.py` |
@@ -170,7 +171,9 @@ bash infra/scripts/deploy.sh destroy  a1b2c3d4     # 앱 삭제. 앱 전용 DB�
 bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 지운다(되돌릴 수 없다)
 ```
 
-`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`. `build --arch`도 같은 값을 받아 계획과 같은 아키텍처로 빌드한다), `--yes`, `--plan-only`.
+`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`. `build --arch`도 같은 값을 받아 계획과 같은 아키텍처로 빌드한다), `--secret 이름`(여러 번 가능), `--yes`, `--plan-only`.
+
+- **`--secret 이름`**: 환경 변수 `<이름>`을 SSM SecureString `/<프로젝트>/apps/<id>/secrets/<이름>`에서 **비밀로** 주입한다(ECS `secrets`. 값은 plan·state·작업 정의에 들어가지 않고 컨테이너가 시작할 때 읽힌다). 파라미터는 운영자가 미리 만들어 두며, `up`이 **존재하는지와 SecureString인지**를 확인한다(값은 읽지 않는다). 모듈은 이 배포의 `/apps/<id>/secrets/<이름>`만 허용하고(다른 앱의 파라미터는 plan에서 막는다) `DATABASE_URL`·`environment`와 이름이 겹치면 막는다. `environment`는 `TOKEN`·`PASSWORD` 같은 이름을 평문으로 받지 않으므로 앱이 이런 비밀(예: 플랫폼 백엔드의 `WORKER_API_TOKEN`)을 받으려면 이 경로를 쓴다. foundation의 실행 역할이 이미 `/apps/*`를 읽을 수 있어 foundation 변경은 필요 없다. 입력 파일의 `platform.secret_parameter_arns`에 저장되므로 `update`·`rollback`에서도 유지된다. 예: [platform/](platform/README.md).
 
 - `app.json`은 `app.auto.tfvars.json`의 `app` 값만 담는다(예: `{"container_port": 8000, "health_check_path": "/health", "use_database": true, ...}`).
 - `--plan-only`는 계획을 `plan.json`으로 저장하고 멈춘다. 승인 후 `apply`가 **저장된 계획만** 실행한다. 승인 뒤에 새 계획을 만들지 않는다. `--plan-only` 없이 실행하면 계획을 보여 주고 `yes`를 입력받는다.
