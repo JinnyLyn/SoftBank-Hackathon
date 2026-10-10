@@ -47,6 +47,18 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 `DATABASE_URL`은 `mysql://user:password@host:3306/database` 또는 `mysql+pymysql://...` 형식입니다. 비밀번호에 `@`, `:`, `/`, `%` 등이 있으면 URL 인코딩해야 합니다. AWS RDS 연결에서 TLS CA 검증이 필요하면 `DB_SSL_CA`에 AWS RDS CA bundle 경로를 설정합니다. 앱 시작 시 테이블을 자동 생성하지 않습니다. 마이그레이션은 별도 명령으로 실행하고 `schema_migrations`에 적용 기록을 남깁니다.
 
+### 로컬 MySQL 통합 검사
+
+마이그레이션 적용 후 실제 로컬 MySQL에 연결되는 worker 연결 API 통합 검사는 다음처럼 실행합니다. 테스트는 `DATABASE_URL`이 loopback 주소인지 먼저 확인하고, 합성 연결 두 건을 만든 뒤 삭제합니다. AWS에는 요청하지 않습니다.
+
+```powershell
+$env:DATABASE_URL = "mysql://user:password@127.0.0.1:3307/paved_clouds"
+python -m app.cli migrate
+python tests/integration_connections.py
+```
+
+검사는 DB readiness, worker 인증, 대기 연결 조회, IAM ARN 계정 일치 검증, 완료 동시 요청·멱등 재시도, 실패 메시지 마스킹을 확인합니다. 실제 서비스 URL은 loopback 주소로 제한되며 AWS에는 요청하지 않습니다.
+
 ## 구현된 API
 
 모든 API 응답과 오류 본문은 JSON입니다. 시간은 UTC 기반 MySQL timestamp로 저장합니다.
@@ -88,10 +100,11 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 첫 AWS 배포가 실패하면 이전 `healthy` 배포가 없으므로 롤백을 제공하지 않습니다. 프런트는 `rollback-candidate` 응답의 `first_deployment` 또는 `no_previous_healthy` 이유를 표시하고, AI 실패 원인 분석·수정안 → 새 계획·비용·plan 확인 → 사용자 승인 → 재배포 흐름으로 진행해야 합니다. 이후 실패에서 사용자가 롤백을 선택하면 `rollback` endpoint가 새 `awaiting_approval` rollback plan을 만듭니다. worker는 그 설정으로 **새 Terraform plan과 diff 요약**을 생성·저장하고, 사용자는 새 fingerprint·digest·diff를 확인한 뒤 기존 plan 승인 API로 승인합니다. 승인 전 새 rollback plan은 대기열에 등록할 수 없으며, 자동 롤백은 수행하지 않습니다.
 
-연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. 연결 상태는 검증된 AWS 계정 확인 주체가 `POST /api/worker/connections/{id}/complete`로 계정 ID를 보고할 때 `connected`가 됩니다. `WORKER_API_TOKEN` 없이 연결 완료를 호출할 수 없습니다.
+연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. `PLATFORM_AWS_ACCOUNT_ID`는 worker가 사용하는 운영자 계정 ID이며 사용자 계정의 역할이 신뢰할 플랫폼 계정입니다. `AWS_REGION`은 해당 연결을 위한 콘솔 리전으로, 현재 `.env`에 `sa-east-1`을 설정했습니다. 연결 생성 시 링크에 `param_PlatformAccountId`와 연결별 `param_ExternalId`가 포함됩니다. worker는 `GET /api/worker/connections/pending`으로 대기 항목을 읽고, 실패 시 `POST /api/worker/connections/{id}/fail`, 성공 시 계정 ID·IAM 역할 ARN을 `POST /api/worker/connections/{id}/complete`에 보고합니다. 백엔드는 IAM role ARN 형식과 ARN 내부 계정 ID 일치를 검사해 `aws_account_id`, `role_arn`에 저장합니다. 이 검사는 AWS 역할의 실제 존재·권한을 확인하지 않으므로 worker가 AWS에서 역할 검증을 수행해야 합니다. 모든 worker 연결 API에는 `WORKER_API_TOKEN`이 필요합니다.
 
 ## DB 테이블
 
+- `connections`: AWS 연결 요청·상태, 외부 ID, 연결 완료 시 계정 ID와 IAM role ARN
 - `projects`: ZIP/GitHub 출처, 원본 경로·크기·SHA-256, 사용자 규모·접속 패턴·월 예산·서비스 설명(선택)
 - `analyses`: 분석 스키마 버전, 원본 해시, JSON 결과
 - `deployment_plans`: 대상, 모듈 변수, 비용 추정치, plan digest, 승인 fingerprint와 시각

@@ -196,7 +196,15 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/connections/{connection_id}/check`: 저장된 연결 상태 조회. 현재 AWS 자격 증명을 직접 호출해 실시간 검증하는 endpoint는 아닙니다.
 - `DELETE /api/connections/{connection_id}`: 연결 삭제
 
-연결 생성 결과에는 `status: "pending"`과 설정용 `setupUrl`이 포함될 수 있습니다. CloudFormation 템플릿 URL 설정과 연결 완료 callback은 서버 설정/worker 연동이 필요합니다. API가 프런트 요청만으로 AWS 계정을 검증하지는 않습니다.
+연결 생성 결과에는 `status: "pending"`과 설정용 `setupUrl`이 포함될 수 있습니다. 공개 HTTPS 템플릿 주소는 `AWS_CONNECTION_TEMPLATE_URL`, worker의 운영자 계정 ID는 `PLATFORM_AWS_ACCOUNT_ID`, CloudFormation 콘솔 리전은 `AWS_REGION` 환경 변수로 받습니다. 현재 로컬 `back/.env`에는 운영자 계정 ID와 리전 `sa-east-1`이 설정되어 있습니다. 해당 `.env`는 Git에서 제외됩니다. 링크에는 `param_PlatformAccountId`와 연결별 `param_ExternalId`를 추가합니다.
+
+worker 경로는 다음과 같습니다.
+
+- `GET /api/worker/connections/pending`: 인증된 worker가 대기 연결 목록(ID, `external_id`, 입력 필드)을 조회합니다.
+- `POST /api/worker/connections/{connection_id}/fail`: `{ "error": "실패 원인" }`으로 실패를 보고합니다. 오류는 저장 전에 민감값을 마스킹하며 같은 실패 재시도는 멱등 처리합니다.
+- `POST /api/worker/connections/{connection_id}/complete`: `{ "account_id": "<사용자 AWS 계정 ID>", "role_arn": "arn:aws:iam::<같은 사용자 계정 ID>:role/PavedCloudsReadOnlyRole" }` 형식으로 완료를 보고합니다. 계정 ID와 IAM role ARN의 계정 부분이 일치해야 하며 값은 `connections.aws_account_id`, `connections.role_arn`에 저장됩니다. 같은 완료 재시도는 멱등 처리합니다. `PLATFORM_AWS_ACCOUNT_ID`는 이와 별개로 사용자 역할의 trust policy가 신뢰할 worker 운영 계정입니다.
+
+이 API는 ARN 구문과 계정 ID만 대조하며 AWS STS로 역할 존재나 실제 권한을 검증하지 않습니다. worker가 AssumeRole/GetCallerIdentity 등 AWS 검증에 성공한 뒤 보고해야 합니다. 템플릿이 공개 HTTPS 주소에 올라가 `AWS_CONNECTION_TEMPLATE_URL`이 설정되기 전에는 setup 링크가 만들어지지 않습니다.
 
 ## Worker 전용 API
 
@@ -208,6 +216,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/worker/deployments/claim`: 대기 중인 AWS 일반 배포 또는 사용자 승인 롤백 작업 하나를 가져옵니다. 롤백 작업에는 `operation_type: "rollback"`, `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다. 없으면 `{ "job": null }`.
 - `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 일반 배포와 롤백 모두 `queued → provisioning → deploying → healthy` 또는 `failed` 흐름을 사용합니다. 현재 상태와 같은 상태를 보내면 상태와 URL은 그대로 두고 로그 이벤트만 추가합니다. 다른 상태에서 `healthy`로 전이할 때는 HTTP(S) `url`이 필요합니다.
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.
+- `GET /api/worker/connections/pending`: worker 인증 후 처리할 대기 연결 배열을 반환합니다.
+- `POST /api/worker/connections/{connection_id}/fail`: worker 실패 상태와 마스킹된 오류를 저장합니다.
 
 worker 이벤트의 `message`와 `details`는 DB 저장 전에 비밀값을 마스킹합니다. `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey`, `SessionToken`처럼 snake_case, kebab-case, camelCase/PascalCase로 표기된 민감 키를 처리하며, 이벤트 및 프로젝트 상태 로그를 조회할 때도 기존 저장 데이터의 값이 다시 노출되지 않도록 마스킹합니다.
 

@@ -28,6 +28,9 @@ from app.schemas import (
     ApproveIn,
     ConnectionIn,
     ConnectionOut,
+    ConnectionCompleteIn,
+    ConnectionFailIn,
+    PendingConnectionOut,
     DeploymentCreateIn,
     DeploymentDetailOut,
     DeploymentEventOut,
@@ -130,6 +133,26 @@ def list_connections() -> list[ConnectionOut]:
         return [_connection_out(row) for row in cursor.fetchall()]
 
 
+@app.get("/api/worker/connections/pending", response_model=list[PendingConnectionOut], tags=["worker"])
+def list_pending_connections(
+    x_worker_token: str | None = Header(default=None),
+) -> list[PendingConnectionOut]:
+    _require_worker(x_worker_token)
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT id, provider, name, external_id, fields, created_at "
+            "FROM connections WHERE status = 'pending' ORDER BY created_at, id"
+        )
+        return [
+            PendingConnectionOut(
+                id=UUID(row["id"]), provider=row["provider"], name=row["name"],
+                external_id=row["external_id"], fields=_json_value(row["fields"]),
+                created_at=_as_utc(row["created_at"]),
+            )
+            for row in cursor.fetchall()
+        ]
+
+
 @app.post("/api/connections", response_model=ConnectionOut, status_code=status.HTTP_201_CREATED, tags=["connections"])
 def create_connection(body: ConnectionIn) -> ConnectionOut:
     clean_name = body.name.strip()
@@ -163,8 +186,8 @@ def update_connection(connection_id: UUID, body: ConnectionIn) -> ConnectionOut:
         if row is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "연결을 찾을 수 없습니다.")
         external_id = row["external_id"]
-        setup_url = row["setup_url"] or _aws_setup_url(external_id)
         status_value = "connected" if row["status"] == "connected" else "pending"
+        setup_url = row["setup_url"] if status_value == "connected" else _aws_setup_url(external_id)
         detail = row["detail"] if status_value == "connected" else "AWS CloudFormation 연결을 기다리는 중입니다."
         cursor.execute(
             """UPDATE connections SET name = %s, status = %s, detail = %s, error = NULL,
@@ -196,24 +219,56 @@ def delete_connection(connection_id: UUID) -> None:
         connection.commit()
 
 
-@app.post("/api/worker/connections/{connection_id}/complete", tags=["worker"])
-def complete_connection(
+@app.post("/api/worker/connections/{connection_id}/fail", response_model=ConnectionOut, tags=["worker"])
+def fail_connection(
     connection_id: UUID,
-    body: dict[str, str],
+    body: ConnectionFailIn,
     x_worker_token: str | None = Header(default=None),
 ) -> ConnectionOut:
     _require_worker(x_worker_token)
-    account_id = body.get("account_id", "")
-    if not re.fullmatch(r"\d{12}", account_id):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "유효한 AWS 계정 ID가 필요합니다.")
+    safe_error = _redact(body.error)[:2000]
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute(
-            """UPDATE connections SET status = 'connected', detail = %s, setup_url = NULL, error = NULL
-               WHERE id = %s AND provider = 'aws'""",
-            (f"AWS 계정 {account_id}", str(connection_id)),
-        )
-        if cursor.rowcount != 1:
+        cursor.execute("SELECT * FROM connections WHERE id = %s FOR UPDATE", (str(connection_id),))
+        row = cursor.fetchone()
+        if row is None or row["provider"] != "aws":
             raise HTTPException(status.HTTP_404_NOT_FOUND, "AWS 연결을 찾을 수 없습니다.")
+        if row["status"] == "error" and row.get("error") == safe_error:
+            return _connection_out(row)
+        if row["status"] != "pending":
+            raise HTTPException(status.HTTP_409_CONFLICT, "대기 중인 연결만 실패 처리할 수 있습니다.")
+        cursor.execute(
+            "UPDATE connections SET status = 'error', detail = %s, error = %s WHERE id = %s",
+            ("AWS 역할 연결 확인에 실패했습니다.", safe_error, str(connection_id)),
+        )
+        connection.commit()
+        cursor.execute("SELECT * FROM connections WHERE id = %s", (str(connection_id),))
+        updated = cursor.fetchone()
+    return _connection_out(updated)
+
+
+@app.post("/api/worker/connections/{connection_id}/complete", response_model=ConnectionOut, tags=["worker"])
+def complete_connection(
+    connection_id: UUID,
+    body: ConnectionCompleteIn,
+    x_worker_token: str | None = Header(default=None),
+) -> ConnectionOut:
+    _require_worker(x_worker_token)
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM connections WHERE id = %s FOR UPDATE", (str(connection_id),))
+        row = cursor.fetchone()
+        if row is None or row["provider"] != "aws":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "AWS 연결을 찾을 수 없습니다.")
+        if row["status"] == "connected":
+            if row.get("aws_account_id") == body.account_id and row.get("role_arn") == body.role_arn:
+                return _connection_out(row)
+            raise HTTPException(status.HTTP_409_CONFLICT, "이미 다른 AWS 역할로 연결된 항목입니다.")
+        if row["status"] != "pending":
+            raise HTTPException(status.HTTP_409_CONFLICT, "대기 중인 연결만 완료 처리할 수 있습니다.")
+        cursor.execute(
+            """UPDATE connections SET status = 'connected', detail = %s, setup_url = NULL,
+                      error = NULL, aws_account_id = %s, role_arn = %s WHERE id = %s""",
+            (f"AWS 계정 {body.account_id}", body.account_id, body.role_arn, str(connection_id)),
+        )
         connection.commit()
         cursor.execute("SELECT * FROM connections WHERE id = %s", (str(connection_id),))
         row = cursor.fetchone()
@@ -1291,6 +1346,7 @@ def _connection_out(row: dict[str, Any]) -> ConnectionOut:
         detail=row["detail"], error=row.get("error"), setupUrl=row.get("setup_url"),
         checkedAt=_as_utc(row.get("updated_at") or row["created_at"]),
         fields=_json_value(row["fields"]),
+        accountId=row.get("aws_account_id"), roleArn=row.get("role_arn"),
     )
 
 
@@ -1301,12 +1357,21 @@ def _aws_setup_url(external_id: str) -> str | None:
     parsed = urlsplit(template_url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise ConfigurationError("AWS_CONNECTION_TEMPLATE_URL must be a credential-free HTTPS URL")
-    params = urlencode({
+    params = {
         "templateURL": template_url,
         "stackName": "PavedCloudsConnection",
         "param_ExternalId": external_id,
-    })
-    return f"https://console.aws.amazon.com/cloudformation/home?region=ap-northeast-2#/stacks/create/review?{params}"
+    }
+    platform_account_id = os.getenv("PLATFORM_AWS_ACCOUNT_ID", "").strip()
+    if platform_account_id:
+        if not re.fullmatch(r"\d{12}", platform_account_id):
+            raise ConfigurationError("PLATFORM_AWS_ACCOUNT_ID must be a 12-digit AWS account ID")
+        params["param_PlatformAccountId"] = platform_account_id
+    query = urlencode(params)
+    region = os.getenv("AWS_REGION", "sa-east-1").strip()
+    if not re.fullmatch(r"[a-z0-9-]+-\d", region):
+        raise ConfigurationError("AWS_REGION must be an AWS region name")
+    return f"https://console.aws.amazon.com/cloudformation/home?region={region}#/stacks/create/review?{query}"
 
 
 def _analysis_out(row: dict[str, Any]) -> AnalysisOut:
