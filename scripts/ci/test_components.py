@@ -88,6 +88,15 @@ class CoverageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "back:.*누락"):
             inspect(self.root)
 
+    def test_backend_database_contract_files_cannot_disappear(self):
+        for filename in ("Dockerfile", "app/cli.py", "app/migrations.py",
+                         "migrations/004_deployment_rollbacks.sql", "migrations/005_rollback_plan_approval.sql"):
+            with self.subTest(filename=filename):
+                self.add_component("back")
+                (self.root / "back" / filename).unlink()
+                with self.assertRaisesRegex(ValueError, "back:.*누락"):
+                    inspect(self.root)
+
     def test_backend_activates_without_frontend_or_infrastructure(self):
         self.add_component("back")
         present = inspect(self.root)
@@ -95,7 +104,7 @@ class CoverageTests(unittest.TestCase):
         self.assertFalse(present["front"])
         self.assertFalse(present["infra"])
 
-    def test_backend_smoke_success_does_not_claim_database_integration(self):
+    def test_backend_success_describes_database_scope_without_claiming_deployment(self):
         needs = {key: {"result": "skipped"} for key in CONTRACTS}
         needs["sample_front"]["result"] = "success"
         needs["back"] = {"result": "success"}
@@ -105,7 +114,8 @@ class CoverageTests(unittest.TestCase):
         }
         failed, summary = report(needs)
         self.assertFalse(failed)
-        self.assertIn("DB 연결·마이그레이션·프런트 연동은 미검증", summary)
+        self.assertIn("MySQL 8.4·마이그레이션 재실행·롤백 API 계약", summary)
+        self.assertIn("프런트·LLM·실제 AWS 배포는 미검증", summary)
         self.assertIn("전체 플랫폼 통합: 미검증", summary)
 
     def test_aggregate_propagates_every_unexpected_result(self):
