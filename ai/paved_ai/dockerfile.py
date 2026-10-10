@@ -65,7 +65,7 @@ def _header(framework: str, based_on: List[str]) -> List[str]:
     return [
         f"# Paved Clouds가 코드를 보고 만든 Dockerfile 초안입니다 ({framework}).",
         "# 근거: " + "; ".join(based_on),
-        "# 저장소 루트에 Dockerfile 로 저장하고 다시 올리면 이 파일로 빌드합니다. 필요하면 고쳐서 쓰세요.",
+        "# 승인하면 이 초안으로 빌드합니다(소스는 바꾸지 않음). 고쳐 쓰려면 저장소 루트에 Dockerfile 로 넣고 다시 올리세요.",
     ]
 
 
