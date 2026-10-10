@@ -61,7 +61,7 @@ _SECRET_KEY = re.compile(
     r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)"
 )
 _SECRET_VALUE = re.compile(
-    r"(?i)\b((?:[A-Z0-9]+[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-][A-Z0-9]+)*)(\s*[:=]\s*)([^\s,;]+)"
+    r"""(?ix)(?<![A-Z0-9])(?P<key_quote>["']?)(?P<key>(?:[A-Z0-9]+[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-][A-Z0-9]+)*)(?P=key_quote)(?P<separator>\s*[:=]\s*)(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"""
 )
 _CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -601,39 +601,60 @@ def project_deployment_status(project_id: UUID) -> FrontDeployStatus:
 def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_worker(x_worker_token)
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute(
-            """SELECT d.id AS deployment_id, d.status, d.target, d.plan_id, d.project_id,
-                      p.module_id, p.variables, p.summary, p.cost_estimate, p.terraform_plan_sha256,
-                      p.terraform_plan_path,
-                      pr.source_path, pr.source_filename, pr.source_sha256
-               FROM deployments d
-               JOIN deployment_plans p ON p.id = d.plan_id
-               JOIN projects pr ON pr.id = d.project_id
-               WHERE d.status = 'queued' AND d.target = 'aws' AND p.target = 'aws'
-               ORDER BY d.created_at, d.id
-               LIMIT 1 FOR UPDATE SKIP LOCKED"""
-        )
-        job = cursor.fetchone()
-        if job is None:
-            connection.rollback()
-            return {"job": None}
-        if job["target"] == "aws" and not _terraform_plan_is_valid(job):
-            connection.rollback()
-            raise HTTPException(status.HTTP_409_CONFLICT, "대기 작업의 Terraform plan 검증에 실패했습니다.")
-        cursor.execute("UPDATE deployments SET status = 'provisioning' WHERE id = %s AND status = 'queued'", (job["deployment_id"],))
-        _insert_event(
-            cursor,
-            UUID(job["deployment_id"]),
-            "info",
-            "provisioning",
-            "배포 작업자가 실행을 시작했습니다.",
-            None,
-        )
-        connection.commit()
-        job["status"] = "provisioning"
-        job["variables"] = _json_value(job["variables"])
-        job["cost_estimate"] = _json_value(job["cost_estimate"])
-    return {"job": _json_safe(job)}
+        while True:
+            cursor.execute(
+                """SELECT d.id AS deployment_id, d.status, d.target, d.plan_id, d.project_id,
+                          p.module_id, p.variables, p.summary, p.cost_estimate, p.terraform_plan_sha256,
+                          p.terraform_plan_path,
+                          pr.source_path, pr.source_filename, pr.source_sha256
+                   FROM deployments d
+                   JOIN deployment_plans p ON p.id = d.plan_id
+                   JOIN projects pr ON pr.id = d.project_id
+                   WHERE d.status = 'queued' AND d.target = 'aws' AND p.target = 'aws'
+                   ORDER BY d.created_at, d.id
+                   LIMIT 1 FOR UPDATE SKIP LOCKED"""
+            )
+            job = cursor.fetchone()
+            if job is None:
+                connection.rollback()
+                return {"job": None}
+            if job["target"] == "aws" and not _terraform_plan_is_valid(job):
+                failure_message = "대기 작업의 Terraform plan 파일이 없거나 SHA-256 검증에 실패했습니다."
+                cursor.execute(
+                    "UPDATE deployments SET status = 'failed', url = NULL WHERE id = %s AND status = 'queued'",
+                    (job["deployment_id"],),
+                )
+                if cursor.rowcount == 1:
+                    _insert_event(
+                        cursor,
+                        UUID(job["deployment_id"]),
+                        "error",
+                        "terraform_plan_validation_failed",
+                        failure_message,
+                        None,
+                    )
+                    connection.commit()
+                else:
+                    connection.rollback()
+                # Quarantine the bad job and keep looking so it cannot block later queued work.
+                continue
+            cursor.execute(
+                "UPDATE deployments SET status = 'provisioning' WHERE id = %s AND status = 'queued'",
+                (job["deployment_id"],),
+            )
+            _insert_event(
+                cursor,
+                UUID(job["deployment_id"]),
+                "info",
+                "provisioning",
+                "배포 작업자가 실행을 시작했습니다.",
+                None,
+            )
+            connection.commit()
+            job["status"] = "provisioning"
+            job["variables"] = _json_value(job["variables"])
+            job["cost_estimate"] = _json_value(job["cost_estimate"])
+            return {"job": _json_safe(job)}
 
 
 @app.post("/api/worker/plans/{plan_id}/terraform-plan", tags=["worker"])
@@ -668,10 +689,27 @@ async def upload_terraform_plan(
             cursor.execute(
                 """UPDATE deployment_plans SET terraform_plan_path = %s
                    WHERE id = %s AND target = 'aws' AND status = 'awaiting_approval'
-                     AND terraform_plan_sha256 = %s""",
-                (str(stored.path), str(plan_id), stored.sha256),
+                     AND terraform_plan_sha256 = %s AND terraform_plan_path <=> %s""",
+                (str(stored.path), str(plan_id), stored.sha256, plan["terraform_plan_path"]),
             )
             if cursor.rowcount != 1:
+                cursor.execute("SELECT * FROM deployment_plans WHERE id = %s FOR UPDATE", (str(plan_id),))
+                current = cursor.fetchone()
+                if (
+                    current is not None
+                    and current["target"] == "aws"
+                    and current["status"] == "awaiting_approval"
+                    and current["terraform_plan_sha256"] == stored.sha256
+                    and _terraform_plan_is_valid(current)
+                ):
+                    connection.rollback()
+                    stored.path.unlink(missing_ok=True)
+                    return {
+                        "plan_id": str(plan_id),
+                        "sha256": stored.sha256,
+                        "ready": True,
+                        "reused": True,
+                    }
                 connection.rollback()
                 raise HTTPException(status.HTTP_409_CONFLICT, "plan 저장 중 계획 상태가 바뀌었습니다.")
             connection.commit()
@@ -705,15 +743,19 @@ def record_worker_event(
             "healthy": set(),
             "rolled_back": set(),
         }
-        if body.status not in allowed[current["status"]]:
+        same_status = body.status == current["status"]
+        if not same_status and body.status not in allowed[current["status"]]:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 f"현재 상태({current['status']})에서 {body.status} 상태로 변경할 수 없습니다.",
             )
-        cursor.execute(
-            """UPDATE deployments SET status = %s, url = %s WHERE id = %s""",
-            (body.status, body.url if body.status == "healthy" else None, str(deployment_id)),
-        )
+        if body.status == "healthy" and not same_status and not body.url:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "healthy 상태로 변경하려면 url이 필요합니다.")
+        if not same_status:
+            cursor.execute(
+                """UPDATE deployments SET status = %s, url = %s WHERE id = %s""",
+                (body.status, body.url if body.status == "healthy" else None, str(deployment_id)),
+            )
         _insert_event(
             cursor,
             deployment_id,
@@ -788,7 +830,14 @@ def _redact(text: str) -> str:
     text = _CREDENTIAL_URL.sub(lambda match: f"{match.group(1)}://[REDACTED]@", text)
     text = _BEARER.sub("Bearer [REDACTED]", text)
     text = _AWS_ACCESS_KEY.sub("[REDACTED_AWS_ACCESS_KEY]", text)
-    return _SECRET_VALUE.sub(lambda match: f"{match.group(1)}{match.group(2)}[REDACTED]", text)
+
+    def replace_secret(match: re.Match[str]) -> str:
+        value = match.group("value")
+        quote = value[0] if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0] else ""
+        redacted = f"{quote}[REDACTED]{quote}" if quote else "[REDACTED]"
+        return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('separator')}{redacted}"
+
+    return _SECRET_VALUE.sub(replace_secret, text)
 
 
 def _redact_tree(value: Any) -> Any:

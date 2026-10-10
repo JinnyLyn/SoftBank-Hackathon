@@ -12,7 +12,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException, status
 
@@ -153,7 +153,9 @@ async def save_terraform_plan(
     chunks: AsyncIterator[bytes], plan_id: UUID, expected_sha256: str
 ) -> StoredUpload:
     directory = plan_artifact_directory()
-    final_path = directory / f"{plan_id}.tfplan"
+    # A request owns its own immutable artifact path. Concurrent failed requests
+    # must never unlink another request's successfully committed plan.
+    final_path = directory / f"{plan_id}-{uuid4().hex}.tfplan"
     digest = hashlib.sha256()
     size = 0
     file_descriptor, temporary_name = tempfile.mkstemp(prefix=f"{plan_id}-", suffix=".part", dir=directory)

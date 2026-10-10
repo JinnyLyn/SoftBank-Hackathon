@@ -87,7 +87,7 @@ class AnalysisOut(APIModel):
 
 class CostEstimate(APIModel):
     amount: Decimal = Field(ge=0, max_digits=12, decimal_places=4)
-    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    currency: Literal["USD"]
     period: Literal["month"] = "month"
     pricing_as_of: str = Field(min_length=4, max_length=32)
 
@@ -184,8 +184,6 @@ class WorkerEventIn(APIModel):
                 raise ValueError("event details must be valid JSON") from exc
             if len(encoded_details) > 32 * 1024:
                 raise ValueError("event details must be at most 32 KiB")
-        if self.status == "healthy" and not self.url:
-            raise ValueError("url is required when status is healthy")
         if self.url:
             parsed = urlsplit(self.url)
             if (

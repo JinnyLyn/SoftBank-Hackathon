@@ -107,6 +107,8 @@ LLM 분석 요청 자체는 이 API가 수행하지 않습니다. 분석 담당 
 
 AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니다. 응답에는 서버가 만든 `fingerprint`, `status: "awaiting_approval"`, `terraform_plan_ready` 등이 포함됩니다. 이 fingerprint는 사용자가 승인하는 계획 내용의 식별자이므로 프런트가 임의로 계산하거나 바꾸면 안 됩니다.
 
+현재 비용 추정 통화는 `USD`만 허용합니다. 프런트 이력의 `monthlyUsd` 필드는 이 금액을 그대로 표시합니다.
+
 - `GET /api/projects/{project_id}/plans`: 프로젝트 계획 목록
 - `GET /api/plans/{plan_id}`: 계획 상세와 fingerprint
 
@@ -159,10 +161,12 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 
 - `POST /api/worker/plans/{plan_id}/terraform-plan`: `Content-Type: application/octet-stream`으로 Terraform binary plan 업로드. 서버가 SHA-256을 확인합니다.
 - `POST /api/worker/deployments/claim`: 대기 중인 AWS 작업 하나를 가져옵니다. 없으면 `{ "job": null }`.
-- `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 허용되는 진행은 `queued → provisioning → deploying → healthy`이며 실패/롤백 상태 전이도 제한적으로 허용합니다. `healthy` 상태에는 HTTP(S) `url`이 필요합니다.
+- `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 허용되는 진행은 `queued → provisioning → deploying → healthy`이며 실패/롤백 상태 전이도 제한적으로 허용합니다. 현재 상태와 같은 상태를 보내면 상태와 URL은 그대로 두고 로그 이벤트만 추가합니다. 다른 상태에서 `healthy`로 전이할 때는 HTTP(S) `url`이 필요합니다.
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.
 
 현재 API는 Terraform, Docker 또는 AWS 명령을 직접 실행하지 않습니다. 실제 worker 구현과 AWS 배포 검증은 별도 작업입니다.
+
+대기열에서 가져온 작업의 Terraform plan 파일이 없거나 해시가 맞지 않으면 해당 배포를 `failed`로 바꾸고 오류 이벤트를 남긴 뒤, 다음 대기 작업을 계속 찾습니다. 하나의 손상된 작업이 나머지 작업을 막지 않도록 처리합니다.
 
 ## 공통 오류 예시
 
