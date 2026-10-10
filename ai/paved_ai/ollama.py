@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 DEFAULT_BASE_URL = "https://ollama.com"
-DEFAULT_MODEL = "glm-5.3"
+# 10/11 비교(시험 앱 2개 × 3회, 캐시 끔): gemma4:31b 중간값 1.2초·6/6로 가장 빠름 (glm-5.3 5.6초·6/6)
+DEFAULT_MODEL = "gemma4:31b"
 
 
 class OllamaError(Exception):

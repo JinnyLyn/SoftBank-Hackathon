@@ -123,7 +123,7 @@ class ProviderChoiceTests(unittest.TestCase):
     def test_ollama_first_then_anthropic(self):
         client, model = self.pick({"OLLAMA_API_KEY": "x", "ANTHROPIC_API_KEY": "y"})
         self.assertIsInstance(client, OllamaClient)
-        self.assertEqual(model, "glm-5.3")
+        self.assertEqual(model, "gemma4:31b")
         self.assertEqual(self.pick({}), (None, None))
         client, _ = self.pick({"PAVED_AI_PROVIDER": "ollama"})
         self.assertIsNone(client, "Ollama를 고르고 키가 없으면 규칙 분석만")

@@ -7,7 +7,7 @@
 - 금액·구성 단계는 묻지 않는다 (인프라 worker의 cost.py가 계산).
 
 client를 밖에서 넘겨받으므로 테스트는 가짜 client로 돈다.
-- OllamaClient(ollama.py, 표준 라이브러리): 기본. Ollama 클라우드의 glm-5.3
+- OllamaClient(ollama.py, 표준 라이브러리): 기본. Ollama 클라우드의 gemma4:31b
 - Anthropic client(SDK): 실제로 부를 때만 SDK가 필요
 """
 

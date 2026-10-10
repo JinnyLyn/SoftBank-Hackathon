@@ -70,9 +70,10 @@ LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 
 | 항목 | 값 |
 |---|---|
 | 묻는 것 | `unresolved` 중 `container_port`, `health_check_path`, `dockerfile`, `framework` 만. 규칙이 찾은 값은 덮어쓰지 않음 |
-| 기본 | Ollama 클라우드 `glm-5.3` (`ollama.py`, 표준 라이브러리로 `POST https://ollama.com/api/chat`). `OLLAMA_API_KEY` 가 있으면 이것을 씀 |
+| 기본 | Ollama 클라우드 `gemma4:31b` (`ollama.py`, 표준 라이브러리로 `POST https://ollama.com/api/chat`). `OLLAMA_API_KEY` 가 있으면 이것을 씀 |
 | 대안 | Anthropic `claude-opus-5-5`, effort `medium`, SDK 필요. `PAVED_AI_PROVIDER=anthropic` 이거나 Ollama 키가 없을 때 |
-| 모델 변경 | `PAVED_AI_MODEL` 또는 `--model` (예: `glm-5.3-flash`) |
+| 모델 변경 | `PAVED_AI_MODEL` 또는 `--model` (예: `glm-5.3`) |
+| 모델 비교 (10/11) | 시험 앱 2개(숨은 포트 Flask·설정 파일 포트 Express) × 3회, 캐시 끔. 중간값: gemma4:31b 1.2초, deepseek-v4.1-flash 2.1초, kimi-k2.7-code 5.0초, glm-5.3 5.6초, kimi-k3 8.3초, deepseek-v4-pro:0813 8.5초. 모두 정답 6/6 → 가장 빠른 gemma4:31b 를 기본으로 |
 | 출력 | JSON 스키마 (`answers`, `notes`). Ollama는 `format` 에 스키마를 주지만 강제되지 않아(코드 블록으로 감싸거나 필드를 빼먹음) 코드 블록을 벗기고 필드가 빠진 답은 버림. Anthropic은 `output_config.format` 으로 강제, 거절 시 `fallbacks: "default"` |
 | 검증 | 근거 파일·줄이 실제로 있고 그 줄에 값이 들어 있어야 받아들임. 아니면 버리고 `unresolved` 유지 |
 | 비밀값 | 보내기 직전에 다시 가림. 업로드 코드 속 문장은 지시가 아니라 데이터라고 프롬프트에 밝힘 |
