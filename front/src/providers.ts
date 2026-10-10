@@ -50,7 +50,7 @@ const ALL_PROVIDERS: Provider[] = ['aws', 'onprem']
 
 /**
  * 화면에 보일 배포 대상 종류. `.env` 의 VITE_PROVIDERS=aws,onprem 처럼 지정.
- * 지정하지 않으면 AWS만 (온프레미스 백엔드가 준비되면 onprem을 추가)
+ * 지정하지 않으면 AWS만. onprem은 worker를 `--targets aws,local_docker`로 실행했을 때(발표자 PC의 로컬 Docker 배포) 추가
  */
 export const ENABLED_PROVIDERS: Provider[] = (() => {
   const raw = String(import.meta.env.VITE_PROVIDERS ?? 'aws')
@@ -60,6 +60,14 @@ export const ENABLED_PROVIDERS: Provider[] = (() => {
 
 export const isEnabled = (p: Provider) => ENABLED_PROVIDERS.includes(p)
 export const ONPREM_ENABLED = isEnabled('onprem')
+
+/**
+ * 연결 관리 화면에서 새로 등록할 수 있는 종류. 온프레미스 "서버 연결"(설치 명령)은 mock에만 있다.
+ * 실제 백엔드의 온프레미스 배포 대상은 연결 없이 worker가 실행되는 PC의 로컬 Docker라서 연결 화면과 무관하다(백엔드는 aws 연결만 받음)
+ */
+export const CONNECTABLE_PROVIDERS: Provider[] = ENABLED_PROVIDERS.filter(
+  (p) => p === 'aws' || import.meta.env.VITE_USE_MOCK === 'true',
+)
 
 export const EXTERNAL_ID = 'pc-7f3a91'
 

@@ -72,6 +72,9 @@ if _cors_origins:
         allow_headers=["Content-Type"],
     )
 
+# 배포 계획·작업의 대상. aws가 제품 배포 대상이고, local_docker는 발표자 PC의 Docker로 올리는 시연용 대상이다(롤백은 aws만).
+PLAN_TARGETS = ("aws", "local_docker")
+
 _SECRET_KEY = re.compile(
     r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)"
 )
@@ -552,6 +555,11 @@ def create_plan(body: PlanIn) -> PlanOut:
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "AWS 계획에는 저장 plan의 SHA-256과 월 비용 추정치가 필요합니다.",
         )
+    if body.target == "local_docker" and body.terraform_plan_sha256 is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "로컬 Docker 계획에는 승인할 compose 파일의 SHA-256이 필요합니다.",
+        )
     plan_id = uuid4()
     payload = body.model_dump(mode="json")
     fingerprint = _fingerprint(payload)
@@ -566,9 +574,11 @@ def create_plan(body: PlanIn) -> PlanOut:
             analysis = cursor.fetchone()
             if analysis is None or analysis["project_id"] != str(body.project_id):
                 raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "분석 결과가 프로젝트와 일치하지 않습니다.")
+        # 같은 배포 대상의 승인 대기 계획만 대체한다. 한 프로젝트가 AWS와 로컬 Docker 계획을 함께 가질 수 있어 서로 대체하지 않는다.
         cursor.execute(
-            "UPDATE deployment_plans SET status = 'superseded' WHERE project_id = %s AND status = 'awaiting_approval'",
-            (str(body.project_id),),
+            "UPDATE deployment_plans SET status = 'superseded' "
+            "WHERE project_id = %s AND status = 'awaiting_approval' AND target = %s",
+            (str(body.project_id), body.target),
         )
         cursor.execute(
             """INSERT INTO deployment_plans
@@ -621,12 +631,14 @@ def approve_plan(plan_id: UUID, body: ApproveIn) -> PlanOut:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 계획을 찾을 수 없습니다.")
         if row["status"] != "awaiting_approval":
             raise HTTPException(status.HTTP_409_CONFLICT, "승인 대기 중인 계획만 승인할 수 있습니다.")
-        if row["target"] != "aws":
-            raise HTTPException(status.HTTP_409_CONFLICT, "현재 배포 대상은 AWS 클라우드입니다.")
+        if row["target"] not in PLAN_TARGETS:
+            raise HTTPException(status.HTTP_409_CONFLICT, "지원하지 않는 배포 대상입니다.")
         if not hmac.compare_digest(row["fingerprint"], body.expected_fingerprint):
             raise HTTPException(status.HTTP_409_CONFLICT, "승인하려는 계획이 표시된 계획과 다릅니다.")
         if row["target"] == "aws" and not _terraform_plan_is_valid(row):
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 SHA-256과 일치하는 저장 Terraform plan이 없습니다.")
+        if row["target"] == "local_docker" and not row["terraform_plan_sha256"]:
+            raise HTTPException(status.HTTP_409_CONFLICT, "승인된 compose 파일의 SHA-256이 없습니다.")
         if row.get("operation_type") == "rollback" and row.get("terraform_plan_summary") is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "롤백 Terraform plan의 diff 요약을 먼저 저장해야 합니다.")
         _validate_rollback_context(cursor, row)
@@ -638,6 +650,13 @@ def approve_plan(plan_id: UUID, body: ApproveIn) -> PlanOut:
         )
         if cursor.rowcount != 1:
             raise HTTPException(status.HTTP_409_CONFLICT, "계획 상태가 변경되어 승인하지 못했습니다.")
+        if row.get("operation_type", "deploy") == "deploy":
+            # 배포 대상을 골랐으니 같은 프로젝트의 다른 대상 승인 대기 계획은 대체한다. 두면 쓰지 않을 AWS 계획이 Fargate vCPU를 계속 예약한다.
+            cursor.execute(
+                """UPDATE deployment_plans SET status = 'superseded'
+                   WHERE project_id = %s AND id <> %s AND status = 'awaiting_approval' AND operation_type = 'deploy'""",
+                (row["project_id"], str(plan_id)),
+            )
         connection.commit()
         cursor.execute("SELECT * FROM deployment_plans WHERE id = %s", (str(plan_id),))
         approved = cursor.fetchone()
@@ -660,14 +679,16 @@ def queue_deployment(body: DeploymentCreateIn) -> DeploymentOut:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 계획을 찾을 수 없습니다.")
         if plan["status"] != "approved" or not plan["approved_at"]:
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 배포 계획만 실행 대기열에 넣을 수 있습니다.")
-        if plan["target"] != "aws":
-            raise HTTPException(status.HTTP_409_CONFLICT, "현재 배포 대상은 AWS 클라우드입니다.")
+        if plan["target"] not in PLAN_TARGETS:
+            raise HTTPException(status.HTTP_409_CONFLICT, "지원하지 않는 배포 대상입니다.")
         if not hmac.compare_digest(plan["fingerprint"], body.expected_fingerprint) or not hmac.compare_digest(
             plan["approved_fingerprint"] or "", body.expected_fingerprint
         ):
             raise HTTPException(status.HTTP_409_CONFLICT, "승인 후 배포 계획이 변경되었습니다.")
         if plan["target"] == "aws" and not _terraform_plan_is_valid(plan):
             raise HTTPException(status.HTTP_409_CONFLICT, "승인된 Terraform plan이 없거나 SHA-256 검증에 실패했습니다.")
+        if plan["target"] == "local_docker" and not plan["terraform_plan_sha256"]:
+            raise HTTPException(status.HTTP_409_CONFLICT, "승인된 compose 파일의 SHA-256이 없습니다.")
         if plan.get("operation_type") == "rollback" and plan.get("terraform_plan_summary") is None:
             raise HTTPException(status.HTTP_409_CONFLICT, "롤백 Terraform plan의 diff 요약이 없어 실행 대기열에 넣을 수 없습니다.")
         cursor.execute(
@@ -755,6 +776,8 @@ def rollback_candidate(deployment_id: UUID) -> RollbackCandidateOut:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
         if failed["operation_type"] != "deploy" or failed["status"] != "failed":
             return RollbackCandidateOut(rollback_available=False, reason="not_failed")
+        if failed["target"] != "aws":
+            return RollbackCandidateOut(rollback_available=False, reason="unsupported_target")
         cursor.execute(
             "SELECT id FROM deployments WHERE project_id = %s ORDER BY created_at DESC, id DESC LIMIT 1",
             (failed["project_id"],),
@@ -805,6 +828,8 @@ def queue_rollback(deployment_id: UUID, body: RollbackRequestIn) -> PlanOut:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
         if failed["operation_type"] != "deploy" or failed["status"] != "failed":
             raise HTTPException(status.HTTP_409_CONFLICT, "실패한 일반 배포에 대해서만 롤백을 요청할 수 있습니다.")
+        if failed["target"] != "aws":
+            raise HTTPException(status.HTTP_409_CONFLICT, "로컬 Docker 배포는 롤백을 지원하지 않습니다.")
         cursor.execute(
             """SELECT id FROM deployments WHERE project_id = %s
                ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
@@ -912,18 +937,29 @@ def project_deployment_status(project_id: UUID) -> FrontDeployStatus:
 
 
 @app.post("/api/worker/deployments/claim", status_code=status.HTTP_200_OK, tags=["worker"])
-def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[str, Any]:
+def claim_deployment(
+    targets: str = Query(default="aws", max_length=64),
+    x_worker_token: str | None = Header(default=None),
+) -> dict[str, Any]:
     _require_worker(x_worker_token)
+    # worker가 다루는 배포 대상(쉼표 구분). 생략하면 aws라서 targets를 모르는 옛 worker는 로컬 Docker 작업을 가져가지 않는다.
+    wanted = list(dict.fromkeys(item.strip() for item in targets.split(",") if item.strip()))
+    if not wanted or any(item not in PLAN_TARGETS for item in wanted):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, f"targets는 {', '.join(PLAN_TARGETS)} 중에서 쉼표로 지정합니다."
+        )
+    marks = ", ".join(["%s"] * len(wanted))
     require_worker_artifact_support()
     with connect() as connection, connection.cursor() as cursor:
         while True:
             # Discover without taking child-row locks; every lifecycle writer
             # acquires the project first, then re-reads mutable rows with locks.
             cursor.execute(
-                """SELECT d.project_id FROM deployments d
+                f"""SELECT d.project_id FROM deployments d
                    JOIN deployment_plans p ON p.id = d.plan_id
-                   WHERE d.status = 'queued' AND d.target = 'aws' AND p.target = 'aws'
-                   ORDER BY d.created_at, d.id LIMIT 1"""
+                   WHERE d.status = 'queued' AND d.target IN ({marks}) AND p.target IN ({marks})
+                   ORDER BY d.created_at, d.id LIMIT 1""",
+                (*wanted, *wanted),
             )
             candidate = cursor.fetchone()
             if candidate is None:
@@ -931,7 +967,7 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
                 return {"job": None}
             _lock_project(cursor, candidate["project_id"])
             cursor.execute(
-                """SELECT d.id AS deployment_id, d.status, d.target, d.operation_type,
+                f"""SELECT d.id AS deployment_id, d.status, d.target, d.operation_type,
                           d.rollback_from_deployment_id, d.rollback_to_deployment_id, d.plan_id, d.project_id,
                           p.module_id, p.variables, p.summary, p.cost_estimate, p.terraform_plan_sha256,
                           p.terraform_plan_path,
@@ -939,11 +975,11 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
                    FROM deployments d
                    JOIN deployment_plans p ON p.id = d.plan_id
                    JOIN projects pr ON pr.id = d.project_id
-                   WHERE d.status = 'queued' AND d.target = 'aws' AND p.target = 'aws'
+                   WHERE d.status = 'queued' AND d.target IN ({marks}) AND p.target IN ({marks})
                      AND d.project_id = %s
                    ORDER BY d.created_at, d.id
                    LIMIT 1 FOR UPDATE""",
-                (candidate["project_id"],),
+                (*wanted, *wanted, candidate["project_id"]),
             )
             job = cursor.fetchone()
             if job is None:
@@ -996,7 +1032,8 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
             job["variables"] = _json_value(job["variables"])
             job["cost_estimate"] = _json_value(job["cost_estimate"])
             job["source_download_path"] = f"/api/worker/projects/{job['project_id']}/source"
-            job["terraform_plan_download_path"] = f"/api/worker/plans/{job['plan_id']}/terraform-plan"
+            if job["target"] == "aws":   # 로컬 Docker 계획의 본문(compose 파일)은 계획 변수에 들어 있어 별도 파일이 없다
+                job["terraform_plan_download_path"] = f"/api/worker/plans/{job['plan_id']}/terraform-plan"
             if s3_enabled():
                 job["source_path"] = None
                 job["terraform_plan_path"] = None

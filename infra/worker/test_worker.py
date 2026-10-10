@@ -248,7 +248,7 @@ class FakeBackend:
                     outer.order.append("conn")
                     outer.conn_posts.append((p, json.loads(body), self.headers.get("X-Worker-Token")))
                     return self._send(outer.conn_post_code, {})
-                if p == "/api/worker/deployments/claim":
+                if p.split("?")[0] == "/api/worker/deployments/claim":   # 로컬 Docker를 켠 worker는 ?targets=를 붙인다(경로 전체는 headers_seen에 남는다)
                     outer.order.append("claim")
                     if self.headers.get("X-Worker-Token") != TOKEN:
                         return self._send(401, {"error": "인증 실패"})
