@@ -144,6 +144,7 @@ jobs:
           python -m compileall -q back/app
       - name: DB·AWS·LLM 없이 앱 기동·HTTP 계약 확인
         run: python scripts/ci/test_platform_back.py
+
   infra:
     name: Infrastructure (static validation)
     needs: inventory
