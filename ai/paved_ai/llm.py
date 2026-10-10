@@ -276,6 +276,25 @@ def _system(client) -> str:
     return SYSTEM
 
 
+def _settings(client) -> str:
+    """답에 영향을 주는 호출 설정. 캐시 키에 넣어, 주소·설정이 바뀌면 예전 답을 쓰지 않게 함 (PR #29 리뷰)"""
+    if isinstance(client, OllamaClient):
+        s = {"endpoint": client.base_url.rstrip("/"), "max_tokens": MAX_TOKENS, "temperature": 0}
+    else:
+        s = {"endpoint": str(getattr(client, "base_url", "") or ""), "max_tokens": MAX_TOKENS, "effort": EFFORT,
+             "betas": [FALLBACK_BETA], "fallbacks": "default"}
+    return json.dumps(s, sort_keys=True)
+
+
+def _well_formed(data: dict) -> bool:
+    """출력 스키마의 모양을 갖췄는지: answers·notes 가 목록이고 각 항목에 필수 필드가 있음"""
+    answers, notes = data.get("answers"), data.get("notes", [])
+    if not isinstance(answers, list) or not isinstance(notes, list):
+        return False
+    need = ("field", "value", "file", "line")
+    return all(isinstance(a, dict) and all(k in a for k in need) for a in answers) and all(isinstance(n, dict) for n in notes)
+
+
 def _ask(client, model: str, prompt: str):
     """(답 텍스트, stop_reason, 응답 모델, request_id, 입력 토큰, 출력 토큰)"""
     if isinstance(client, OllamaClient):
@@ -313,7 +332,7 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
     # 가린 뒤의 입력·프롬프트/스키마 버전·제공자·모델이 같으면 예전 답을 다시 씀. 꺼낸 답도 아래에서 다시 검증함
     key = cache.cache_key(
         version=PROMPT_VERSION, schema=json.dumps(OUTPUT_SCHEMA, sort_keys=True), provider=type(client).__name__,
-        model=model, system=_system(client), prompt=prompt,
+        model=model, system=_system(client), prompt=prompt, settings=_settings(client),
     )
     hit = cache.get(key)
     started = time.monotonic()
@@ -325,8 +344,6 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
             text, stop_reason, outcome.model, outcome.request_id, outcome.input_tokens, outcome.output_tokens = _ask(client, model, prompt)
         except Exception as exc:  # API 오류만 LlmUnavailable로 바꾸고 나머지(코드 버그)는 그대로 올림
             raise _as_unavailable(exc) from exc
-        if stop_reason == "end_turn":
-            cache.put(key, {"text": text, "stop_reason": stop_reason, "model": outcome.model})
     outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
     analysis.ai_usage = outcome.usage()
 
@@ -345,6 +362,10 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
         for t in targets:
             outcome.rejected[t] = "LLM 답이 JSON이 아님"
         return outcome
+    # 형식이 맞는 답만 캐시 (PR #29 리뷰: 잘못된 답을 저장하면 같은 소스·모델에서 다시 묻지 못함).
+    # 근거 검증에서 버려지는 답은 형식은 맞으므로 저장해도 됨 (다시 물어도 같은 근거로 버려짐)
+    if not outcome.cached and _well_formed(data):
+        cache.put(key, {"text": text, "stop_reason": stop_reason, "model": outcome.model})
 
     by_path = {f.path: f.text.splitlines() for f in masked}
     answers = data.get("answers") if isinstance(data.get("answers"), list) else []

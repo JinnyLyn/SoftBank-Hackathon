@@ -204,6 +204,27 @@ class UsageAndCacheTests(unittest.TestCase):
             self.assertEqual(len(again.calls), 1)
         self.assertEqual(os.listdir(self.tmp) and all(n.endswith(".json") for n in os.listdir(self.tmp)), True)
 
+    def test_malformed_answers_are_not_cached(self):
+        # PR #29 리뷰: 검증 전에 저장해 잘못된 답을 계속 재사용할 수 있었음
+        for bad in (None, {"answers": "x", "notes": []}, {"answers": [{"field": "container_port"}], "notes": []}):
+            with self.subTest(bad=bad):
+                self.fill(FakeClient(bad))  # None 이면 'not json'
+                retry = FakeClient({"answers": [], "notes": []})
+                self.fill(retry)
+                self.assertEqual(len(retry.calls), 1, "형식이 틀린 답은 저장하지 않아 다시 물음")
+                shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_endpoint_is_part_of_the_key(self):
+        # PR #29 리뷰: OLLAMA_BASE_URL 등 다른 서비스로 바꿔도 예전 답을 썼음
+        payload = {"answers": [], "notes": []}
+        a = FakeClient(payload)
+        a.base_url = "https://one.example"
+        self.fill(a)
+        b = FakeClient(payload)
+        b.base_url = "https://two.example"
+        self.fill(b)
+        self.assertEqual(len(b.calls), 1, "주소가 다르면 다시 부름")
+
 
 class SelectFilesTests(unittest.TestCase):
     def test_prioritizes_deploy_files_and_skips_noise(self):

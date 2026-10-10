@@ -49,7 +49,8 @@ class DraftTests(unittest.TestCase):
             "package-lock.json": "{}",
             "server.js": "app.listen(process.env.PORT || 3000)\n",
         })
-        self.assertIn("RUN npm ci\n", d["content"], "빌드가 있으면 개발 의존성도 설치")
+        # NODE_ENV=production 이면 npm이 개발 의존성을 빼므로 명시 (PR #29 리뷰)
+        self.assertIn("RUN npm ci --include=dev\n", d["content"], "빌드가 있으면 개발 의존성도 설치")
         self.assertIn("RUN npm run build", d["content"])
         self.assertIn("ENV PORT=3000", d["content"])
         self.assertIn('CMD ["npm", "start"]', d["content"])

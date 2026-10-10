@@ -151,10 +151,10 @@ def _node(files, framework: str, runtime: Optional[str], port: int) -> Tuple[Opt
         based_on.append(entry)
     has_build = isinstance(scripts.get("build"), str)
     lock = _root(files, "package-lock.json") is not None
-    # 빌드가 있으면 개발 의존성도 필요함
+    # 빌드가 있으면 개발 의존성(TypeScript·Vite 등)도 필요함. NODE_ENV=production 이면 npm이 기본으로 빼므로
+    # --include=dev 를 명시 (PR #29 리뷰: tsc 를 못 찾아 npm run build 가 실패했음)
     install = "npm ci" if lock else "npm install"
-    if not has_build:
-        install += " --omit=dev"
+    install += " --include=dev" if has_build else " --omit=dev"
 
     lines = _header(framework, based_on) + [
         f"FROM node:{_version(runtime, DEFAULT_NODE, major_only=True)}-slim",
