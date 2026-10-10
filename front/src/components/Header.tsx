@@ -48,9 +48,11 @@ export default function Header({ page, onChange, connections, loadFailed }: Prop
             </button>
           ))}
         </nav>
-        <button className="account" onClick={() => onChange('targets')} title="연결 관리">
+        {/* 배포는 관리형 AWS. 연결 관리는 운영자용이라 연결 상태 경고는 연결이 있을 때만 */}
+        <button className="account" onClick={() => onChange('targets')} title="연결 관리 (운영자)">
           <span className={'dot' + (broken || loadFailed ? ' is-warn' : '')} />
-          {loadFailed ? '연결 정보 조회 실패' : `대상 ${connections.length}곳${broken ? ` · 확인 필요 ${broken}` : ''}`}
+          배포: 관리형 AWS
+          {loadFailed ? ' · 연결 조회 실패' : broken ? ` · 연결 확인 필요 ${broken}` : ''}
         </button>
       </div>
     </header>

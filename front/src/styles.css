@@ -365,9 +365,8 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 
 /* ---------- review ---------- */
 .summary-strip {
-  display: grid;
-  grid-template-columns: repeat(5, auto);
-  justify-content: start;
+  display: flex;
+  flex-wrap: wrap;
   gap: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
@@ -633,6 +632,32 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .conn-status.is-error::before { background: var(--marking); }
 .conn-error { color: var(--fail); font-size: 12.5px; }
 .conn-pending { font-size: 12.5px; color: var(--marking-ink); }
+/* 오래 걸리는 작업 진행 표시 */
+.work-progress { border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 14px 18px; display: flex; flex-direction: column; gap: 10px; max-width: 720px; }
+.work-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.work-head strong { display: flex; align-items: center; gap: 8px; }
+.work-head .pulse { display: inline-block; width: 9px; height: 9px; }
+.work-bar { height: 8px; border-radius: 999px; background: var(--sunken); overflow: hidden; }
+.work-bar > span { display: block; height: 100%; border-radius: inherit; background: var(--marking); transition: width 0.9s ease; }
+.work-bar.is-failed > span { background: var(--fail); }
+.work-steps { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.work-steps li { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.work-steps .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line-strong); }
+.work-steps li.is-current { color: var(--ink); font-weight: 600; }
+.work-steps li.is-current .dot { border-color: var(--marking); background: var(--marking-soft); }
+.work-steps li.is-done { color: var(--ok); }
+.work-steps li.is-done .dot { background: var(--ok); border-color: var(--ok); }
+.work-steps li.is-failed { color: var(--fail); }
+.work-steps li.is-failed .dot { background: var(--fail); border-color: var(--fail); }
+.work-hint { font-size: 13px; color: var(--ink-2); animation: reveal 0.4s ease both; }
+.reveal { animation: reveal 0.35s ease both; }
+@keyframes reveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .reveal, .work-hint { animation: none; } }
+.blockers { margin: 6px 0; padding-left: 18px; }
+.rec-wait { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-2); font-size: 13px; }
+.rec-wait .pulse { display: inline-block; width: 8px; height: 8px; }
+.rec-wait.is-error { color: var(--fail); }
+.conn-pending .pulse { display: inline-block; width: 8px; height: 8px; margin-right: 4px; vertical-align: middle; }
 .conn-status.is-pending { color: var(--marking-ink); }
 .conn-status.is-pending::before { background: transparent; border: 2px solid var(--marking); width: 5px; height: 5px; }
 .kind-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
@@ -751,6 +776,8 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .poll-actions { display: flex; gap: 6px; }
 .fail-note { margin: 10px 0 0; font-size: 13px; color: var(--ink-2); }
 
+.readonly-note { margin-top: 10px; background: var(--sunken); border-radius: 8px; padding: 10px 14px; color: var(--ink-2); font-size: 13px; }
+
 /* ---------- 조회 실패 ---------- */
 .load-error {
   display: flex;
@@ -828,3 +855,30 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
   .timeline li { grid-template-columns: 40px 1fr 48px; }
   .t-time { display: none; }
 }
+
+/* ---------- domain ---------- */
+.domain-modes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; max-width: 760px; }
+.domain-modes .kind { padding: 12px 14px; gap: 4px; }
+.domain-modes .kind strong { font-size: 14px; }
+@media (max-width: 720px) { .domain-modes { grid-template-columns: 1fr; } }
+.domain-input { display: flex; gap: 8px; max-width: 520px; }
+.domain-input .input { flex: 1; min-width: 0; }
+
+.cost-breakdown { max-width: 560px; }
+.cost-breakdown td:not(:first-child), .cost-breakdown th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+.cost-breakdown tr:last-child td { font-weight: 700; border-top: 1px solid var(--line-strong); }
+
+.domain-progress { border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 14px 18px; display: flex; flex-direction: column; gap: 12px; }
+.domain-head { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.domain-head a { word-break: break-all; }
+.domain-steps { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.domain-steps li { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.domain-steps .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line-strong); }
+.domain-steps li.is-current { color: var(--ink); font-weight: 600; }
+.domain-steps li.is-current .dot { border-color: var(--marking); }
+.domain-steps li.is-done { color: var(--ok); }
+.domain-steps li.is-done .dot { background: var(--ok); border-color: var(--ok); }
+.domain-steps li.is-failed { color: var(--fail); }
+.domain-steps li.is-failed .dot { background: var(--fail); border-color: var(--fail); }
+.record-box { display: flex; flex-direction: column; gap: 8px; overflow-x: auto; }
+.record-value { word-break: break-all; }

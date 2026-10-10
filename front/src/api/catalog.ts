@@ -99,7 +99,7 @@ function tfMain(p: Exclude<Provider, 'onprem'>, tier: CatalogTier) {
 }
 
 const TF_VARS = (p: Exclude<Provider, 'onprem'>) => {
-  const region = { aws: 'ap-northeast-2' }[p]
+  const region = { aws: 'sa-east-1' }[p]
   return `variable "app_name" {\n  type    = string\n  default = "sample-app"\n}\n\nvariable "region" {\n  type    = string\n  default = "${region}"\n}\n\nvariable "image" {\n  type        = string\n  description = "빌드 후 레지스트리에 올린 이미지 주소"\n}`
 }
 
@@ -154,7 +154,7 @@ export function buildPlan(p: Provider, tier: CatalogTier) {
 // ---------- 배포 로그 ----------
 
 const REGISTRY: Record<Provider, string> = {
-  aws: '1234.dkr.ecr.ap-northeast-2.amazonaws.com/sample-app:v1',
+  aws: '1234.dkr.ecr.sa-east-1.amazonaws.com/sample-app:v1',
   onprem: 'registry.local:5000/sample-app:v1',
 }
 
@@ -188,5 +188,5 @@ export function logScript(p: Provider, tier: CatalogTier, host?: string): [numbe
 
 export function publicUrl(p: Provider, tier: TierKey, host?: string) {
   if (p === 'onprem') return tier === 'lean' ? `http://${host ?? '192.168.0.24'}:8080` : `https://${host ?? '192.168.0.24'}`
-  return tier === 'lean' ? 'http://3.38.112.47' : 'https://sample-app-alb-1203.ap-northeast-2.elb.amazonaws.com'
+  return tier === 'lean' ? 'http://18.228.112.47' : 'https://sample-app-alb-1203.sa-east-1.elb.amazonaws.com'
 }

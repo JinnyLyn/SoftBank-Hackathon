@@ -1,11 +1,11 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import { shortTime } from '../format'
 import { isSafeRedirect } from '../api/http'
 import ProviderMark from '../components/ProviderMark'
 import InstallCommand from '../components/InstallCommand'
 import LoadError from '../components/LoadError'
-import { CONSOLE_HOSTS, ENABLED_PROVIDERS, EXTERNAL_ID, ONPREM_ENABLED, PROVIDERS } from '../providers'
+import { CONSOLE_HOSTS, ENABLED_PROVIDERS, EXTERNAL_ID, ONPREM_ENABLED, PROVIDERS, isEnabled } from '../providers'
 import type { Connection, Provider } from '../types'
 
 interface Draft {
@@ -24,6 +24,9 @@ const emptyDraft = (provider: Provider, count: number): Draft => ({
 })
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
+
+// AWS 연결 확인(worker의 AssumeRole)은 최대 2분쯤 걸림. 저장된 상태만 다시 읽으므로 AWS에는 영향 없음
+const AWS_POLL_MS = 5000
 
 interface Props {
   connections: Connection[] | null
@@ -46,6 +49,20 @@ export default function Connections({ connections, loadError, onReload, onChange
   const replace = (c: Connection) => onChange(listRef.current.map((x) => (x.id === c.id ? c : x)))
 
   const installConn = list.find((c) => c.id === installFor) ?? null
+
+  // 확인을 기다리는 AWS 연결이 있으면 몇 초마다 목록을 다시 읽음 → "다시 확인"을 계속 누르지 않아도 됨
+  const awsPending = list.some((c) => c.provider === 'aws' && c.status === 'pending')
+  useEffect(() => {
+    if (!awsPending) return
+    const timer = window.setInterval(async () => {
+      try {
+        onChange((await api.listConnections()).filter((c) => isEnabled(c.provider)))
+      } catch {
+        // 일시적인 오류면 다음 주기에 다시
+      }
+    }, AWS_POLL_MS)
+    return () => window.clearInterval(timer)
+  }, [awsPending])
 
   const meta = PROVIDERS[draft.provider]
   const sameKind = list.filter((c) => c.provider === draft.provider).length
@@ -97,6 +114,18 @@ export default function Connections({ connections, loadError, onReload, onChange
     return c
   }
 
+  // 확인에 실패한 AWS 연결: 같은 이름으로 새 연결(새 ExternalId·콘솔 링크)을 만들고 실패한 것은 지움
+  const recreate = async (c: Connection) => {
+    setError(null)
+    try {
+      const fresh = await api.saveConnection({ provider: c.provider, name: c.name, fields: c.fields })
+      await api.deleteConnection(c.id).catch(() => undefined)
+      onChange([...listRef.current.filter((x) => x.id !== c.id), fresh])
+    } catch (e) {
+      setError(errMsg(e))
+    }
+  }
+
   const reissueInstall = async (c: Connection) => {
     try {
       replace(await api.saveConnection({ id: c.id, provider: c.provider, name: c.name, fields: c.fields }))
@@ -110,6 +139,10 @@ export default function Connections({ connections, loadError, onReload, onChange
       <div className="page-head">
         <div>
           <h1>연결 관리</h1>
+          <p className="readonly-note">
+            새 배포에는 연결이 필요 없습니다. 앱은 플랫폼 운영자가 준비한 AWS에 배포됩니다. 이 화면은 운영자가 AWS 계정을
+            역할 위임으로 연결할 때 씁니다.
+          </p>
           <p>
             {ONPREM_ENABLED
               ? 'AWS 계정과 사내 서버를 등록해 두면 분석할 때 모든 대상의 구성과 비용을 같이 비교합니다. AWS는 키 대신 역할 위임으로, 사내 서버는 설치 명령 한 줄로 연결합니다.'
@@ -139,7 +172,24 @@ export default function Connections({ connections, loadError, onReload, onChange
                 <div className="conn-main">
                   <strong>{c.name}</strong>
                   <span className="mono small muted">{c.detail}</span>
-                  {c.status === 'error' && <span className="conn-error">{c.error}</span>}
+                  {c.roleArn && (
+                    <span className="mono small muted conn-role" title={c.roleArn}>
+                      역할 {c.roleArn}
+                    </span>
+                  )}
+                  {c.status === 'error' && (
+                    <span className="conn-error">
+                      {c.error || '연결 확인에 실패했습니다.'}
+                      {c.provider === 'aws' && (
+                        <>
+                          {' '}
+                          <button className="link-btn" onClick={() => recreate(c)}>
+                            새 연결 만들기
+                          </button>
+                        </>
+                      )}
+                    </span>
+                  )}
                   {c.status === 'pending' && c.provider === 'onprem' && (
                     <span className="conn-pending">
                       서버에서 설치 명령을 실행하면 자동으로 연결됩니다.{' '}
@@ -148,16 +198,23 @@ export default function Connections({ connections, loadError, onReload, onChange
                       </button>
                     </span>
                   )}
-                  {c.status === 'pending' && c.provider !== 'onprem' && (
+                  {/* 스택이 계정 정보를 보냈으면 확인 중. 같은 안내를 계속 보여 주면 스택을 또 만들 수 있음 */}
+                  {c.status === 'pending' && c.provider !== 'onprem' && (c.accountId || c.roleArn) && (
+                    <span className="conn-pending">
+                      <span className="pulse" aria-hidden /> 스택이 만들어졌습니다. 플랫폼이 이 역할을 쓸 수 있는지 확인하는
+                      중입니다(최대 2분쯤). 스택을 다시 만들 필요는 없습니다.
+                    </span>
+                  )}
+                  {c.status === 'pending' && c.provider !== 'onprem' && !c.accountId && !c.roleArn && (
                     <span className="conn-pending">
                       {c.setupUrl && isSafeRedirect(c.setupUrl, CONSOLE_HOSTS) ? (
                         <a href={c.setupUrl} target="_blank" rel="noreferrer noopener">
                           콘솔에서 연결 스택 만들기
                         </a>
                       ) : (
-                        '콘솔 주소를 받지 못했습니다. 다시 저장해 주세요.'
-                      )}{' '}
-                      → 끝나면 "다시 확인"
+                        '콘솔 연결 링크가 아직 준비되지 않았습니다 (서버의 AWS 연결 템플릿 설정 필요).'
+                      )}
+                      {c.setupUrl ? ' → 스택을 만들면 자동으로 확인합니다' : ''}
                     </span>
                   )}
                 </div>

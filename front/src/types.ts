@@ -18,6 +18,10 @@ export interface Connection {
   checkedAt: string
   /** 폼에 입력한 원본 값. 비밀 값은 서버가 돌려주지 않음 */
   fields: Record<string, string>
+  /** (AWS) CloudFormation 스택이 백엔드에 알려 준 계정 ID. 스택을 만들기 전에는 없음 */
+  accountId?: string | null
+  /** (AWS) 스택이 만든 IAM 역할 ARN. 값이 와도 worker가 AssumeRole로 확인하기 전까지는 pending */
+  roleArn?: string | null
 }
 
 export interface ConnectionInput {
@@ -55,6 +59,11 @@ export interface Analysis {
   findings: Finding[]
   /** 스캐너가 찾은 판단 근거 */
   evidence: string[]
+  /**
+   * 배포할 수 없는 이유 (미지원 DB·여러 이미지, 포트·헬스체크·Dockerfile을 못 찾음 등).
+   * 하나라도 있으면 worker가 계획을 만들지 않으므로 기다리지 않고 이유를 보여 줌
+   */
+  blockers?: string[]
 }
 
 export type TierKey = 'lean' | 'balanced' | 'roomy'
@@ -140,8 +149,54 @@ export interface TerraformBundle {
   planInfo?: PlanInfo
 }
 
+// ---------- 도메인 ----------
+
+/** auto: 플랫폼 도메인 아래 자동 주소(서버가 이름을 정함), own: 이미 가진 도메인 연결 */
+export type DomainMode = 'auto' | 'own'
+
+export interface DomainChoice {
+  mode: DomainMode
+  /** own 일 때 연결할 도메인. auto 는 빈 문자열 */
+  name: string
+}
+
+export interface DnsRecord {
+  type: 'CNAME' | 'A' | 'ALIAS' | 'TXT' | 'NS'
+  name: string
+  value: string
+  /** 화면 설명 (예: "인증서 확인용") */
+  purpose: string
+}
+
+/** 서버가 확정한 도메인 계획. 비용 승인 화면에 앱 비용과 함께 보여 줌 */
+export interface DomainPlan {
+  /** none: 서버에 도메인 기능이 없어 미리보기 주소(AWS 기본 주소)로만 배포 */
+  mode: DomainMode | 'none'
+  /** auto 는 서버가 정한 주소, own 은 사용자가 넣은 도메인 */
+  name: string | null
+  /** 매달 붙는 비용 (DNS 호스팅 등). 없으면 0 */
+  monthlyUsd: number
+  /** 이미 가진 도메인일 때 사용자가 도메인 업체에 넣을 레코드. 값은 배포 뒤 확정될 수 있음 */
+  records: DnsRecord[]
+  note?: string
+}
+
+export type DomainState = 'skipped' | 'waiting_dns' | 'issuing_cert' | 'active' | 'failed'
+
+export interface DomainStatus {
+  state: DomainState
+  name: string | null
+  message?: string
+  /** waiting_dns 일 때 아직 확인되지 않은 레코드 */
+  records?: DnsRecord[]
+  /** active 일 때 접속 주소 */
+  url?: string
+}
+
 export interface DeployStatus {
   state: 'running' | 'success' | 'failed'
+  /** 도메인 연결 진행 상태. 앱 배포가 끝난 뒤에도 DNS·인증서 때문에 더 걸릴 수 있음 */
+  domain?: DomainStatus
   log: string[]
   url?: string
   /** 실패 시 AI가 로그를 보고 정리한 원인과 수정안 */
