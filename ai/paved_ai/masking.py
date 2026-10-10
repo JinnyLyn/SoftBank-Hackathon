@@ -26,8 +26,12 @@ _SECRET_FILE_GLOBS = ["*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "id_rsa*", "i
 _ENV_FILE = re.compile(r"(^|/)\.env(\.[\w-]+)?$")
 _ENV_EXAMPLE = re.compile(r"(^|/)\.env\.(example|sample|template|dist)$")
 
-# 비밀로 보는 변수 이름. infra app-config.schema.json·백엔드 규칙과 같은 단어
-_SECRET_NAME = r"[A-Za-z0-9_-]*(?:PASSWORD|PASSWD|SECRET|TOKEN|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY)[A-Za-z0-9_-]*"
+# 비밀로 보는 변수 이름. infra app-config.schema.json·백엔드 규칙의 단어에 흔한 줄임(DB_PASS, PWD, AUTH, DSN)을 더함.
+# PASS·AUTH 는 바로 뒤에 글자가 오면 제외 (PASSENGER, AUTHOR 는 비밀 이름이 아님). 더 가리는 쪽은 안전함
+_SECRET_NAME = (
+    r"[A-Za-z0-9_-]*(?:PASSWORD|PASSWD|PASS(?![A-Za-z])|PWD|SECRET|TOKEN|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY"
+    r"|AUTH(?![A-Za-z])|DSN)[A-Za-z0-9_-]*"
+)
 
 # 모양으로 알아보는 비밀값
 _PATTERNS: List[Tuple[re.Pattern, str]] = [
@@ -43,12 +47,15 @@ _PATTERNS: List[Tuple[re.Pattern, str]] = [
     (re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)[^/\s:@'\"]+:[^/\s@'\"]+@"), r"\1" + MASK + "@"),
 ]
 
-# 설정 파일의 KEY=값, KEY: 값, - KEY=값 (env·yaml·ini·compose). 따옴표 문자열이거나 공백 없는 값
-_ENV_ASSIGN = re.compile(r"(?im)^(\s*(?:-\s*)?(?:export\s+)?(" + _SECRET_NAME + r")\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#\n]+)")
+# 설정 파일의 KEY=값, KEY: 값, - KEY=값, "KEY": 값 (env·yaml·ini·compose·json). 따옴표 문자열이거나 공백·쉼표 없는 값
+_ENV_ASSIGN = re.compile(
+    r"(?im)^(\s*(?:-\s*)?(?:export\s+)?[\"']?(" + _SECRET_NAME + r")[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#,\n]+)"
+)
 # 위 규칙을 적용할 설정 파일. 코드에는 적용하지 않음 (SECRET_KEY = os.getenv("SECRET_KEY") 같은 줄의 변수 이름을 지키려고)
-_CONFIG_FILE = re.compile(r"(?i)(^|/)(\.env(\.[\w-]+)?|[^/]+\.(ya?ml|ini|cfg|conf|toml|properties)|dockerfile)$")
+_CONFIG_FILE = re.compile(r"(?i)(^|/)(\.env(\.[\w-]+)?|[^/]+\.(ya?ml|ini|cfg|conf|toml|properties|json)|dockerfile)$")
 # 코드에서 비밀 이름 변수에 문자열 그대로 넣은 것만 (password = request.form[...] 같은 코드는 그대로 둠)
-_CODE_ASSIGN = re.compile(r"(?i)\b(" + _SECRET_NAME + r")(\s*[:=]\s*)([\"'])([^\"'\n]{4,})\3")
+# 키에 따옴표가 있는 객체 문법("password": "...")도 포함
+_CODE_ASSIGN = re.compile(r"(?i)\b(" + _SECRET_NAME + r")([\"']?\s*[:=]\s*)([\"'])([^\"'\n]{4,})\3")
 
 
 @dataclass(frozen=True)

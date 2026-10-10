@@ -47,6 +47,33 @@ class MaskTextTests(unittest.TestCase):
         self.assertEqual(n, 1)
 
 
+    def test_short_secret_names_and_quoted_keys(self):
+        # PR #25 리뷰: DB_PASS 같은 줄임 이름과 JSON의 따옴표 키가 그대로 LLM에 갔음
+        for text, config in [
+            ("DB_PASS: hunter2", True),
+            ('  "DB_PASSWORD": "hunter2",', True),
+            ('{"DB_PASSWORD": "hunter2"}', False),
+            ('{"auth": "tok123456"}', False),
+            ('db_pass="hunter22"', False),
+            ("SENTRY_DSN=https://k@o1.ingest.sentry.io/1", True),
+            ("MYSQL_PWD=hunter2", True),
+        ]:
+            with self.subTest(text=text):
+                masked, n = mask_text(text, config_file=config)
+                self.assertGreater(n, 0)
+                self.assertNotIn("hunter2", masked)
+                self.assertNotIn("tok123456", masked)
+
+    def test_similar_words_are_not_secrets(self):
+        for text in ("PORT: 8080", "passenger_count: 3", '"listen": 7311'):
+            with self.subTest(text=text):
+                self.assertEqual(mask_text(text, config_file=True), (text, 0))
+        # 코드의 변수 이름은 지킴 (설정 파일 규칙은 코드에 쓰지 않음)
+        for text in ('author: "kim"', 'SECRET_KEY = os.getenv("SECRET_KEY")'):
+            with self.subTest(text=text):
+                self.assertEqual(mask_text(text), (text, 0))
+
+
 class MaskFilesTests(unittest.TestCase):
     def test_secret_files_withheld(self):
         report = mask_files([

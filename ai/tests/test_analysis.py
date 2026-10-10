@@ -170,6 +170,77 @@ class SmallAppTests(unittest.TestCase):
         a = analyze_files(files(**{"docker-compose.yml": compose, "web/Dockerfile": "FROM nginx\n", "api/Dockerfile": "FROM python:3.12\n"}))
         self.assertFalse(a.supported)
 
+    def fastapi_app(self, main: str, routes: str):
+        return analyze_files(files(**{
+            "requirements.txt": "fastapi==0.111.0\nuvicorn==0.30.0\n",
+            "main.py": main,
+            "routes.py": routes,
+            "Dockerfile": "FROM python:3.12-slim\nCOPY . .\nCMD [\"uvicorn\", \"main:app\", \"--port\", \"8000\"]\n",
+        }))
+
+    def test_router_prefix_is_joined_to_health_path(self):
+        # PR #25 리뷰: APIRouter(prefix="/api") 아래 /health 를 /health 로 확정해 ALB가 없는 경로를 검사했음
+        a = self.fastapi_app(
+            "from fastapi import FastAPI\nfrom routes import router\napp = FastAPI()\napp.include_router(router)\n",
+            "from fastapi import APIRouter\nrouter = APIRouter(prefix=\"/api\")\n@router.get(\"/health\")\ndef health():\n    return {}\n",
+        )
+        self.assertEqual(a.health_check_path, "/api/health")
+
+    def test_router_mounted_elsewhere_with_prefix_is_unresolved(self):
+        a = self.fastapi_app(
+            "from fastapi import FastAPI\nfrom routes import router\napp = FastAPI()\napp.include_router(router, prefix=\"/v1\")\n",
+            "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get(\"/health\")\ndef health():\n    return {}\n",
+        )
+        self.assertIsNone(a.health_check_path)
+        self.assertIn("health_check_path", a.unresolved)
+        # Express: app.use('/api', router) 로 붙인 라우터도 같음. 앱에 바로 붙은 경로는 그대로 씀
+        b = analyze_files(files(**{
+            "package.json": json.dumps({"dependencies": {"express": "^4.19.0"}}),
+            "server.js": "const app = require('express')()\nconst r = require('./r')\napp.use('/api', r)\napp.listen(3000)\n",
+            "r.js": "const router = require('express').Router()\nrouter.get('/health', (q, s) => s.send('ok'))\nmodule.exports = router\n",
+            "Dockerfile": "FROM node:20-alpine\nCOPY . .\nCMD [\"node\", \"server.js\"]\n",
+        }))
+        self.assertIsNone(b.health_check_path)
+
+    def prisma_app(self, provider: str, env_example: str = "DATABASE_URL=\n"):
+        return analyze_files(files(**{
+            "package.json": json.dumps({"dependencies": {"express": "^4.19.0", "@prisma/client": "^5.0.0"}}),
+            "server.js": "const app = require('express')()\napp.get('/health', (q, s) => s.send('ok'))\napp.listen(3000)\n",
+            "prisma/schema.prisma": f'datasource db {{\n  provider = "{provider}"\n  url      = env("DATABASE_URL")\n}}\n',
+            ".env.example": env_example,
+            "Dockerfile": "FROM node:20-alpine\nCOPY . .\nCMD [\"node\", \"server.js\"]\n",
+        }))
+
+    def test_orm_db_kind_comes_from_provider_not_assumed(self):
+        # PR #25 리뷰: ORM과 DATABASE_URL만 보고 MySQL로 단정해 PostgreSQL 앱이 MySQL 접속 정보로 배포됐음
+        pg = self.prisma_app("postgresql")
+        self.assertFalse(pg.supported)
+        self.assertEqual(pg.database, "PostgreSQL")
+        self.assertIn("prisma/schema.prisma", [e.file for e in pg.evidence])
+        # 미지원이면 app_config 를 주지 않아 worker가 계획을 만들지 않음
+        self.assertIsNone(pg.to_result()["app_config"])
+        my = self.prisma_app("mysql")
+        self.assertTrue(my.supported)
+        self.assertEqual(my.database, "MySQL")
+
+    def test_orm_with_unknown_db_kind_is_not_deployed_as_mysql(self):
+        a = analyze_files(files(**{
+            "package.json": json.dumps({"dependencies": {"express": "^4.19.0", "sequelize": "^6.0.0"}}),
+            "server.js": "const app = require('express')()\nconst db = new Sequelize(process.env.DATABASE_URL)\napp.get('/health', (q, s) => s.send('ok'))\napp.listen(3000)\n",
+            "Dockerfile": "FROM node:20-alpine\nCOPY . .\nCMD [\"node\", \"server.js\"]\n",
+        }))
+        self.assertFalse(a.supported)
+        self.assertNotEqual(a.database, "MySQL")
+        # DATABASE_URL 예시에 mysql:// 가 있으면 MySQL로 확정
+        b = analyze_files(files(**{
+            "package.json": json.dumps({"dependencies": {"express": "^4.19.0", "sequelize": "^6.0.0"}}),
+            "server.js": "const app = require('express')()\nconst db = new Sequelize(process.env.DATABASE_URL)\napp.get('/health', (q, s) => s.send('ok'))\napp.listen(3000)\n",
+            ".env.example": "DATABASE_URL=mysql://user:pass@localhost:3306/app\n",
+            "Dockerfile": "FROM node:20-alpine\nCOPY . .\nCMD [\"node\", \"server.js\"]\n",
+        }))
+        self.assertTrue(b.supported)
+        self.assertEqual(b.database, "MySQL")
+
 
 class SourceTests(unittest.TestCase):
     def _zip(self, entries: dict) -> bytes:

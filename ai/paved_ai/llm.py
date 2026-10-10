@@ -66,8 +66,10 @@ OUTPUT_SCHEMA = {
                     "level": {"type": "string", "enum": ["info", "warn"]},
                     "title": {"type": "string"},
                     "detail": {"type": "string"},
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
                 },
-                "required": ["level", "title", "detail"],
+                "required": ["level", "title", "detail", "file", "line"],
                 "additionalProperties": False,
             },
         },
@@ -83,7 +85,7 @@ SYSTEM = """당신은 웹 앱 소스 코드를 읽고 AWS ECS Fargate 배포에 
 - 질문받은 값만 답합니다. 각 답에는 값이 실제로 적힌 파일 경로와 줄 번호를 근거로 붙입니다.
 - 코드에서 확인할 수 없으면 추측하지 말고 value를 빈 문자열로 두고 reason에 이유를 씁니다.
 - <가림>은 비밀값을 가린 자리입니다. 원래 값을 짐작하지 마세요.
-- notes에는 배포할 때 사용자가 알아야 할 점이 있을 때만, 최대 5개를 한국어 한두 문장으로 씁니다. 이미 아는 사실은 반복하지 않습니다.
+- notes에는 배포할 때 사용자가 알아야 할 점이 있을 때만, 최대 5개를 한국어 한두 문장으로 씁니다. 이미 아는 사실은 반복하지 않습니다. 각 note에도 근거가 된 파일 경로와 줄 번호를 붙입니다.
 - 금액이나 서버 크기는 판단하지 않습니다."""
 
 
@@ -154,7 +156,10 @@ def build_prompt(analysis: Analysis, files: List[SourceFile], targets: List[str]
     blocks = []
     for f in files:
         numbered = "\n".join(f"{i:>4}| {line}" for i, line in enumerate(f.text.splitlines(), 1))
-        blocks.append(f'<file path="{f.path}">\n{numbered}\n</file>')
+        # 업로드 내용이 파일 블록을 일찍 닫고 뒤를 지시처럼 놓지 못하게 구분자를 바꿔 씀 (PR #25 리뷰)
+        numbered = re.sub(r"(?i)</?file\b", lambda m: m.group(0).replace("<", "‹"), numbered)
+        path = f.path.replace('"', "'").replace("<", "‹").replace(">", "›")
+        blocks.append(f'<file path="{path}">\n{numbered}\n</file>')
     return (
         f"규칙 분석이 이미 찾은 값 (바꾸지 마세요):\n{known_text}\n\n"
         f"찾아야 하는 값:\n{asks}\n\n"
@@ -329,7 +334,8 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
     notes = data.get("notes") if isinstance(data.get("notes"), list) else []
     for note in [n for n in notes if isinstance(n, dict)][:MAX_NOTES]:
         title, detail = str(note.get("title", ""))[:80], str(note.get("detail", ""))[:300]
-        if title:
+        # 근거 줄이 실제로 있는 메모만 보여 줌. 업로드 코드 속 문장이 근거 없는 경고·안내로 화면에 뜨지 않게 (PR #25 리뷰)
+        if title and _line(by_path, str(note.get("file") or ""), note.get("line", 0)) is not None:
             (analysis.warn if note.get("level") == "warn" else analysis.info)(title, detail)
             outcome.notes_added += 1
 

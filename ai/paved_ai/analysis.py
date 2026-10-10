@@ -115,7 +115,8 @@ class Analysis:
             "stack": [{"label": k, "value": v} for k, v in stack],
             "findings": [{"level": f.level, "title": f.title, "detail": backend_safe_text(f.detail)} for f in self.findings],
             "evidence": [e.as_dict() for e in self.evidence],
-            "app_config": self.app_config(),
+            # 미지원 앱은 app_config 를 주지 않아 worker가 계획을 만들지 못하게 함 (PR #25 리뷰: PostgreSQL 앱이 MySQL로 배포됐음)
+            "app_config": self.app_config() if self.supported else None,
             "dockerfile": self.dockerfile,
             "scale": scale,
             "unresolved": self.unresolved,
@@ -292,21 +293,49 @@ def _detect_port(a: Analysis, repo: Repo) -> None:
 
 _ROUTE = re.compile(
     r"""(?x)
-    @(?:\w+)\.(?:get|route|api_route)\(\s*["']([^"']+)["']      # FastAPI·Flask
-    | \b(?:app|router|server)\.(?:get|all|head)\(\s*["'`]([^"'`]+)["'`]  # Express·Fastify
-    | \bpath\(\s*["']([^"']*)["']                                 # Django
-    | @GetMapping\(\s*(?:value\s*=\s*)?["']([^"']+)["']           # Spring
+    @(?P<obj1>\w+)\.(?:get|route|api_route)\(\s*["'](?P<p1>[^"']+)["']        # FastAPI·Flask
+    | \b(?P<obj2>app|router|server|\w*[Rr]outer)\.(?:get|all|head)\(\s*["'`](?P<p2>[^"'`]+)["'`]  # Express·Fastify
+    | \bpath\(\s*["'](?P<p3>[^"']*)["']                                         # Django
+    | @GetMapping\(\s*(?:value\s*=\s*)?["'](?P<p4>[^"']+)["']                   # Spring
     """
+)
+# 앱 객체에 바로 붙은 경로. 이 이름이 아니면 라우터로 봄
+_APP_OBJECTS = {"app", "application", "server", "api"}
+# 같은 파일에서 라우터를 만들며 정한 접두사: FastAPI APIRouter(prefix=), Flask Blueprint(url_prefix=)
+_ROUTER_PREFIX = re.compile(r"""(\w+)\s*=\s*(?:APIRouter|Blueprint)\([^)]*?(?:url_)?prefix\s*=\s*["']([^"']*)["']""")
+# 스프링 컨트롤러 클래스의 공통 경로
+_SPRING_PREFIX = re.compile(r"""@RequestMapping\(\s*(?:value\s*=\s*|path\s*=\s*)?["']([^"']+)["']""")
+# 다른 곳에서 접두사를 붙여 라우터를 마운트함 → 라우터에 적힌 경로만으로는 최종 경로를 모름
+_MOUNT_PREFIX = re.compile(
+    r"""include_router\([^)]*prefix\s*=|register_blueprint\([^)]*url_prefix\s*=|\.use\(\s*["'`]/[^"'`]*["'`]\s*,"""
 )
 
 
+def _join(prefix: str, path: str) -> str:
+    joined = "/".join(p.strip("/") for p in (prefix, path) if p.strip("/"))
+    return "/" + joined if joined else "/"
+
+
 def _detect_health(a: Analysis, repo: Repo) -> None:
+    sources = repo.code(".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".kt")
+    mounted = any(repo.grep(f, _MOUNT_PREFIX) for f in sources)
     routes: List[Tuple[str, Evidence]] = []
-    for f in repo.code(".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".kt"):
+    unsure = False  # 라우터 경로라 최종 경로를 확정하지 못한 것이 있음
+    for f in sources:
+        prefixes = {name: prefix for name, prefix in _ROUTER_PREFIX.findall(f.text)}
+        spring = _SPRING_PREFIX.search(f.text)
         for i, m in repo.grep(f, _ROUTE):
-            path = next(g for g in m.groups() if g is not None)
-            path = "/" + path.strip("/") if path.strip("/") else "/"
-            routes.append((path, Evidence(f.path, i, m.group(0))))
+            obj = m.group("obj1") or m.group("obj2")
+            path = next(m.group(g) for g in ("p1", "p2", "p3", "p4") if m.group(g) is not None)
+            if m.group("p4") is not None and spring:
+                path = _join(spring.group(1), path)
+            elif obj and obj not in _APP_OBJECTS:
+                # 라우터에 붙은 경로 (PR #25 리뷰: APIRouter(prefix="/api") 아래 /health 를 /health 로 확정했음)
+                if mounted:
+                    unsure = True
+                    continue
+                path = _join(prefixes.get(obj, ""), path)
+            routes.append((_join("", path), Evidence(f.path, i, m.group(0))))
     for want in HEALTH_PATHS:
         for path, ev in routes:
             if path == want:
@@ -314,12 +343,41 @@ def _detect_health(a: Analysis, repo: Repo) -> None:
                 a.evidence.append(ev)
                 return
     root = next(((p, ev) for p, ev in routes if p == "/"), None)
-    if root:
+    if root and not unsure:
         a.health_check_path = "/"
         a.evidence.append(root[1])
         a.info("헬스체크 전용 경로가 없어 / 를 씁니다", "응답이 느린 첫 화면이면 /health 같은 가벼운 경로를 추가하는 게 좋습니다.")
         return
+    if unsure:
+        a.unresolved["health_check_path"] = "라우터가 다른 경로 아래에 붙어 있어 헬스체크의 전체 경로를 확정하지 못했습니다."
+        return
     a.unresolved["health_check_path"] = "헬스체크로 쓸 경로(/health 또는 /)를 찾지 못했습니다."
+
+
+# ORM·DATABASE_URL 만으로는 DB 종류를 모름. 주소 형식(postgresql://)·Prisma provider·ORM dialect 로 종류를 찾음
+_DB_KIND = [
+    ("PostgreSQL", re.compile(r"(?i)\bpostgres(?:ql)?(?:\+\w+)?://|provider\s*=\s*\"(?:postgresql|cockroachdb)\"|(?:dialect|type)\s*:\s*['\"]postgres")),
+    ("MongoDB", re.compile(r"(?i)\bmongodb(?:\+srv)?://|provider\s*=\s*\"mongodb\"")),
+    ("SQLite", re.compile(r"(?i)\bsqlite:|provider\s*=\s*\"sqlite\"|(?:dialect|type)\s*:\s*['\"](?:better-)?sqlite")),
+    ("MySQL", re.compile(r"(?i)\b(?:mysql(?:\+\w+)?|mariadb)://|provider\s*=\s*\"mysql\"|(?:dialect|type)\s*:\s*['\"](?:mysql|mariadb)")),
+]
+_COMPOSE_NAMES = ("docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml")
+
+
+def _db_kind(repo: Repo) -> Optional[Tuple[str, SourceFile, int]]:
+    """(DB 종류, 파일, 줄) 또는 None. 여러 종류가 보이면 None (단정하지 않음)"""
+    files = repo.code(".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".prisma") + repo.named(
+        ".env.example", ".env.sample", ".env.template", *_COMPOSE_NAMES)
+    found: Dict[str, Tuple[SourceFile, int]] = {}
+    for f in files:
+        for kind, pattern in _DB_KIND:
+            hits = repo.grep(f, pattern)
+            if hits and kind not in found:
+                found[kind] = (f, hits[0][0])
+    if len(found) != 1:
+        return None
+    kind, (f, line) = next(iter(found.items()))
+    return kind, f, line
 
 
 def _detect_database(a: Analysis, repo: Repo, deps: Dict[str, Tuple[SourceFile, int, str]], jvm: dict) -> None:
@@ -353,14 +411,36 @@ def _detect_database(a: Analysis, repo: Repo, deps: Dict[str, Tuple[SourceFile, 
         if pg[0] in deps:
             ev(pg[0])
         return
-    if mysql or (orm and db_url_hits):
+    # ORM·DATABASE_URL 만 있으면 종류를 확인한 뒤에만 MySQL로 봄 (PR #25 리뷰: Prisma provider가 PostgreSQL이어도 MySQL로 배포됐음)
+    kind = _db_kind(repo) if not mysql and (orm or db_url_hits) else None
+    if kind and kind[0] in ("PostgreSQL", "MongoDB"):
+        name, f, i = kind
+        a.supported = False
+        a.unsupported_reasons.append(f"{name}를 쓰는 앱은 아직 지원하지 않습니다. 공용 DB는 MySQL입니다.")
+        a.database, a.use_database = name, True
+        a.evidence.append(Evidence(f.path, i, f.text.splitlines()[i - 1]))
+        return
+    if mysql or (kind and kind[0] == "MySQL"):
         a.use_database, a.database = True, "MySQL"
         if mysql and mysql[0] in deps:
             ev(mysql[0])
-        if db_url_hits:
+        if kind:
+            a.evidence.append(Evidence(kind[1].path, kind[2], kind[1].text.splitlines()[kind[2] - 1]))
+        elif db_url_hits:
             f, i, m = db_url_hits[0]
             a.evidence.append(Evidence(f.path, i, f.text.splitlines()[i - 1]))
         a.info("DB 접속 정보는 배포가 넣습니다", "공용 MySQL에 앱 전용 DB와 계정을 만들고 DATABASE_URL을 비밀 저장소로 주입합니다.")
+        return
+    if (orm or db_url_hits) and not sqlite_hits and not (kind and kind[0] == "SQLite"):
+        # DB는 쓰는데 종류를 모름 → MySQL 접속 정보를 넣어도 되는지 알 수 없어 배포하지 않음
+        f, i, m = db_url_hits[0] if db_url_hits else (None, 0, None)
+        if f:
+            a.evidence.append(Evidence(f.path, i, f.text.splitlines()[i - 1]))
+        a.use_database, a.database = True, "확인 안 됨"
+        a.supported = False
+        a.unsupported_reasons.append(
+            "DB를 쓰지만 종류(MySQL·PostgreSQL 등)를 코드에서 확인하지 못했습니다. "
+            ".env.example 의 DATABASE_URL 예시(mysql://...)나 ORM 설정에 DB 종류를 적어 주세요.")
         return
     if sqlite_hits:
         f, i, m = sqlite_hits[0]
@@ -368,11 +448,6 @@ def _detect_database(a: Analysis, repo: Repo, deps: Dict[str, Tuple[SourceFile, 
         a.use_database, a.database = False, "SQLite (파일)"
         a.sizing_hints["stateful_local_files"] = True
         a.warn("SQLite 파일에 데이터를 저장합니다", "컨테이너를 다시 띄우면 데이터가 사라지고, 작업을 2개 이상으로 늘리면 서로 다른 데이터를 봅니다. MySQL로 옮기는 걸 권합니다.")
-        return
-    if db_url_hits:
-        f, i, m = db_url_hits[0]
-        a.evidence.append(Evidence(f.path, i, f.text.splitlines()[i - 1]))
-        a.use_database, a.database = True, "MySQL (DATABASE_URL)"
         return
     a.use_database = False
 
