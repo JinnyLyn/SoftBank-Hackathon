@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import CodeView from '../components/CodeView'
 import DomainProgress from '../components/DomainProgress'
 import { IS_MOCK } from '../api'
@@ -23,6 +24,38 @@ interface Props {
   onFix: () => void
   onRestart: () => void
   onHistory: () => void
+}
+
+// 10/11 실제 AWS 배포는 빌드부터 헬스체크까지 약 10분. 이보다 한참 길거나 같은 단계가 오래 이어지면 멈췄을 수 있다고 알림
+const LONG_TOTAL_MS = 15 * 60_000
+const LONG_STAGE_MS = 10 * 60_000
+
+/** 분·초 표시 */
+function clock(ms: number): string {
+  const sec = Math.max(0, Math.floor(ms / 1000))
+  const m = Math.floor(sec / 60)
+  return m ? `${m}분 ${sec % 60}초` : `${sec}초`
+}
+
+/**
+ * 배포가 진행 중일 때 경과 시간과 마지막 로그 이후 시간. 상태 API에 시각이 없어 이 화면이 진행 중 상태를 처음 본 때부터 잰다
+ * (승인 직후 이 화면으로 오므로 보통 배포 시작과 같음. 새로 고침하면 다시 0부터)
+ */
+function useElapsed(running: boolean, logCount: number) {
+  const [start, setStart] = useState<number | null>(null)
+  const [stage, setStage] = useState<{ count: number; at: number } | null>(null)
+  const [now, setNow] = useState(() => Date.now())
+  // 렌더 중 상태 갱신 (React 권장 방식: 이전 값과 비교해 바뀐 때만)
+  if (running && start === null) setStart(Date.now())
+  if (!running && start !== null) setStart(null)
+  if (running && stage?.count !== logCount) setStage({ count: logCount, at: Date.now() })
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [running])
+  if (!running || start === null) return null
+  return { total: Math.max(0, now - start), stage: Math.max(0, now - (stage?.at ?? start)) }
 }
 
 /** ALB 기본 주소(*.elb.amazonaws.com)의 https. 공용 ALB 인증서는 팀 도메인용이라 이 이름과 맞지 않음 (10/11 실제 배포에서 확인) */
@@ -68,7 +101,10 @@ export default function DeployStep({
     </div>
   )
 
+  const elapsed = useElapsed(status?.state === 'running', status?.log.length ?? 0)
+
   if (!status) return issue || <p className="muted">배포를 시작하는 중…</p>
+  const slow = elapsed && (elapsed.total > LONG_TOTAL_MS || elapsed.stage > LONG_STAGE_MS)
 
   return (
     <div className="stack">
@@ -76,8 +112,19 @@ export default function DeployStep({
 
       {status.state === 'running' && !pollIssue && (
         <div className="state-line">
-          <span className="pulse" /> 이미지를 빌드하고 {targetName}에 올리는 중입니다. DB를 새로 만들면 몇 분 걸릴 수 있어요.
+          <span className="pulse" /> 이미지를 빌드하고 {targetName}에 올리는 중입니다. 보통 10분 안팎 걸려요.
+          {elapsed && <span className="muted small">경과 {clock(elapsed.total)}</span>}
         </div>
+      )}
+
+      {status.state === 'running' && !pollIssue && slow && elapsed && (
+        <p className="hint" role="status">
+          {elapsed.stage > LONG_STAGE_MS
+            ? `같은 단계가 ${clock(elapsed.stage)}째 이어지고 있어요. `
+            : '평소보다 오래 걸리고 있어요. '}
+          이미지를 받거나 올리는 중에 네트워크가 느리거나 끊기면 이렇게 될 수 있습니다. 작업에는 시간 한도가 있어서, 멈춘 경우 잠시 뒤 실패로
+          바뀌고 아래 로그에 이유가 남습니다. 그때 &lsquo;새 배포&rsquo;로 다시 시도해 주세요.
+        </p>
       )}
 
       {status.state === 'success' && (

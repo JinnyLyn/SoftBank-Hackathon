@@ -1028,18 +1028,21 @@ cmd_foundation_info() {
 # 승인된 배포에만 실행한다(AGENTS.md 7장: Docker 빌드·실행에는 배포 승인과 실행 범위를 적용한다).
 # 빌드에는 호스트의 AWS 키나 docker 소켓을 넘기지 않는다
 cmd_build() {
-  local id="" source="" dockerfile="Dockerfile" tag="" arch=""
+  local id="" source="" dockerfile="Dockerfile" dockerfile_file="" tag="" arch=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
       --source) source="$2"; shift 2 ;;
       --dockerfile) dockerfile="$2"; shift 2 ;;
+      # 소스 밖의 Dockerfile(승인된 초안). 소스는 바꾸지 않고 docker build -f 로만 씀
+      --dockerfile-file) dockerfile_file="$2"; shift 2 ;;
       --tag) tag="$2"; shift 2 ;;
       --arch) arch="$2"; shift 2 ;;
       *) die "알 수 없는 옵션: $1" ;;
     esac
   done
-  [ -n "$id" ] && [ -n "$source" ] || die "사용법: build --id <id> --source <ZIP|폴더> [--dockerfile 경로] [--tag 태그] [--arch X86_64|ARM64]"
+  [ -n "$id" ] && [ -n "$source" ] || die "사용법: build --id <id> --source <ZIP|폴더> [--dockerfile 경로 | --dockerfile-file 파일] [--tag 태그] [--arch X86_64|ARM64]"
+  [ -z "$dockerfile_file" ] || [ -f "$dockerfile_file" ] || die "--dockerfile-file 을 찾지 못했습니다: $dockerfile_file"
   valid_id "$id"
   # 아키텍처는 계획(up --arch)과 같아야 한다. 계획은 ECS 태스크의 CPU 아키텍처로 고정되는데 이미지가 다르면 태스크가 바로 죽는다.
   # 생략하면 이 PC의 docker 아키텍처로 빌드한다(다른 아키텍처를 지정하면 docker가 에뮬레이션으로 빌드하므로 느리다)
@@ -1062,7 +1065,9 @@ cmd_build() {
   else
     rm -rf "${work:?}"; die "소스를 찾을 수 없습니다: $source"
   fi
-  [ -f "$ctx/$dockerfile" ] || { rm -rf "${work:?}"; die "Dockerfile을 찾지 못했습니다: $ctx/$dockerfile"; }
+  local df="$ctx/$dockerfile"
+  [ -z "$dockerfile_file" ] || df="$dockerfile_file"
+  [ -f "$df" ] || { rm -rf "${work:?}"; die "Dockerfile을 찾지 못했습니다: $df"; }
   [ -n "$arch" ] || arch="$(detect_arch)"
   platform="linux/amd64"; [ "$arch" = "ARM64" ] && platform="linux/arm64"
   [ -n "$tag" ] || tag="$id-r$(date +%s)"
@@ -1077,7 +1082,7 @@ cmd_build() {
     export DOCKER_CONFIG; DOCKER_CONFIG="$(native_path "$cfg")"
     # 이 PC에 같은 태그의 옛 이미지가 남아 있으면 빌드가 실패해도 그것이 push될 수 있어 태그를 먼저 지운다
     docker rmi -f "$image" >/dev/null 2>&1 || true
-    docker build --platform "$platform" -f "$(native_path "$ctx/$dockerfile")" -t "$image" "$(native_path "$ctx")" >&2 || exit 1
+    docker build --platform "$platform" -f "$(native_path "$df")" -t "$image" "$(native_path "$ctx")" >&2 || exit 1
     aws ecr get-login-password --region "$rgn" | docker login --username AWS --password-stdin "$registry" >/dev/null || exit 1
     docker push "$image" >&2 || exit 1
   ) || { rm -rf "${work:?}"; die "이미지를 빌드하거나 올리지 못했습니다"; }

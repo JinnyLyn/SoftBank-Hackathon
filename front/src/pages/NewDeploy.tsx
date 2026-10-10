@@ -487,7 +487,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
               </small>
             )}
             {rec && (rec.recommended?.connectionId !== option.connectionId || rec.recommended?.tier !== selectedTier.key) && (
-              <small className="muted">AI 추천과 다른 선택</small>
+              <small className="muted">추천과 다른 선택</small>
             )}
           </div>
         )}

@@ -28,7 +28,7 @@ AI는 **업로드한 코드를 읽고 "이 앱을 어떻게 띄워야 하는지"
 | 3 | **규칙 분석**: 프레임워크(FastAPI·Flask·Django·Express·Next.js 등), 포트, 헬스체크 경로, Dockerfile 위치, DB 사용 여부, 초기화 명령을 코드에서 찾음 | `paved_ai/analysis.py` | 찾은 값마다 근거(파일:줄)를 남김 |
 | 4 | **LLM 보완**: 규칙이 못 찾은 값(포트·헬스체크 경로·Dockerfile 경로·프레임워크)만 LLM에 물어봄 | `paved_ai/llm.py`, `paved_ai/ollama.py` | 규칙으로 다 찾으면 LLM을 부르지 않음 |
 | 5 | **답 검증**: LLM 답은 JSON 스키마와 "근거 파일:줄에 그 값이 실제로 있는지"를 확인. 근거가 안 맞으면 버리고 "찾지 못함"으로 남김 | `paved_ai/llm.py` | 추측한 값이 배포 설정에 들어가지 않게 함 |
-| 6 | **Dockerfile 초안**: 저장소에 Dockerfile이 없으면 규칙 템플릿으로 초안을 만듦 (Python: FastAPI·Flask·Django / Node: npm·pnpm·yarn) | `paved_ai/dockerfile.py` | 진입점이 애매하면 만들지 않고 이유를 표시 |
+| 6 | **Dockerfile 초안**: 저장소에 Dockerfile이 없으면 규칙 템플릿으로 초안을 만듦 (Python: FastAPI·Flask·Django / Node: npm·pnpm·yarn). 승인 화면에 보여 주고, 승인하면 worker가 그 내용 그대로 빌드 | `paved_ai/dockerfile.py` | 진입점이 애매하면 만들지 않고 이유를 표시. 소스는 바꾸지 않음 |
 | 7 | 결과를 백엔드에 기록: worker가 읽는 `app_config`·`dockerfile`·`scale`과 화면이 읽는 기술 스택·발견 사항·근거·초안 | `ai/runner.py` → `POST /api/projects/{id}/analyses` | 토큰 사용량(`ai.usage`)도 같이 기록 |
 
 ## AI가 하지 않는 일
@@ -50,12 +50,10 @@ AI는 **업로드한 코드를 읽고 "이 앱을 어떻게 띄워야 하는지"
 
 1. **비밀값 가리기**: `.env`가 든 저장소를 올려도 분석 결과·LLM 입력에 비밀번호가 없음.
 2. **규칙 + LLM 보완**: 포트를 설정 파일·환경 변수 기본값에 숨겨 둔 앱 → 규칙이 못 찾은 포트를 LLM이 찾고 근거 줄을 함께 보여 줌.
-3. **Dockerfile 초안**: Dockerfile 없는 저장소 → 초안을 만들어 코드 검토 화면의 "Dockerfile (초안)" 탭에 표시.
+3. **Dockerfile 초안**: Dockerfile 없는 저장소 → 초안을 만들어 코드 검토 화면의 "Dockerfile (초안)" 탭에 표시 → 승인하면 그 초안으로 바로 빌드·배포.
 4. **분석 진행 표시**: 업로드 직후 단계별 진행 게이지.
 
 ## 아직 연결되지 않은 부분 (발표에서 밝힐 것)
 
-- **Dockerfile 초안으로 바로 빌드**: 분석·화면 쪽은 끝났지만, worker가 승인된 초안으로 빌드하는 인프라 수정이 아직 `main`에 없다.
-  그래서 지금은 화면 플래그 `VITE_DOCKERFILE_DRAFT_BUILD`가 꺼져 있고, 초안이 있는 앱은 "저장소에 Dockerfile을 추가해 주세요"로 멈춘다.
 - **배포 실패 원인 분석(AI 진단)**: 10/8 분담상 노진서 담당 범위로, 이 문서의 분석기에는 들어 있지 않다.
 - 분석기는 아직 `ai/`의 별도 프로세스다. 백엔드가 안정되면 `back/app/llm/`으로 옮길 예정이다.
