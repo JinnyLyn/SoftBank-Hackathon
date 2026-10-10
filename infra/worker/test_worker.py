@@ -659,8 +659,39 @@ class PlannerTests(Base):
                          [("lowest", "lean", False), ("average", "balanced", False), ("highest", "roomy", True)])
         self.assertIn("월 예산 $400.00 이내", body["summary"])
         self.assertIn("안 비교", body["summary"])
-        # 승인 화면에 나가는 금액은 평소 비용이다. 부하가 최대일 때 비용은 variables.cost와 요약에 따로 있다
-        self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), 199.73, places=2)
+        # 승인 화면에 나가는 금액(cost_estimate.amount)은 예산을 판정한 기준과 같은 부하 최대 비용이다. 평소 비용은 variables.cost에 따로 있다
+        self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), v["cost"]["peak_monthly"], places=2)
+        self.assertAlmostEqual(v["cost"]["total_monthly"], 199.73, places=2)
+
+    def test_approval_amount_is_the_peak_cost_the_budget_was_judged_on(self):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users="~10,000", monthly_budget_usd=400)   # roomy medium 2~5개: 평소 $199.73, 최대 약 $385
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        amount = float(body["cost_estimate"]["amount"])
+        self.assertEqual(body["cost_estimate"]["amount"], f"{v['cost']['peak_monthly']:.4f}")
+        self.assertGreater(amount, v["cost"]["total_monthly"])   # 평소 금액만 보여주면 승인 때 최대 청구를 모른다
+        self.assertLessEqual(amount, 400)                         # 승인 금액은 사용자가 정한 예산 안이다
+        self.assertEqual(v["cost"]["amount_basis"], "peak_monthly")
+        # 승인 화면은 리소스 행을 나열하고 amount를 합계로 보여준다: 행의 합이 합계와 맞고, 최대 시 추가분이 행으로 보인다
+        rows = v["resources"]
+        self.assertAlmostEqual(sum(r["monthlyUsd"] for r in rows), amount, delta=0.05)
+        extra = rows[-1]
+        self.assertEqual(extra["service"], "ECS Fargate 오토스케일링 최대 시 추가분")
+        self.assertAlmostEqual(extra["monthlyUsd"], amount - v["cost"]["total_monthly"], delta=0.02)
+        self.assertIn("태스크 3개 더 (최대 5개)", extra["spec"])
+        self.assertIn("승인 금액은 부하가 최대일 때(태스크 5개)", body["summary"])
+        self.assertIn("평소 월 추정", body["summary"])
+
+    def test_no_autoscale_row_when_the_peak_equals_the_typical_cost(self):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users="~100", monthly_budget_usd=100)   # 월 $100에는 최저 안(1~1개)만 들어간다
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        self.assertEqual(float(body["cost_estimate"]["amount"]), v["cost"]["total_monthly"])
+        self.assertFalse(any("오토스케일링" in r["service"] for r in v["resources"]))
 
     def quota_plan(self, budget=1000, users="~10,000"):
         res = json.loads(json.dumps(GOOD_RESULT))
