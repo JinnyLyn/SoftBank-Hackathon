@@ -10,6 +10,7 @@ import DeployStep from '../steps/DeployStep'
 import DomainStep, { domainReady } from '../steps/DomainStep'
 import { domainDone } from '../components/DomainProgress'
 import WorkProgress from '../components/WorkProgress'
+import { STAGE_SIZE } from '../progress'
 import { costText, tierTotal, usd } from '../format'
 import type { PollIssue } from '../steps/DeployStep'
 import type {
@@ -87,7 +88,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const [recError, setRecError] = useState<string | null>(null)
   // 진행 표시: 분석을 시작한 시각, 업로드가 끝났는지, 계획을 기다리기 시작한 시각
   const [analyzeStartedAt, setAnalyzeStartedAt] = useState<number | null>(null)
-  const [uploaded, setUploaded] = useState(false)
+  // 업로드가 끝난 시각. null 이면 아직 올리는 중
+  const [uploadedAt, setUploadedAt] = useState<number | null>(null)
   const [recStartedAt, setRecStartedAt] = useState<number | null>(null)
   const [choice, setChoiceState] = useState<Choice | null>(null)
   // 조합별로 만들어 둔 코드. 다른 칸을 눌렀다 돌아와도 다시 만들지 않음
@@ -116,7 +118,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setRec(null)
     setRecError(null)
     setAnalyzeStartedAt(null)
-    setUploaded(false)
+    setUploadedAt(null)
     setRecStartedAt(null)
     setChoiceState(null)
     setBundles({})
@@ -332,9 +334,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
         if (!domainPlan) await saveDomain(analysis.projectId)
       } else {
         setAnalyzeStartedAt(Date.now())
-        setUploaded(false)
+        setUploadedAt(null)
         setStep(ANALYSIS)
-        const a = await api.analyze(source, scale, () => setUploaded(true))
+        const a = await api.analyze(source, scale, () => setUploadedAt(Date.now()))
         projectRef.current = a.projectId
         setAnalysis(a)
         await saveDomain(a.projectId)
@@ -502,14 +504,15 @@ export default function NewDeploy({ onShowHistory }: Props) {
           )}
           {step === ANALYSIS && !analysis && analyzeStartedAt !== null && (
             <WorkProgress
-              title={error ? '분석하지 못했습니다' : uploaded ? 'AI가 코드를 분석하고 있습니다' : '코드를 올리고 있습니다'}
+              title={error ? '분석하지 못했습니다' : uploadedAt ? 'AI가 코드를 분석하고 있습니다' : '코드를 올리고 있습니다'}
               startedAt={analyzeStartedAt}
+              stageStartedAt={uploadedAt ?? analyzeStartedAt}
               stages={[
-                { label: '코드 올리기', state: uploaded ? 'done' : error ? 'failed' : 'current' },
-                { label: '코드 분석', state: !uploaded ? 'todo' : error ? 'failed' : 'current' },
-                { label: '구성·비용 계획', state: 'todo' },
+                { label: '코드 올리기', state: uploadedAt ? 'done' : error ? 'failed' : 'current', ...STAGE_SIZE.upload },
+                { label: '코드 분석', state: !uploadedAt ? 'todo' : error ? 'failed' : 'current', ...STAGE_SIZE.analyze },
+                { label: '구성·비용 계획', state: 'todo', ...STAGE_SIZE.plan },
               ]}
-              hints={uploaded ? ANALYZE_HINTS : ['소스를 서버에 올리고 있습니다']}
+              hints={uploadedAt ? ANALYZE_HINTS : ['소스를 서버에 올리고 있습니다']}
               note={error ? '위의 오류를 확인하고 "이전"으로 돌아가 다시 시도해 주세요.' : '보통 10~30초 걸립니다.'}
             />
           )}

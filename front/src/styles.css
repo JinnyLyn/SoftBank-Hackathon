@@ -637,6 +637,9 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .work-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .work-head strong { display: flex; align-items: center; gap: 8px; }
 .work-head .pulse { display: inline-block; width: 9px; height: 9px; }
+.work-bar { height: 8px; border-radius: 999px; background: var(--sunken); overflow: hidden; }
+.work-bar > span { display: block; height: 100%; border-radius: inherit; background: var(--marking); transition: width 0.9s ease; }
+.work-bar.is-failed > span { background: var(--fail); }
 .work-steps { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 22px; }
 .work-steps li { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .work-steps .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line-strong); }

@@ -1,5 +1,6 @@
 import ProviderMark from '../components/ProviderMark'
 import WorkProgress from '../components/WorkProgress'
+import { STAGE_SIZE } from '../progress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
 import type { Analysis, Choice, Recommendation, TierKey } from '../types'
@@ -84,10 +85,11 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
             <WorkProgress
               title="구성과 비용 계획을 만들고 있습니다"
               startedAt={recStartedAt ?? Date.now()}
+              stageStartedAt={recStartedAt ?? Date.now()}
               stages={[
-                { label: '코드 올리기', state: 'done' },
-                { label: '코드 분석', state: 'done' },
-                { label: '구성·비용 계획', state: 'current' },
+                { label: '코드 올리기', state: 'done', ...STAGE_SIZE.upload },
+                { label: '코드 분석', state: 'done', ...STAGE_SIZE.analyze },
+                { label: '구성·비용 계획', state: 'current', ...STAGE_SIZE.plan },
               ]}
               hints={PLAN_HINTS}
               note="보통 1~4분 걸립니다. 위의 분석 결과를 먼저 확인해 주세요. 승인하기 전에는 아무것도 만들지 않습니다."
