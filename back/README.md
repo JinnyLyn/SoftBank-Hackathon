@@ -54,8 +54,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `PUT` | `/api/connections/{id}` | AWS 연결 이름/설정 변경 |
 | `POST` | `/api/connections/{id}/check` | 현재 연결 상태 확인 |
 | `DELETE` | `/api/connections/{id}` | AWS 연결 설정 삭제 |
-| `POST` | `/api/projects?name=...&filename=...` | `application/zip` 원문 업로드, SHA-256 계산, 프로젝트 메타데이터 저장 |
-| `POST` | `/api/projects/github` | GitHub 저장소 URL과 선택 ref에서 ZIP을 가져와 같은 검증 후 저장 |
+| `POST` | `/api/projects?name=...&filename=...` | `application/zip` 원문 업로드, SHA-256 계산, 프로젝트 메타데이터 저장. 사용자 규모·접속 패턴·월 예산·서비스 설명을 선택 쿼리로 함께 저장 가능 |
+| `POST` | `/api/projects/github` | GitHub 저장소 URL과 선택 ref에서 ZIP을 가져와 같은 검증 후 저장. 규모·예산 입력도 JSON에 선택적으로 포함 가능 |
 | `GET` | `/api/projects?limit=20&cursor=...` | 커서 기반 프로젝트 목록 |
 | `GET` | `/api/projects/{id}` | 프로젝트 상세 |
 | `POST` | `/api/projects/{id}/analyses` | LLM 담당 모듈이 만든 버전·입력 해시 포함 분석 결과 저장 |
@@ -86,7 +86,7 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 ## DB 테이블
 
-- `projects`: ZIP/GitHub 출처, 원본 경로·크기·SHA-256
+- `projects`: ZIP/GitHub 출처, 원본 경로·크기·SHA-256, 사용자 규모·접속 패턴·월 예산·서비스 설명(선택)
 - `analyses`: 분석 스키마 버전, 원본 해시, JSON 결과
 - `deployment_plans`: 대상, 모듈 변수, 비용 추정치, plan digest, 승인 fingerprint와 시각
 - `deployments`: 일반 배포·사용자 승인 롤백별 실행 상태와 URL, 원래 실패 배포/복구 기준 정상 배포 연결
@@ -98,7 +98,8 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 ## 현재 연결 경계
 
 - LLM 분석은 이 API에 분석 JSON을 기록하는 방식으로 연결합니다. 모델, endpoint, 프롬프트, 분석 JSON의 필드 스키마는 이 백엔드에서 고정하지 않았습니다.
-- PR #7 프런트는 분석·추천·코드 생성 API를 예상하지만, LLM 분석 JSON 및 추천 번들 계약은 아직 연결되지 않았습니다. `VITE_USE_MOCK=false` 전환 전 이 계약을 확정해야 합니다.
+- 프런트의 프로젝트 등록 API에는 화면 입력(사용자 규모·접속 패턴·월 예산·서비스 설명)을 저장할 선택 필드를 추가했습니다. 현재 프런트 `real.ts`는 이 필드를 요청에 아직 보내지 않으므로 프런트 담당이 실제 모드 연결 때 전달해야 합니다.
+- LLM 분석 JSON 및 추천 번들 생성 계약은 별도 모듈과 연결되지 않았습니다. 이 API는 LLM을 호출하거나 분석·추천을 자동 생성하지 않습니다. 프런트 분석 화면까지 실제 연결하기 전, 분석 담당 모듈이 프로젝트 source와 메타데이터를 읽고 `/analyses`에 결과를 쓰는 계약을 합의해야 합니다.
 - 배포 worker는 AWS 작업과 사용자 승인 롤백 작업을 claim하고 이벤트를 보고할 계약을 갖습니다. 롤백 작업에는 이전 `healthy` 배포의 검증된 Terraform plan과 원래 실패/복구 기준 배포 ID가 전달됩니다. AWS Terraform 모듈 입력/출력과 DB 마이그레이션 하위 호환성은 인프라 담당과 합의한 뒤 worker에서 구현해야 합니다. Compose는 개발용 API/MySQL 실행에만 사용합니다.
 - 인증된 작업자 API 외의 제품 사용자 인증·인가, 승인자 신원, 브라우저 CORS 도메인은 아직 팀 계약으로 확정되지 않았습니다. 이 API를 공개 ALB에 직접 노출하지 말고, 접근 경계를 합의한 후 배포해야 합니다.
 - DB 스키마는 수동 실행 마이그레이션으로 제공했습니다. 시작 시 자동 DDL을 적용하지 않으며, 운영 DB에 적용하기 전 백업과 마이그레이션 실행 주체를 정해야 합니다.

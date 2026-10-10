@@ -125,11 +125,11 @@ jobs:
         run: npm run build --prefix front
 
   back:
-    name: Platform backend (startup and API smoke)
+    name: Platform backend (API smoke and MySQL contracts)
     needs: inventory
     if: needs.inventory.outputs.back == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -144,6 +144,10 @@ jobs:
           python -m compileall -q back/app
       - name: DB·AWS·LLM 없이 앱 기동·HTTP 계약 확인
         run: python scripts/ci/test_platform_back.py
+      - name: 비밀 마스킹 회귀 검사
+        run: python -m unittest discover -s scripts/ci -p 'test_platform_back_secrets.py' -v
+      - name: 격리 MySQL·마이그레이션 재실행·롤백 API 계약
+        run: bash scripts/ci/run_platform_stack.sh
 
   infra:
     name: Infrastructure (static validation)

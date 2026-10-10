@@ -94,9 +94,11 @@ def validate(body):
             if is_placeholder(value):
                 errors.append(f"상세 보고 {number}: '{field}' 항목을 작성하세요.")
             elif field == "문서 처리":
-                treatment = re.match(r"^(이 PR에서 갱신|JinnyLyn 갱신 요청|변경 불필요)(?=\s|$|[—–:：-])(.*)$",
+                treatment = re.match(r"^(이 PR에서 갱신|JinnyLyn 갱신 요청|변경 불필요)(?=\s|$|[—–:：(（-])(.*)$",
                                      value.replace("**", "").replace("`", ""), flags=re.S)
                 reason = treatment[2].strip(" \t\r\n—–:：-") if treatment else ""
+                if reason.startswith("(") and reason.endswith(")") or reason.startswith("（") and reason.endswith("）"):
+                    reason = reason[1:-1].strip()
                 if not treatment or is_placeholder(reason) or "중 선택하고" in value:
                     errors.append(f"상세 보고 {number}: '문서 처리'에서 처리 방법 하나와 수정 위치·내용 또는 이유를 적으세요.")
     return errors
