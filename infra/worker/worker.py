@@ -259,13 +259,14 @@ def deploy(cfg, *args):
 
 
 # --- planner ---------------------------------------------------------------------------------------
-def app_config_from_analysis(result, tier):
+def app_config_from_analysis(result, tier, tier_cfg=None):
     """분석 결과(result)에서 앱 설정과 Dockerfile 경로를 읽어 app-config.schema.json 규칙으로 검증한다.
 
     분석 결과의 계약(LLM 담당과 합의 필요):
       result["app_config"]  container_port, health_check_path, use_database, environment, init_command(선택)
       result["dockerfile"]  소스 안의 Dockerfile 상대 경로(생략하면 Dockerfile)
-    task_size·min_tasks·max_tasks 는 LLM이 아니라 선택한 구성 단계(tier)가 정한다.
+    task_size·min_tasks·max_tasks 는 LLM이 아니라 선택한 구성 단계(tier)가 정한다. 예산으로 max_tasks를 정한 구성은
+    tier_cfg(cost.estimate의 결과처럼 task_size·min_tasks·max_tasks를 가진 딕셔너리)로 넘기고, 없으면 TIERS 프리셋을 쓴다.
     """
     if not isinstance(result, dict) or not isinstance(result.get("app_config"), dict):
         raise PlanError("분석 결과에 app_config가 없습니다(container_port, health_check_path 등이 필요합니다)")
@@ -292,7 +293,7 @@ def app_config_from_analysis(result, tier):
     dockerfile = result.get("dockerfile", "Dockerfile")
     if not isinstance(dockerfile, str) or not dockerfile or dockerfile.startswith("/") or ".." in dockerfile or len(dockerfile) > 200:
         raise PlanError(f"dockerfile 경로가 올바르지 않습니다: {dockerfile!r}")
-    t = cost.TIERS[tier]
+    t = tier_cfg if tier_cfg is not None else cost.TIERS[tier]
     app = {"container_port": port, "health_check_path": health, "task_size": t["task_size"],
            "min_tasks": t["min_tasks"], "max_tasks": t["max_tasks"],
            "use_database": bool(c.get("use_database", False)), "environment": dict(env)}
@@ -429,7 +430,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         raise PlanError(rec["reason"])
     tier = rec["recommended"]
     est = rec["estimates"][tier]
-    app, dockerfile = app_config_from_analysis(result, tier)
+    app, dockerfile = app_config_from_analysis(result, tier, est)   # est가 예산으로 정한 task_size·min_tasks·max_tasks를 가진다
 
     rc, out, err = run_capture(deploy(cfg, "make-id", f"{project['name']}|{project['id']}"), 60, env=env)
     deploy_id = out.strip()
@@ -470,12 +471,19 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         "source_sha256": src_sha, "cpu_architecture": arch,
         "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
         "resources": est["resources"],
-        "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "excluded": est["excluded"]},
+        "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "peak_monthly": est["peak_monthly"],
+                 "budget_usd": budget, "excluded": est["excluded"]},
+        # 최저·평균·최대 금액 순의 비교 안. 승인 화면이 세 안을 나란히 보여주는 데 쓴다(선택한 안은 recommended=True)
+        "options": rec["options"],
     }
+    comparison = " / ".join(f"{cost.RANKS[o['rank']]} {o['label']}: 평소 ${o['total_monthly']:.2f}·최대 ${o['peak_monthly']:.2f}" for o in rec["options"])
     summary = "\n".join([
         f"{est['label']} 구성({tier}): {app['task_size']} 태스크 {app['min_tasks']}개(최대 {app['max_tasks']}개), 포트 {app['container_port']}, "
         f"헬스체크 {app['health_check_path']}, 앱 전용 DB {'사용' if app['use_database'] else '미사용'}",
         f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
+        f"부하가 최대일 때(태스크 {app['max_tasks']}개) 월 ${est['peak_monthly']:.2f}"
+        + (f", 월 예산 ${budget:.2f} 이내" if budget is not None else ", 월 예산 입력 없음"),
+        f"안 비교(평소·최대 월 비용): {comparison}",
         f"기준: {est['region']}, {est['pricing_as_of']} 가격표. 제외: " + "; ".join(est["excluded"]),
         f"선택 이유: {rec['reason']}",
     ])

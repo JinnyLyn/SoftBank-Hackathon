@@ -327,6 +327,92 @@ class CostTests(unittest.TestCase):
     def test_budget_exactly_equal_is_allowed(self):
         self.assertEqual(cost.recommend("~100", "steady", 91.40, self.p)["recommended"], "lean")
 
+    def test_peak_cost_is_the_cost_at_max_tasks(self):
+        bal = cost.estimate("balanced", self.p)   # small 1~2: 평소 1개, 부하가 최대면 2개
+        self.assertAlmostEqual(bal["peak_monthly"] - bal["total_monthly"], 30.95, places=2)   # (0.5 x 0.0696 + 1 x 0.0076) x 730
+        lean = cost.estimate("lean", self.p)   # 1~1이라 늘어나지 않는다
+        self.assertEqual(lean["peak_monthly"], lean["total_monthly"])
+
+    def test_peak_cost_counts_task_ipv4_when_there_is_no_nat(self):
+        nonat = {"task_subnet_ids": ["a", "b"], "assign_public_ip": True}
+        a, b = cost.estimate("roomy", self.p, foundation=nonat), cost.estimate("roomy", self.p)   # roomy 2~4
+        self.assertAlmostEqual(a["peak_monthly"] - a["total_monthly"], (61.90 + 3.65) * 2, places=1)   # 늘어나는 태스크마다 공인 IPv4가 붙는다
+        self.assertAlmostEqual(b["peak_monthly"] - b["total_monthly"], 61.90 * 2, places=1)
+
+    def test_large_and_xlarge_task_sizes_are_priced(self):
+        # large = 2 vCPU / 4 GB: (2 x 0.0696 + 4 x 0.0076) x 730 = 123.81, xlarge는 그 두 배. modules/ecs-web-app/main.tf의 프리셋과 같은 값이다
+        for size, want in [("large", 123.81), ("xlarge", 247.62)]:
+            with self.subTest(size=size):
+                e = cost.estimate("lean", self.p, cfg={**cost.TIERS["lean"], "task_size": size})
+                self.assertAlmostEqual(e["app_monthly"], want, places=2)
+        with self.assertRaises(ValueError):
+            cost.estimate("lean", self.p, cfg={**cost.TIERS["lean"], "task_size": "huge"})
+
+    def test_budget_makes_lowest_average_highest_options_within_budget(self):
+        r = cost.recommend("~1,000", "steady", 300, self.p)
+        opts = r["options"]
+        self.assertEqual([(o["rank"], o["tier"]) for o in opts], [("lowest", "lean"), ("average", "balanced"), ("highest", "roomy")])
+        for o in opts:
+            self.assertLessEqual(o["peak_monthly"], 300)   # 부하가 최대일 때도 예산을 넘지 않는다
+        self.assertLess(opts[0]["total_monthly"], opts[1]["total_monthly"])
+        self.assertLess(opts[1]["total_monthly"], opts[2]["total_monthly"])
+        # 최대 안은 예산 한도까지 채운다: 태스크를 하나 더 늘리면 예산을 넘는다
+        top = opts[2]
+        over = cost.estimate("roomy", self.p, cfg={**cost.TIERS["roomy"], "max_tasks": top["max_tasks"] + 1})
+        self.assertGreater(over["peak_monthly"], 300)
+        self.assertEqual([o["recommended"] for o in opts], [False, True, False])   # ~1,000명은 평균(balanced)
+
+    def test_budget_is_the_only_limit_so_a_large_budget_allows_more_than_four_tasks(self):
+        top = cost.recommend("~10,000", "steady", 1000, self.p)["options"][-1]
+        self.assertEqual((top["tier"], top["task_size"], top["min_tasks"]), ("roomy", "medium", 2))
+        self.assertGreater(top["max_tasks"], 4)   # 예전에는 max_tasks 4개가 코드로 박혀 있었다
+        self.assertLessEqual(top["peak_monthly"], 1000)
+
+    def test_small_budget_drops_options_that_cannot_be_made(self):
+        # 110달러: 최대(medium 2개, 약 200달러)는 못 만든다. 평균(balanced)을 예산 한도까지 채워 최대 안으로 삼는다
+        r = cost.recommend("~10,000", "steady", 110, self.p)
+        self.assertEqual([(o["rank"], o["tier"], o["max_tasks"]) for o in r["options"]], [("lowest", "lean", 1), ("highest", "balanced", 1)])
+        # 100달러: balanced의 평소 비용(106.87)도 못 담아 최저 안만 남는다
+        r = cost.recommend("~10,000", "steady", 100, self.p)
+        self.assertEqual([(o["rank"], o["tier"]) for o in r["options"]], [("lowest", "lean")])
+        self.assertEqual(r["recommended"], "lean")
+
+    def test_budget_exactly_equal_to_an_options_peak_keeps_that_option(self):
+        # 반올림 오차로 딱 맞는 예산이 탈락하지 않아야 한다(최소 구성의 월 비용과 같은 예산)
+        nonat = {"task_subnet_ids": ["a", "b"], "assign_public_ip": True}
+        for foundation in (None, nonat):
+            for tier, tasks in [("balanced", 1), ("roomy", 2)]:
+                with self.subTest(tier=tier, nat=foundation is None):
+                    exact = cost.estimate(tier, self.p, foundation=foundation, cfg={**cost.TIERS[tier], "max_tasks": tasks})["peak_monthly"]
+                    got = {o["tier"]: o for o in cost.recommend("~1,000", "steady", exact, self.p, foundation=foundation)["options"]}
+                    self.assertIn(tier, got)
+                    self.assertLessEqual(got[tier]["peak_monthly"], exact)
+                    below = {o["tier"] for o in cost.recommend("~1,000", "steady", exact - 0.01, self.p, foundation=foundation)["options"]}
+                    self.assertNotIn(tier, below)   # 1센트만 모자라도 그 안은 만들 수 없다
+
+    def test_without_budget_the_three_presets_are_the_options(self):
+        r = cost.recommend("~1,000", "steady", None, self.p)
+        self.assertEqual([(o["rank"], o["tier"], o["min_tasks"], o["max_tasks"]) for o in r["options"]],
+                         [("lowest", "lean", 1, 1), ("average", "balanced", 1, 2), ("highest", "roomy", 2, 4)])
+
+    def test_options_never_exceed_any_budget_and_grow_with_it(self):
+        nonat = {"task_subnet_ids": ["a", "b"], "assign_public_ip": True}
+        for foundation in (None, nonat):
+            prev_top = 0
+            for budget in range(60, 1500, 13):
+                r = cost.recommend("~1,000", "steady", budget, self.p, foundation=foundation)
+                if not r["options"]:
+                    self.assertIsNone(r["recommended"])
+                    continue
+                self.assertEqual([o["recommended"] for o in r["options"]].count(True), 1)
+                for o in r["options"]:
+                    self.assertLessEqual(o["peak_monthly"], budget, (budget, o))
+                    self.assertGreaterEqual(o["max_tasks"], o["min_tasks"])
+                peaks = [o["peak_monthly"] for o in r["options"]]
+                self.assertEqual(peaks, sorted(peaks))
+                self.assertGreaterEqual(peaks[-1], prev_top)   # 예산이 늘면 최대 안도 줄지 않는다
+                prev_top = peaks[-1]
+
 
 class AppConfigTests(unittest.TestCase):
     def conv(self, result, tier="balanced"):
@@ -337,6 +423,9 @@ class AppConfigTests(unittest.TestCase):
         res["app_config"]["task_size"] = "medium"   # LLM이 정해도 무시한다
         app, df = self.conv(res, "balanced")
         self.assertEqual((app["task_size"], app["min_tasks"], app["max_tasks"]), ("small", 1, 2))
+        # 예산으로 max_tasks를 정한 구성(tier_cfg)은 프리셋 대신 그 값을 쓴다. 코드로 박아 둔 상한은 없다
+        app, _ = worker.app_config_from_analysis(res, "roomy", {"task_size": "medium", "min_tasks": 2, "max_tasks": 14})
+        self.assertEqual((app["task_size"], app["min_tasks"], app["max_tasks"]), ("medium", 2, 14))
         self.assertEqual(df, "sample-back/Dockerfile")
         self.assertEqual(app["init_command"], ["python", "-m", "backend.app.initialize_database"])
         self.assertTrue(app["use_database"])
@@ -471,6 +560,33 @@ class PlannerTests(Base):
         self.assertEqual(self.backend.uploads[0][2], TOKEN)   # 업로드는 worker 경로라 토큰이 간다
         self.assertIn("제외", body["summary"])
         self.assertIn("가격표", body["summary"])
+
+    def test_plan_carries_budget_sized_app_config_and_the_three_options(self):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users="~10,000", monthly_budget_usd=400)
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        self.assertEqual(v["tier"], "roomy")
+        # medium 2개 이상, 최대 태스크 수는 예산 400달러 안에서 정해진다(기본 가정 foundation: 공용 75.92 + 태스크당 61.90 x 5 = 385.4)
+        self.assertEqual((v["app"]["task_size"], v["app"]["min_tasks"], v["app"]["max_tasks"]), ("medium", 2, 5))
+        self.assertLessEqual(v["cost"]["peak_monthly"], 400)
+        self.assertEqual(v["cost"]["budget_usd"], 400.0)
+        self.assertEqual([(o["rank"], o["tier"], o["recommended"]) for o in v["options"]],
+                         [("lowest", "lean", False), ("average", "balanced", False), ("highest", "roomy", True)])
+        self.assertIn("월 예산 $400.00 이내", body["summary"])
+        self.assertIn("안 비교", body["summary"])
+        # 승인 화면에 나가는 금액은 평소 비용이다. 부하가 최대일 때 비용은 variables.cost와 요약에 따로 있다
+        self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), 199.73, places=2)
+
+    def test_plan_without_budget_uses_presets_and_says_so(self):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        del res["scale"]["monthly_budget_usd"]
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        self.assertIsNone(body["variables"]["cost"]["budget_usd"])
+        self.assertEqual(body["variables"]["app"]["max_tasks"], 2)   # balanced 프리셋
+        self.assertIn("월 예산 입력 없음", body["summary"])
 
     def test_plan_is_made_with_plan_only_and_without_building(self):
         worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())

@@ -66,6 +66,8 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 
 검증은 두 겹이다. 1차는 LLM 계층의 JSON 스키마, 2차는 Terraform 변수 검증과 사전 조건이다. JSON 스키마로 표현할 수 없는 `max_tasks >= min_tasks`는 LLM 계층 코드와 Terraform 사전 조건에서 확인한다.
 
+`min_tasks`·`max_tasks`는 1 이상의 정수이기만 하면 되고 **태스크 수 상한을 코드에 두지 않는다**(이전에는 `min_tasks` 1~2, `max_tasks` 1~4). 비용 한도는 사용자가 정한 월 예산이며 비용 계산 코드(`worker/cost.py`)가 부하가 최대일 때(`max_tasks`개)의 월 비용으로 판정한다. 이 모듈 자체는 비용을 막지 않으므로 직접 값을 넣는 경우에는 비용이 그대로 늘어난다. 상한이 없는 만큼 AWS 쪽 한도(Fargate·ECS 서비스 할당량)와 공용 RDS의 최대 연결 수(메모리 1GiB인 `db.t4g.micro`는 기본 파라미터에서 80개 안팎으로 알려져 있으나 이 저장소에서 확인하지는 않았다)를 넘지 않는지는 별도로 확인해야 한다. 태스크가 늘면 앱의 DB 연결도 태스크 수만큼 늘어난다.
+
 태스크 크기 프리셋 (6단계 비용 계산 코드도 같은 값을 쓴다):
 
 | task_size | vCPU | 메모리 |
@@ -73,6 +75,8 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 | xsmall | 0.25 | 0.5 GB |
 | small | 0.5 | 1 GB |
 | medium | 1 | 2 GB |
+| large | 2 | 4 GB |
+| xlarge | 4 | 8 GB |
 
 ## 최초 1회
 
@@ -109,6 +113,7 @@ terraform -chdir=infra/foundation output -json deploy_inputs > infra/deployments
 | `db_backup_retention_days` | `7` | RDS 자동 백업 보관 기간 |
 | `db_multi_az` | `false` | 다중 AZ(비용 약 2배) |
 | `final_snapshot` | `true` | RDS를 지울 때 최종 스냅샷을 남긴다 |
+| `budget_monthly_usd`, `budget_alert_emails` | `0`, 비움(만들지 않음) | 계정의 월 비용이 이 금액의 80%·100%를 넘거나 100%를 넘을 것으로 예측되면 이메일로 알리는 AWS Budgets를 만든다. **알림만 보내고 비용을 차단하지 않는다.** 둘 다 지정해야 만들어지고(금액만 주면 경고), 이메일은 코드에 적지 말고 `-var`로 넘긴다. 배포 역할에 `budgets:` 권한이 필요하다. 사용자가 입력한 앱별 월 예산과는 별개인 운영자용 안전망이다 |
 | `protect_from_destroy` | `true` | RDS 삭제 보호, ECR 강제 삭제 방지 |
 | `ecr_keep_images` | `200` | ECR에 보관할 최근 앱 이미지 수. **저장소 하나를 모든 앱이 같이 쓰므로** 앱 수 × 되돌릴 버전 수보다 커야 한다. 부족하면 오래된 앱의 롤백 대상 이미지가 지워진다. DB 작업용 `tools-` 이미지는 별도 규칙이라 밀려나지 않는다 |
 
@@ -361,7 +366,9 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - 다른 PC에서 S3 state로 이어서 `destroy`(한 PC에서만 시험).
 - `db_multi_az`, `final_snapshot=true`로 삭제(스냅샷 남기기), `nat_high_availability=false`, `az_count=2`의 **실제 생성**(계획 내용만 회귀 시험으로 확인).
 - 두 배포를 정확히 동시에 `up`할 때의 포트 경합(문서에 한계를 적었다).
-- CPU 기반 오토스케일링(`max_tasks > min_tasks`)의 실제 증감, 부하 상황.
+- CPU 기반 오토스케일링(`max_tasks > min_tasks`)의 실제 증감, 부하 상황. 태스크 수 상한을 없앤 뒤 `max_tasks`가 4를 넘는 배포(예: 예산이 큰 경우)의 실제 생성과 공용 RDS 연결 수 한도.
+- `large`·`xlarge` 태스크 크기의 실제 배포(계획 입력 검증과 비용 계산만 시험했다).
+- AWS Budgets 알림(`budget_monthly_usd`)의 실제 생성과 메일 수신. 가짜 자격 증명으로 계획 내용(예산 1개, 알림 3건)만 확인했고 실제 계정·권한에서는 적용하지 않았다.
 - `cpu_architecture = ARM64` 이미지.
 - 이미지 빌드·푸시를 포함한 전체 배포 시간과 3분 데모 목표 충족 여부. 이미지가 이미 있을 때 `apply`~`healthy`는 약 2~3분(앱 전용 DB 준비 포함 약 3분)이었다.
 - 테이블 생성 주체(앱 시작 시 자동 생성 vs 마이그레이션)는 팀 미결(`docs/OPEN_QUESTIONS.md`). 앱 전용 DB는 빈 DB로 만들어진다.

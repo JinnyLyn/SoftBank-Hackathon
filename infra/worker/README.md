@@ -42,7 +42,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 백엔드에서 계획이 없는 프로젝트를 찾고(`GET /api/projects`, `/plans`), 분석 결과가 있으면 다음을 한다.
 
-1. 분석 결과의 사용 규모·예산으로 구성 단계(`lean` / `balanced` / `roomy`)와 월 비용을 계산한다(`cost.py`, `prices.json`).
+1. 분석 결과의 사용 규모·예산으로 최저·평균·최대 세 안(`lean` / `balanced` / `roomy`)과 월 비용을 계산하고 그중 하나를 고른다(`cost.py`, `prices.json`. 아래 "최저·평균·최대 세 안과 예산").
 2. `deploy.sh make-id`로 배포 ID, `deploy.sh image-ref`로 이미지 주소를 정한다(이미지는 아직 만들지 않는다).
 3. `deploy.sh up --plan-only`로 Terraform 계획을 만든다. **Docker 빌드는 하지 않는다**(승인 전).
 4. plan 파일의 SHA-256을 계산해 `POST /api/plans`로 등록하고, 파일을 `POST /api/worker/plans/{id}/terraform-plan`으로 올린다.
@@ -68,16 +68,33 @@ python infra/worker/worker.py --once             # 한 번만 점검
 ```
 
 - `app_config`는 [`app-config.schema.json`](../modules/ecs-web-app/app-config.schema.json)과 같은 규칙으로 검증한다. 검증에 실패하면 계획을 만들지 않는다.
-  `task_size`·`min_tasks`·`max_tasks`는 분석이 아니라 **선택한 구성 단계가 정한다**(분석 결과의 값은 무시).
+  `task_size`·`min_tasks`·`max_tasks`는 분석이 아니라 **선택한 구성 단계와 예산이 정한다**(분석 결과의 값은 무시).
 - `init_command`는 앱 이미지로 apply 뒤에 한 번 실행한다(테이블 생성 등). 여러 번 실행돼도 안전해야 한다.
 - `dockerfile`은 소스 안의 상대 경로다(생략하면 `Dockerfile`).
-- `scale`은 백엔드 API에 사용 규모·예산을 받는 곳이 없어서 분석 결과에 담는 방식으로 정했다. 없으면 `balanced`로 시작하고 예산 검사는 하지 않는다.
+- `scale`은 백엔드 API에 사용 규모·예산을 받는 곳이 없어서 분석 결과에 담는 방식으로 정했다. 없으면 `balanced`로 시작하고 예산 검사는 하지 않는다(세 안은 프리셋 그대로).
 - 비밀로 보이는 환경 변수 **이름**이나 `DATABASE_URL`은 거부한다. 이름이 무해해도 **값**이 키·토큰·접속 URL처럼 보이면(`sk-...`, `ghp_...`, AWS 키, JWT, 개인 키, `mysql://사용자:비밀번호@`) 거부한다. 값은 계획 변수와 작업 정의에 평문으로 남기 때문이다.
+
+### 최저·평균·최대 세 안과 예산
+
+월 예산(`scale.monthly_budget_usd`)은 코드에 박은 상한 대신 사용자가 정하는 한도다. 예산이 있으면 `cost.budget_configs`가 그 금액을 넘지 않는 세 안을 만든다. 예산 판정은 평소 비용이 아니라 **부하가 최대일 때(오토스케일링이 `max_tasks`까지 늘었을 때)의 월 비용(`peak_monthly`)** 으로 한다. 그래야 부하가 몰려도 예산을 넘지 않는다.
+
+| 안 | 구성 | 금액 기준 |
+|---|---|---|
+| 최저 `lean` | xsmall 1개 고정 | 예산과 무관하게 가장 작은 구성 |
+| 평균 `balanced` | small, 최소 1개 | 최저와 최대 안의 **중간 금액**까지 `max_tasks`를 채움 |
+| 최대 `roomy` | medium, 최소 2개 | **예산 한도**까지 `max_tasks`를 채움 |
+
+- `max_tasks`는 코드에 상한이 없고 예산이 허용하는 만큼 정해진다(예: foundation 기본 구성(3 AZ, NAT 3대)에서 월 $300이면 최대 안은 medium 2~3개, $1000이면 2~14개). 예산을 늘리면 최대 안도 따라 커진다.
+- 예산이 작아 최대 안의 최소 구성(medium 2개)을 못 담으면 평균 안을 예산 한도까지 채워 최대 안으로 삼는다. 그것도 못 담으면 최저 안만 남는다. 최저 안도 예산을 넘으면 계획을 만들지 않고 이유와 함께 종료한다.
+- 예산이 없으면 예산 판정을 하지 않고 프리셋 세 안(1~1, 1~2, 2~4)을 그대로 쓴다.
+- 이 중 추천 안은 예상 사용자 수와 접속 패턴으로 고른다. 예산 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다.
+- 비교 금액은 두 가지다. `total_monthly`는 평소(`min_tasks`개) 비용, `peak_monthly`는 부하가 최대일 때 비용이다. 승인 화면으로 가는 `cost_estimate.amount`는 평소 비용이다.
+- 제외 항목(NAT 인스턴스 EC2, ALB 처리 용량·데이터 전송, 로그·ECR·백업 저장)은 두 금액 모두에 들어 있지 않다. 그래서 실제 청구는 예산보다 클 수 있다. 이를 알아채려면 foundation의 `budget_monthly_usd` 알림(`infra/README.md`)을 쓴다.
 
 ### 계획 변수 (프런트가 읽는 키)
 
-`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`를 담는다.
-현재는 **권장 단계 하나만** 계획으로 등록한다. 단계마다 Terraform 저장 계획이 따로 필요한데 한 배포 폴더에는 계획 하나만 둘 수 있어서, 단계 비교용 여러 계획은 아직 만들지 않았다(프런트 `README`의 "추천 비교표"는 계획이 하나면 그 하나만 보여 준다).
+`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`(`app_monthly`, `shared_monthly`, `peak_monthly`, `budget_usd`, `excluded`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `headline`, `tradeoff`, `recommended`)를 담는다.
+현재는 **권장 단계 하나만** 계획으로 등록하고, 나머지 안은 `options`로 비교 정보만 알린다. 단계마다 Terraform 저장 계획이 따로 필요한데 한 배포 폴더에는 계획 하나만 둘 수 있어서, 단계 비교용 여러 계획은 아직 만들지 않았다(프런트 `README`의 "추천 비교표"는 계획이 하나면 그 하나만 보여 준다). 사용자가 다른 안을 고르는 흐름(선택한 안을 worker에 전달해 그 안으로 다시 계획)은 백엔드·프런트와 계약을 맞춰야 한다(`docs/OPEN_QUESTIONS.md`).
 
 ## executor: 승인된 작업 실행
 

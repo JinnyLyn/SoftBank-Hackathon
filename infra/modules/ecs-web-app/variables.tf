@@ -158,35 +158,35 @@ variable "health_check_path" {
 }
 
 variable "task_size" {
-  description = "태스크 크기 프리셋 (5단계 추천 결과). 비용 계산 코드는 같은 프리셋 표를 쓴다"
+  description = "태스크 크기 프리셋 (5단계 추천 결과). 비용 계산 코드는 같은 프리셋 표를 쓴다. 비용 상한은 여기서 걸지 않고 사용자가 정한 월 예산으로 비용 계산 코드(6단계)가 판정한다"
   type        = string
   default     = "xsmall"
 
   validation {
-    condition     = contains(["xsmall", "small", "medium"], var.task_size)
-    error_message = "task_size는 xsmall, small, medium 중 하나여야 합니다."
+    condition     = contains(["xsmall", "small", "medium", "large", "xlarge"], var.task_size)
+    error_message = "task_size는 xsmall, small, medium, large, xlarge 중 하나여야 합니다."
   }
 }
 
 variable "min_tasks" {
-  description = "최소 태스크 수 (5단계 추천 결과)"
+  description = "최소 태스크 수 (5단계 추천 결과). 상한은 두지 않는다(사용자가 정한 월 예산이 한도)"
   type        = number
   default     = 1
 
   validation {
-    condition     = contains([1, 2], var.min_tasks)
-    error_message = "min_tasks는 1 또는 2여야 합니다."
+    condition     = var.min_tasks >= 1 && var.min_tasks == floor(var.min_tasks)
+    error_message = "min_tasks는 1 이상의 정수여야 합니다."
   }
 }
 
 variable "max_tasks" {
-  description = "최대 태스크 수. min_tasks보다 크면 CPU 기준 오토스케일링을 켠다 (5단계 추천 결과)"
+  description = "최대 태스크 수. min_tasks보다 크면 CPU 기준 오토스케일링을 켠다 (5단계 추천 결과). 상한은 두지 않는다(사용자가 정한 월 예산이 한도이며, 비용 계산 코드가 부하가 최대일 때의 월 비용으로 판정한다)"
   type        = number
   default     = 1
 
   validation {
-    condition     = contains([1, 2, 3, 4], var.max_tasks)
-    error_message = "max_tasks는 1~4여야 합니다. 지원금 범위를 넘지 않도록 상한을 둔다."
+    condition     = var.max_tasks >= 1 && var.max_tasks == floor(var.max_tasks)
+    error_message = "max_tasks는 1 이상의 정수여야 합니다."
   }
 }
 
