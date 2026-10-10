@@ -2,6 +2,10 @@
 
 플랫폼 백엔드(`back/`, PR #10)와 `infra/scripts/deploy.sh`를 잇는 프로그램이다. 표준 라이브러리만 쓴다(Python 3.12 이상).
 
+현재 제품 기준은 [PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`이다. 아래 AWS 자격 증명과 foundation 준비는 운영자/worker 환경용이며 사용자 계정·IAM 키 입력을 전제하지 않는다. 계정 이전은 [OPERATOR_AWS.md](../../docs/OPERATOR_AWS.md)를 따른다.
+
+이 worker의 `healthy`는 앱 배포 상태다. 도메인 신규 등록·DNS·인증서·호스트 라우팅의 제품 흐름은 아직 포함하지 않는다. 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
+
 백엔드는 ZIP·분석 결과·계획·승인·배포 대기열을 저장만 하고 Terraform·Docker·AWS를 실행하지 않는다(`back/API.md`).
 프런트는 계획이 생길 때까지 기다리기만 한다. 그 사이를 이 worker가 채운다.
 
@@ -88,7 +92,11 @@ python infra/worker/worker.py --once             # 한 번만 점검
 - **보고는 일시 오류(연결 실패, 5xx)면 최대 4번 다시 보낸다.** 4xx(상태 전이 거부 등)는 다시 보내도 같아서 바로 올린다. `deploying` 보고가 끝내 실패해도 apply 출력 읽기는 멈추지 않고, 끝난 뒤 `deploying`을 다시 보내고 `healthy`를 보낸다(백엔드는 `provisioning`에서 `healthy`로 바로 갈 수 없다).
 - **제한 시간**(계획 15분, 빌드 20분, 적용 25분)을 넘기면 bash만이 아니라 **하위 프로세스(terraform·docker) 전체를 종료**하고 `failed`로 보고한다(Windows는 `taskkill /T`, 그 밖에는 프로세스 그룹 종료). 종료된 Terraform은 state 잠금이 남을 수 있어 `deploy.sh` 재시도 전에 확인이 필요하다.
 
-**실패해도 자동 롤백하지 않는다.** 자동 복구 범위가 팀 결정 전이다(AGENTS.md 6장). 되돌리려면 `deploy.sh rollback <id>`를 사람이 실행한다.
+**실패해도 자동 롤백하지 않는다.** 이는 미결 사항이 아니라 [AGENTS §5](../../AGENTS.md#5-처리-흐름과-계약)의 확정 정책이다. 첫 배포 실패에는 롤백이 없으며 AI 진단·수정안 → 새 계획 → 사용자 승인 → 재배포로 진행한다.
+
+이후 실패한 일반 배포의 롤백은 [백엔드 승인 계약](../../back/API.md#실패-후-사용자-승인-롤백)을 따른다. 사용자가 이전 `healthy` 버전으로 되돌릴 것을 선택하면 새 rollback plan 초안을 만들고, 새 Terraform 저장 plan·SHA-256·diff 요약을 등록한다. 사용자가 새 fingerprint·digest·diff를 검토해 승인한 뒤에만 별도 롤백 작업을 대기열에 등록하고 승인된 저장 plan을 실행한다. 롤백 실패를 자동 재시도하거나 DB 스키마·데이터 복구와 동일시하지 않는다.
+
+**현재 worker에는 rollback plan 생성·업로드·diff 등록과 롤백 전용 실행 연동이 구현돼 있지 않다.** 위 내용은 연결해야 할 계약이며 현재 end-to-end 지원을 뜻하지 않는다. 연동 전에는 제품 롤백 실행을 제공하지 않고 미지원 상태를 알린다. 이 공백을 사람이 `deploy.sh rollback`을 직접 실행하는 방식으로 대체하지 않는다. 저수준 CLI의 확인 프롬프트도 백엔드의 사용자 승인을 대신하지 않는다.
 
 ## 지키는 규칙
 

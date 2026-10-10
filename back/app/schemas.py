@@ -65,6 +65,56 @@ class ConnectionOut(APIModel):
     setupUrl: str | None = None
     checkedAt: datetime
     fields: dict[str, str]
+    accountId: str | None = None
+    roleArn: str | None = None
+
+
+class PendingConnectionOut(APIModel):
+    id: UUID
+    provider: Literal["aws"]
+    name: str
+    external_id: str
+    fields: dict[str, str]
+    created_at: datetime
+    account_id: str | None = None
+    role_arn: str | None = None
+
+
+class ConnectionRoleCallbackIn(APIModel):
+    external_id: str = Field(min_length=35, max_length=35)
+    account_id: str = Field(pattern=r"^\d{12}$")
+    role_arn: str = Field(
+        min_length=24,
+        max_length=2048,
+        pattern=r"^arn:(aws|aws-us-gov|aws-cn):iam::\d{12}:role(?:/[A-Za-z0-9+=,.@_-]+)+$",
+    )
+
+    @model_validator(mode="after")
+    def account_matches_role_arn(self) -> "ConnectionRoleCallbackIn":
+        arn_account = self.role_arn.split(":", maxsplit=5)[4]
+        if arn_account != self.account_id:
+            raise ValueError("account_id must match the AWS account in role_arn")
+        return self
+
+
+class ConnectionCompleteIn(APIModel):
+    account_id: str = Field(pattern=r"^\d{12}$")
+    role_arn: str = Field(
+        min_length=24,
+        max_length=2048,
+        pattern=r"^arn:(aws|aws-us-gov|aws-cn):iam::\d{12}:role(?:/[A-Za-z0-9+=,.@_-]+)+$",
+    )
+
+    @model_validator(mode="after")
+    def account_matches_role_arn(self) -> "ConnectionCompleteIn":
+        arn_account = self.role_arn.split(":", maxsplit=5)[4]
+        if arn_account != self.account_id:
+            raise ValueError("account_id must match the AWS account in role_arn")
+        return self
+
+
+class ConnectionFailIn(APIModel):
+    error: str = Field(min_length=1, max_length=2000)
 
 
 class FrontDeployStatus(APIModel):

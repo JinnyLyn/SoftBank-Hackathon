@@ -735,7 +735,7 @@ class ExecutorTests(Base):
         self.assertEqual(ev["event_type"], "apply_failed")
         self.assertEqual(ev["details"]["diagnose"]["deployId"], "fake0001")
         self.assertIn("헬스체크 실패", ev["details"]["log_tail"])
-        self.assertFalse(any(c.startswith("rollback") for c in self.calls()))   # 자동 복구 범위가 미결이라 롤백하지 않는다
+        self.assertFalse(any(c.startswith("rollback") for c in self.calls()))   # 새 계획의 사용자 승인 없이 자동 롤백하지 않는다
 
     def test_missing_outputs_url_fails(self):
         job = self.make_job()

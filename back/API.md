@@ -2,6 +2,8 @@
 
 프런트엔드와 백엔드 연동을 위한 현재 API 계약입니다. 구현의 상세 스키마는 실행 중인 FastAPI 문서(`/docs`)와 OpenAPI JSON(`/openapi.json`)을 기준으로 합니다.
 
+제품 방향은 [PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`을 따릅니다. 운영자 관리형 AWS와 사용자 독립 도메인이 목표지만, **도메인 조회·신규 등록·연결·상태 API는 현재 이 문서의 구현 계약에 포함되지 않습니다.** 프런트 `JinVibe:f169d27`의 `/api/domains/check`, `/api/projects/{id}/domain`, `/api/projects/{id}/domain/approve`, `status.domain`은 제안입니다. 이번 시연의 A/B 범위와 파트 간 계약을 먼저 확인하며 구매 자동화를 필수 구현으로 가정하지 않습니다. 기존 연결 API의 존재가 사용자 AWS 연결을 필수로 요구하는 근거는 아닙니다.
+
 ## 접속 및 공통 규칙
 
 - 로컬 기본 주소: `http://127.0.0.1:8000`
@@ -194,7 +196,16 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/connections/{connection_id}/check`: 저장된 연결 상태 조회. 현재 AWS 자격 증명을 직접 호출해 실시간 검증하는 endpoint는 아닙니다.
 - `DELETE /api/connections/{connection_id}`: 연결 삭제
 
-연결 생성 결과에는 `status: "pending"`과 설정용 `setupUrl`이 포함될 수 있습니다. CloudFormation 템플릿 URL 설정과 연결 완료 callback은 서버 설정/worker 연동이 필요합니다. API가 프런트 요청만으로 AWS 계정을 검증하지는 않습니다.
+연결 생성 결과에는 `status: "pending"`과 설정용 `setupUrl`이 포함될 수 있습니다. 공개 HTTPS 템플릿 주소는 `AWS_CONNECTION_TEMPLATE_URL`, worker의 운영자 계정 ID는 `PLATFORM_AWS_ACCOUNT_ID`, CloudFormation 콘솔 리전은 `AWS_REGION` 환경 변수로 받습니다. `PUBLIC_API_BASE_URL`이 설정되면 연결별 `param_RoleCallbackUrl`도 CloudFormation 링크에 추가합니다. 해당 템플릿은 이 URL을 호출해 생성한 AWS 계정 ID와 IAM role ARN을 전달하도록 별도로 구현되어야 합니다. 링크에는 `param_PlatformAccountId`와 연결별 `param_ExternalId`도 추가합니다.
+
+CloudFormation callback과 worker 경로는 다음과 같습니다.
+
+- `POST /api/connections/{connection_id}/role-callback`: CloudFormation 템플릿이 `{ "external_id": "...", "account_id": "12자리 계정 ID", "role_arn": "arn:aws:iam::...:role/..." }`을 전달합니다. worker token 대신 연결별 무작위 `external_id`를 capability로 검증합니다. 반복 호출은 같은 값이면 멱등이고, 다른 역할은 409입니다. 이 콜백은 ARN을 저장할 뿐 AWS 역할의 실제 유효성은 검증하지 않습니다.
+- `GET /api/worker/connections/pending`: 인증된 worker가 대기 연결 목록(ID, `external_id`, 입력 필드, 콜백으로 받은 `account_id`·`role_arn`)을 조회합니다. 콜백 전에는 두 역할 필드가 `null`이므로 worker는 역할 정보가 도착할 때까지 처리를 보류해야 합니다.
+- `POST /api/worker/connections/{connection_id}/fail`: `{ "error": "실패 원인" }`으로 실패를 보고합니다. 오류는 저장 전에 민감값을 마스킹하며 같은 실패 재시도는 멱등 처리합니다.
+- `POST /api/worker/connections/{connection_id}/complete`: `{ "account_id": "<사용자 AWS 계정 ID>", "role_arn": "arn:aws:iam::<같은 사용자 계정 ID>:role/PavedCloudsReadOnlyRole" }` 형식으로 완료를 보고합니다. 콜백에 저장된 값과 일치해야 하며, worker는 먼저 AWS에서 AssumeRole 등 실제 검증을 수행해야 합니다. 콜백 없이 만들어진 기존 연결도 worker가 값을 직접 보고할 수 있습니다. `008` 이전부터 `connected`였고 두 역할 컬럼이 모두 `NULL`인 기존 행은 최초 한 번 완료 보고로 원자적으로 보완됩니다. 일부 값만 비어 있거나 저장된 값과 다르면 409입니다. `PLATFORM_AWS_ACCOUNT_ID`는 이와 별개로 사용자 역할의 trust policy가 신뢰할 worker 운영 계정입니다.
+
+백엔드는 ARN 구문과 계정 ID만 대조하며 AWS STS로 역할 존재나 실제 권한을 검증하지 않습니다. worker가 AssumeRole/GetCallerIdentity 등 AWS 검증에 성공한 뒤 완료를 보고해야 합니다. CloudFormation 템플릿이 callback parameter를 받아 역할 정보를 POST하는 기능은 인프라 템플릿 쪽 연동이 필요합니다. 템플릿이 공개 HTTPS 주소에 올라가 `AWS_CONNECTION_TEMPLATE_URL`이 설정되기 전에는 setup 링크가 만들어지지 않습니다.
 
 ## Worker 전용 API
 
@@ -206,6 +217,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/worker/deployments/claim`: 대기 중인 AWS 일반 배포 또는 사용자 승인 롤백 작업 하나를 가져옵니다. 롤백 작업에는 `operation_type: "rollback"`, `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다. 없으면 `{ "job": null }`.
 - `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 일반 배포와 롤백 모두 `queued → provisioning → deploying → healthy` 또는 `failed` 흐름을 사용합니다. 현재 상태와 같은 상태를 보내면 상태와 URL은 그대로 두고 로그 이벤트만 추가합니다. 다른 상태에서 `healthy`로 전이할 때는 HTTP(S) `url`이 필요합니다.
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.
+- `GET /api/worker/connections/pending`: worker 인증 후 처리할 대기 연결 배열을 반환합니다.
+- `POST /api/worker/connections/{connection_id}/fail`: worker 실패 상태와 마스킹된 오류를 저장합니다.
 
 worker 이벤트의 `message`와 `details`는 DB 저장 전에 비밀값을 마스킹합니다. `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey`, `SessionToken`처럼 snake_case, kebab-case, camelCase/PascalCase로 표기된 민감 키를 처리하며, 이벤트 및 프로젝트 상태 로그를 조회할 때도 기존 저장 데이터의 값이 다시 노출되지 않도록 마스킹합니다.
 

@@ -2,6 +2,12 @@
 
 배포 플랫폼의 Python API와 MySQL 영속성 계층입니다. 프로젝트 ZIP/GitHub 소스 메타데이터, LLM 분석 결과, 승인된 배포 계획, 배포 상태와 이벤트 로그를 저장합니다. 제품 LLM 호출과 AWS 배포 실행기는 이 서비스에 포함하지 않습니다. 새 배포는 AWS 클라우드만 지원하며, 작업자가 연결되기 전에는 배포가 `queued` 상태에 머뭅니다.
 
+## 현재 제품 방향과 구현 범위
+
+[관리형 배포·사용자 독립 도메인](../docs/PRODUCT_DIRECTION.md)이 제품 기준이며 ID는 `2026-10-10-managed-domains-v1`입니다. 운영자가 준비한 AWS로 배포하고 사용자 AWS 계정·키 입력을 기본 전제로 삼지 않습니다. 기존 `connections` API가 있다는 이유로 사용자 계정 연결을 필수 온보딩으로 유지하지 않습니다. 운영자 계정 준비는 [별도 문서](../docs/OPERATOR_AWS.md)를 따릅니다.
+
+이번 시연의 기존 확보 도메인 연결(A) / 신규 구매 자동화(B) 선택은 추가 확인 대상입니다. `domains` 테이블·가용성/등록/연결/상태 API는 회의록의 **구현 후보**이며 현재 이 API에 구현된 기능이 아닙니다. 프런트 개인 브랜치의 제안 endpoint와 상태 값을 확정 계약으로 간주하지 않습니다. 필요한 범위·등록인/동의 정보·비용 승인·앱 상태와 도메인 상태의 구분을 연결 파트와 정한 뒤 migration과 API 문서를 함께 갱신합니다.
+
 ## 실행 환경
 
 - Python `3.13.16` (`.python-version`)
@@ -40,6 +46,18 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
 `DATABASE_URL`은 `mysql://user:password@host:3306/database` 또는 `mysql+pymysql://...` 형식입니다. 비밀번호에 `@`, `:`, `/`, `%` 등이 있으면 URL 인코딩해야 합니다. AWS RDS 연결에서 TLS CA 검증이 필요하면 `DB_SSL_CA`에 AWS RDS CA bundle 경로를 설정합니다. 앱 시작 시 테이블을 자동 생성하지 않습니다. 마이그레이션은 별도 명령으로 실행하고 `schema_migrations`에 적용 기록을 남깁니다.
+
+### 로컬 MySQL 통합 검사
+
+마이그레이션 적용 후 실제 로컬 MySQL에 연결되는 worker 연결 API 통합 검사는 다음처럼 실행합니다. 테스트는 `DATABASE_URL`이 loopback 주소인지 먼저 확인하고, 합성 연결 두 건을 만든 뒤 삭제합니다. AWS에는 요청하지 않습니다.
+
+```powershell
+$env:DATABASE_URL = "mysql://user:password@127.0.0.1:3307/paved_clouds"
+python -m app.cli migrate
+python tests/integration_connections.py
+```
+
+검사는 DB readiness, worker 인증, 대기 연결 조회, IAM ARN 계정 일치 검증, 완료 동시 요청·멱등 재시도, 실패 메시지 마스킹을 확인합니다. 실제 서비스 URL은 loopback 주소로 제한되며 AWS에는 요청하지 않습니다.
 
 ## 구현된 API
 
@@ -82,10 +100,11 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 첫 AWS 배포가 실패하면 이전 `healthy` 배포가 없으므로 롤백을 제공하지 않습니다. 프런트는 `rollback-candidate` 응답의 `first_deployment` 또는 `no_previous_healthy` 이유를 표시하고, AI 실패 원인 분석·수정안 → 새 계획·비용·plan 확인 → 사용자 승인 → 재배포 흐름으로 진행해야 합니다. 이후 실패에서 사용자가 롤백을 선택하면 `rollback` endpoint가 새 `awaiting_approval` rollback plan을 만듭니다. worker는 그 설정으로 **새 Terraform plan과 diff 요약**을 생성·저장하고, 사용자는 새 fingerprint·digest·diff를 확인한 뒤 기존 plan 승인 API로 승인합니다. 승인 전 새 rollback plan은 대기열에 등록할 수 없으며, 자동 롤백은 수행하지 않습니다.
 
-연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. 연결 상태는 검증된 AWS 계정 확인 주체가 `POST /api/worker/connections/{id}/complete`로 계정 ID를 보고할 때 `connected`가 됩니다. `WORKER_API_TOKEN` 없이 연결 완료를 호출할 수 없습니다.
+연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. `PLATFORM_AWS_ACCOUNT_ID`는 worker가 사용하는 운영자 계정 ID이며 사용자 계정의 역할이 신뢰할 플랫폼 계정입니다. `AWS_REGION`은 해당 연결을 위한 콘솔 리전입니다. `PUBLIC_API_BASE_URL`을 설정하면 링크에 연결별 `param_RoleCallbackUrl`을 추가합니다. 템플릿이 이 URL과 `ExternalId`를 이용해 계정 ID·역할 ARN을 콜백하면 백엔드가 저장하고 worker의 대기 조회 응답에 포함합니다. 콜백 전까지 worker는 대기해야 합니다. worker는 AWS에서 역할을 실제 검증한 뒤 `complete`를 호출합니다. 백엔드는 IAM role ARN 형식, 계정 일치, 이미 저장된 콜백 정보와의 일치를 검사합니다. `008` 이전부터 `connected`였고 계정·ARN이 모두 비어 있는 기존 행은 `complete` 재호출 시 한 번 원자적으로 보완할 수 있습니다. 콜백과 worker 연결 완료 API의 상세 계약은 [API 문서](API.md)를 참고하세요.
 
 ## DB 테이블
 
+- `connections`: AWS 연결 요청·상태, 외부 ID, 연결 완료 시 계정 ID와 IAM role ARN
 - `projects`: ZIP/GitHub 출처, 원본 경로·크기·SHA-256, 사용자 규모·접속 패턴·월 예산·서비스 설명(선택)
 - `analyses`: 분석 스키마 버전, 원본 해시, JSON 결과
 - `deployment_plans`: 대상, 모듈 변수, 비용 추정치, plan digest, 승인 fingerprint와 시각

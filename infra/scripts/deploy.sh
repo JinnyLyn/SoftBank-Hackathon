@@ -11,7 +11,7 @@
 #   deploy.sh up       (--id a1b2c3d4 | --name "프로젝트 이름") --image <ecr_url>:a1b2c3d4-r1 --app app.json [--port 8001|auto] [--yes]
 #                      [--plan-only] [--shared-db] [--grace 초] [--skip-nat-check] [--arch ARM64]   # 아키텍처 기본값은 이 PC의 docker
 #   deploy.sh update   a1b2c3d4 [--image <ecr_url>:tag] [--app app.json] [--yes] [--plan-only]
-#   deploy.sh rollback a1b2c3d4 [--to <이미지>] [--yes] [--plan-only]
+#   deploy.sh rollback a1b2c3d4 --plan-only [--to <이미지>]   # 저수준 계획 생성. 제품 롤백은 아래 승인·연동 조건 필요
 #   deploy.sh apply    a1b2c3d4            # 위 명령을 --plan-only 로 만든, 승인된 저장 계획만 적용한다
 #   deploy.sh status   a1b2c3d4
 #   deploy.sh diagnose a1b2c3d4            # 실패 분석용 JSON(비밀 마스킹됨)을 표준 출력으로 낸다
@@ -29,9 +29,12 @@
 #   HEALTH_TIMEOUT      헬스체크 대기 시간(초, 기본 300)
 #   PAVED_STATE_BUCKET  지정하면 배포 state를 이 S3 버킷에 저장한다(infra/bootstrap으로 만든다). 없으면 로컬 파일
 #
-# 설계 규칙 (AGENTS.md 6장)
+# 설계 규칙 (AGENTS.md 5·6장, infra/README.md의 "롤백")
 #   - apply는 항상 승인된 저장 plan(tfplan)만 실행한다. 승인 후 새 plan을 만들지 않는다.
-#   - 롤백은 사람이 명령으로 실행한다. 자동 복구는 범위가 확정되기 전이라 만들지 않았다.
+#   - 자동 롤백은 하지 않는다(확정 정책). 첫 실패는 진단·수정안 → 새 계획·사용자 승인 → 재배포다.
+#   - 이후 실패의 제품 롤백은 백엔드 후보 선택 → 새 저장 plan·SHA-256·diff 등록 → 사용자 승인 → 별도 실행 순서다.
+#     이 CLI의 대상 선택·확인 프롬프트는 제품 승인을 대신하지 않는다. --plan-only 없는 rollback은 apply까지 진행할 수 있다.
+#     worker의 롤백 연동은 아직 미구현이므로 사람이 rollback/apply를 직접 실행해 공백을 메우지 않는다.
 #   - 이력(history.log)에는 헬스체크를 통과한 배포만 남기고(롤백 대상), 모든 시도는 attempts.log에 성공·실패를 남긴다.
 #   - 롤백은 이미지와 그때의 앱 설정을 함께 되돌린다(스냅샷).
 #   - 이미지를 되돌려도 DB 스키마와 데이터는 되돌아가지 않는다.

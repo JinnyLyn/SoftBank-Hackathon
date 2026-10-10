@@ -62,8 +62,9 @@ resource "aws_ecs_service" "app" {
   deployment_maximum_percent         = 200
 
   # 새 태스크가 계속 뜨자마자 죽으면 ECS는 기본적으로 끝없이 재시도하고 배포가 IN_PROGRESS로 남는다.
-  # 서킷 브레이커를 켜면 반복 실패 시 배포가 FAILED가 된다. 이전 정상 버전으로의 자동 복구(rollback)는
-  # 허용 범위가 팀에서 확정되기 전이라 켜지 않는다 (AGENTS.md 6장). 복구는 deploy.sh rollback으로 사람이 한다
+  # 서킷 브레이커는 반복 실패를 FAILED로 끝낸다. 자동 롤백은 확정 정책에 따라 끈다(AGENTS.md 5장).
+  # 첫 실패는 진단·수정 후 새 계획을 승인받아 재배포한다. 이후 실패의 제품 롤백도 새 plan·diff의 사용자 승인이 필요하다.
+  # worker의 롤백 연동 전에는 수동 CLI로 대신 실행하지 않는다. 절차·현재 한계는 infra/README.md의 "롤백"을 따른다.
   deployment_circuit_breaker {
     enable   = true
     rollback = false
