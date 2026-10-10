@@ -632,6 +632,24 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .conn-status.is-error::before { background: var(--marking); }
 .conn-error { color: var(--fail); font-size: 12.5px; }
 .conn-pending { font-size: 12.5px; color: var(--marking-ink); }
+/* 오래 걸리는 작업 진행 표시 */
+.work-progress { border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 14px 18px; display: flex; flex-direction: column; gap: 10px; max-width: 720px; }
+.work-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.work-head strong { display: flex; align-items: center; gap: 8px; }
+.work-head .pulse { display: inline-block; width: 9px; height: 9px; }
+.work-steps { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 6px 22px; }
+.work-steps li { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.work-steps .dot { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line-strong); }
+.work-steps li.is-current { color: var(--ink); font-weight: 600; }
+.work-steps li.is-current .dot { border-color: var(--marking); background: var(--marking-soft); }
+.work-steps li.is-done { color: var(--ok); }
+.work-steps li.is-done .dot { background: var(--ok); border-color: var(--ok); }
+.work-steps li.is-failed { color: var(--fail); }
+.work-steps li.is-failed .dot { background: var(--fail); border-color: var(--fail); }
+.work-hint { font-size: 13px; color: var(--ink-2); animation: reveal 0.4s ease both; }
+.reveal { animation: reveal 0.35s ease both; }
+@keyframes reveal { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .reveal, .work-hint { animation: none; } }
 .rec-wait { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-2); font-size: 13px; }
 .rec-wait .pulse { display: inline-block; width: 8px; height: 8px; }
 .rec-wait.is-error { color: var(--fail); }

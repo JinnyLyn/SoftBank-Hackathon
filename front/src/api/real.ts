@@ -137,8 +137,10 @@ function toAnalysis(out: AnalysisOut): Analysis {
  * 백엔드 API는 LLM 분석을 직접 돌리지 않음 → 분석 담당 모듈이 POST /analyses 로 결과를 남겨야 끝남
  * 사용 규모·예산(scale)은 백엔드 API에 받는 곳이 없어 화면에서 추천을 거를 때만 씀
  */
-export async function analyze(source: Source, scale: ScaleInput): Promise<Analysis> {
+/** 프로젝트 등록 → 분석 결과 대기. 등록(업로드)이 끝나면 onUploaded 로 알림 (화면 진행 표시용) */
+export async function analyze(source: Source, scale: ScaleInput, onUploaded?: () => void): Promise<Analysis> {
   const project = await createProject(source, scale)
+  onUploaded?.()
   const out = await poll(() => reqOrNull<AnalysisOut>(`/projects/${project.id}/analyses/latest`), {
     intervalMs: 2000,
     timeoutMs: 5 * 60 * 1000,

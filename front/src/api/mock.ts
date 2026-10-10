@@ -156,9 +156,11 @@ export async function deleteConnection(id: string): Promise<void> {
 
 // ---------- 분석, 추천 ----------
 
-export async function analyze(source: Source, _scale: ScaleInput): Promise<Analysis> {
+export async function analyze(source: Source, _scale: ScaleInput, onUploaded?: () => void): Promise<Analysis> {
   failScenario = /fail/i.test(source.kind === 'zip' ? source.file.name : source.url)
-  await wait(source.kind === 'github' ? 2000 : 1400)
+  await wait(source.kind === 'github' ? 1200 : 600)
+  onUploaded?.()
+  await wait(2500)
   return {
     projectId: 'p_' + Math.random().toString(36).slice(2, 8),
     stack: [

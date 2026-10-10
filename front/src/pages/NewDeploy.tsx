@@ -9,6 +9,7 @@ import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
 import DomainStep, { domainReady } from '../steps/DomainStep'
 import { domainDone } from '../components/DomainProgress'
+import WorkProgress from '../components/WorkProgress'
 import { costText, tierTotal, usd } from '../format'
 import type { PollIssue } from '../steps/DeployStep'
 import type {
@@ -44,6 +45,15 @@ const STEPS = [
 
 const DEFAULT_DOMAIN: DomainChoice = { mode: 'auto', name: '' }
 
+// 분석 단계에서 실제로 하는 일 (ai/runner.py: 규칙 분석 → 비밀값 가리기 → 못 찾은 값만 AI)
+const ANALYZE_HINTS = [
+  'Dockerfile과 실행 명령을 살펴보고 있습니다',
+  '앱이 쓰는 포트와 헬스체크 경로를 찾고 있습니다',
+  '.env 같은 비밀값은 가린 뒤에만 AI에 보냅니다',
+  'DB를 쓰는지, 시작할 때 실행할 명령이 있는지 확인하고 있습니다',
+  '규칙으로 못 찾은 값은 AI가 코드를 읽고 근거 줄과 함께 찾습니다',
+]
+
 const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '', monthlyBudgetUsd: 30 }
 
 // 상태 확인 간격과, 일시적인 오류를 몇 번까지 다시 시도할지
@@ -75,6 +85,10 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const [rec, setRec] = useState<Recommendation | null>(null)
   // 분석 결과는 먼저 보여 주고, 인프라 worker의 계획(구성·비용)은 뒤에서 기다림
   const [recError, setRecError] = useState<string | null>(null)
+  // 진행 표시: 분석을 시작한 시각, 업로드가 끝났는지, 계획을 기다리기 시작한 시각
+  const [analyzeStartedAt, setAnalyzeStartedAt] = useState<number | null>(null)
+  const [uploaded, setUploaded] = useState(false)
+  const [recStartedAt, setRecStartedAt] = useState<number | null>(null)
   const [choice, setChoiceState] = useState<Choice | null>(null)
   // 조합별로 만들어 둔 코드. 다른 칸을 눌렀다 돌아와도 다시 만들지 않음
   const [bundles, setBundles] = useState<Record<string, TerraformBundle>>({})
@@ -101,6 +115,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setAnalysis(null)
     setRec(null)
     setRecError(null)
+    setAnalyzeStartedAt(null)
+    setUploaded(false)
+    setRecStartedAt(null)
     setChoiceState(null)
     setBundles({})
     setCodeErrors({})
@@ -286,11 +303,10 @@ export default function NewDeploy({ onShowHistory }: Props) {
     }
   }
 
-  // 분석 → 추천(+추천 조합 코드) → 도메인 계획 저장을 한 번에
-  // 이미 분석했으면 바뀐 도메인만 다시 저장
   // 인프라 worker의 계획(구성·비용)을 기다림. 분석 화면은 그동안 AI 분석 결과를 먼저 보여 줌
   const loadRec = (projectId: string) => {
     setRecError(null)
+    setRecStartedAt(Date.now())
     api
       .recommend(projectId, scale)
       .then((r) => {
@@ -307,14 +323,18 @@ export default function NewDeploy({ onShowHistory }: Props) {
       })
   }
 
-  // 분석 → 도메인 계획 저장 → 분석 화면. 계획은 뒤에서 기다림
+  // 누르면 바로 분석 화면으로 가서 진행 상황을 보여 줌 → 분석 → 도메인 계획 저장. 계획은 뒤에서 기다림
+  // 이미 분석했으면 바뀐 도메인만 다시 저장
   const analyze = () =>
     run('analyze', async () => {
       if (!source) return
       if (analysis) {
         if (!domainPlan) await saveDomain(analysis.projectId)
       } else {
-        const a = await api.analyze(source, scale)
+        setAnalyzeStartedAt(Date.now())
+        setUploaded(false)
+        setStep(ANALYSIS)
+        const a = await api.analyze(source, scale, () => setUploaded(true))
         projectRef.current = a.projectId
         setAnalysis(a)
         await saveDomain(a.projectId)
@@ -480,11 +500,25 @@ export default function NewDeploy({ onShowHistory }: Props) {
               onChange={setDomainChoice}
             />
           )}
+          {step === ANALYSIS && !analysis && analyzeStartedAt !== null && (
+            <WorkProgress
+              title={error ? '분석하지 못했습니다' : uploaded ? 'AI가 코드를 분석하고 있습니다' : '코드를 올리고 있습니다'}
+              startedAt={analyzeStartedAt}
+              stages={[
+                { label: '코드 올리기', state: uploaded ? 'done' : error ? 'failed' : 'current' },
+                { label: '코드 분석', state: !uploaded ? 'todo' : error ? 'failed' : 'current' },
+                { label: '구성·비용 계획', state: 'todo' },
+              ]}
+              hints={uploaded ? ANALYZE_HINTS : ['소스를 서버에 올리고 있습니다']}
+              note={error ? '위의 오류를 확인하고 "이전"으로 돌아가 다시 시도해 주세요.' : '보통 10~30초 걸립니다.'}
+            />
+          )}
           {step === ANALYSIS && analysis && (
             <AnalysisStep
               analysis={analysis}
               rec={rec}
               recError={recError}
+              recStartedAt={recStartedAt}
               onRetryRec={() => loadRec(analysis.projectId)}
               choice={choice}
               budget={scale.monthlyBudgetUsd}

@@ -1,4 +1,5 @@
 import ProviderMark from '../components/ProviderMark'
+import WorkProgress from '../components/WorkProgress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
 import type { Analysis, Choice, Recommendation, TierKey } from '../types'
@@ -18,6 +19,8 @@ interface Props {
   rec: Recommendation | null
   /** 계획을 기다리다 실패한 이유 */
   recError: string | null
+  /** 계획을 기다리기 시작한 시각(ms). 진행 표시의 경과 시간 */
+  recStartedAt: number | null
   onRetryRec: () => void
   choice: Choice | null
   /** 월 예산 한도. 넘는 칸은 고를 수 없음 */
@@ -30,22 +33,26 @@ interface Props {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
-export default function AnalysisStep({ analysis, rec, recError, onRetryRec, ...plans }: Props) {
+export default function AnalysisStep({ analysis, rec, recError, recStartedAt, onRetryRec, ...plans }: Props) {
   return (
     <div className="stack-lg">
       <section>
         <h3 className="sub-title">코드에서 찾은 것</h3>
         <dl className="kv">
-          {analysis.stack.map((s) => (
-            <div key={s.label}>
+          {analysis.stack.map((s, i) => (
+            <div key={s.label} className="reveal" style={{ animationDelay: `${i * 90}ms` }}>
               <dt>{s.label}</dt>
               <dd>{s.value}</dd>
             </div>
           ))}
         </dl>
         <ul className="findings">
-          {analysis.findings.map((f) => (
-            <li key={f.title} className={'finding is-' + f.level}>
+          {analysis.findings.map((f, i) => (
+            <li
+              key={f.title}
+              className={'finding reveal is-' + f.level}
+              style={{ animationDelay: `${(analysis.stack.length + i) * 90}ms` }}
+            >
               <strong>{f.title}</strong>
               <span>{f.detail}</span>
             </li>
@@ -74,9 +81,17 @@ export default function AnalysisStep({ analysis, rec, recError, onRetryRec, ...p
               </button>
             </div>
           ) : (
-            <p className="rec-wait">
-              <span className="pulse" aria-hidden /> 인프라가 이 분석 결과로 구성과 비용 계획을 만들고 있습니다. 보통 몇 분 걸립니다.
-            </p>
+            <WorkProgress
+              title="구성과 비용 계획을 만들고 있습니다"
+              startedAt={recStartedAt ?? Date.now()}
+              stages={[
+                { label: '코드 올리기', state: 'done' },
+                { label: '코드 분석', state: 'done' },
+                { label: '구성·비용 계획', state: 'current' },
+              ]}
+              hints={PLAN_HINTS}
+              note="보통 1~4분 걸립니다. 위의 분석 결과를 먼저 확인해 주세요. 승인하기 전에는 아무것도 만들지 않습니다."
+            />
           )}
         </section>
       )}
@@ -84,7 +99,15 @@ export default function AnalysisStep({ analysis, rec, recError, onRetryRec, ...p
   )
 }
 
-type PlansProps = Omit<Props, 'analysis' | 'rec' | 'recError' | 'onRetryRec'> & { rec: Recommendation }
+// 계획 단계에서 인프라 worker가 실제로 하는 일
+const PLAN_HINTS = [
+  '사용 규모와 예산에 맞는 구성 크기를 고르고 있습니다',
+  '공용 로드밸런서·DB 같은 기반 인프라 정보를 읽고 있습니다',
+  '구성마다 한 달 비용을 계산하고 있습니다',
+  'Terraform으로 무엇이 새로 생기는지 미리 계산하고 있습니다',
+]
+
+type PlansProps = Omit<Props, 'analysis' | 'rec' | 'recError' | 'recStartedAt' | 'onRetryRec'> & { rec: Recommendation }
 
 function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: PlansProps) {
   const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
