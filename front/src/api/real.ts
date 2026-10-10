@@ -299,6 +299,17 @@ function draftFile(p: PlanOut): { name: string; content: string }[] {
   return isObj(d) && typeof d.content === 'string' && d.content ? [{ name: 'Dockerfile (초안)', content: d.content }] : []
 }
 
+/** 계획 금액에 넣지 않은 비용과 공용 기반 몫 (variables.cost). 없거나 형식이 다르면 비움 */
+function costScope(p: PlanOut): { excludedCosts?: string[]; sharedMonthlyUsd?: number } {
+  const c = isObj(p.variables.cost) ? p.variables.cost : {}
+  const excluded = Array.isArray(c.excluded) ? c.excluded.map(str).filter(Boolean) : []
+  const shared = Number(c.shared_monthly)
+  return {
+    excludedCosts: excluded.length ? excluded : undefined,
+    sharedMonthlyUsd: c.shared_monthly != null && Number.isFinite(shared) ? shared : undefined,
+  }
+}
+
 /** 온프레미스(로컬 Docker) 계획: 검토·승인 대상은 compose 파일과 실행 변수. compose의 SHA-256이 백엔드의 승인 식별자(fingerprint)에 들어 있음 */
 function toComposeBundle(p: PlanOut): TerraformBundle {
   const v = p.variables
@@ -322,6 +333,7 @@ function toComposeBundle(p: PlanOut): TerraformBundle {
       fingerprint: p.fingerprint,
       ready: p.terraform_plan_ready,
       pricingAsOf: undefined,
+      ...costScope(p),
     },
   }
 }
@@ -353,6 +365,7 @@ function toBundle(p: PlanOut): TerraformBundle {
       fingerprint: p.fingerprint,
       ready: p.terraform_plan_ready,
       pricingAsOf: p.cost_estimate?.pricing_as_of,
+      ...costScope(p),
     },
   }
 }
@@ -459,9 +472,19 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
   const pick = pool.find((c) => c.plan.variables.recommended === true) ?? [...pool].sort((a, b) => planCost(a.plan) - planCost(b.plan))[0]
   const cheapest = Math.min(...cells.map((c) => planCost(c.plan)))
 
-  const pricing = plans.find((p) => !isLocal(p) && p.cost_estimate)?.cost_estimate?.pricing_as_of
+  const awsPlan = plans.find((p) => !isLocal(p) && p.cost_estimate)
+  const pricing = awsPlan?.cost_estimate?.pricing_as_of
+  const scope = awsPlan ? costScope(awsPlan) : {}
   const assumptions = [`월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`]
-  if (awsExists) assumptions.push(pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음', '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인')
+  if (awsExists) {
+    assumptions.push(pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음')
+    assumptions.push(
+      scope.sharedMonthlyUsd !== undefined
+        ? `AWS 금액에는 공용 기반(ALB·DB 등) 몫 월 ${usd(scope.sharedMonthlyUsd)}가 들어 있음`
+        : '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인',
+    )
+    if (scope.excludedCosts) assumptions.push(`AWS 금액에 넣지 않은 비용: ${scope.excludedCosts.join(', ')}`)
+  }
   if (cells.some((c) => isLocal(c.plan)))
     assumptions.push('온프레미스(로컬 Docker)의 추가 비용 0에는 전기·회선·PC 사용 비용이 들어 있지 않고, 이 PC의 HTTP 주소로만 접속합니다(도메인·HTTPS 없음)')
   const fallback = pick && awsExists && !awsWithin.length

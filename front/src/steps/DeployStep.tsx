@@ -25,6 +25,16 @@ interface Props {
   onHistory: () => void
 }
 
+/** ALB 기본 주소(*.elb.amazonaws.com)의 https. 공용 ALB 인증서는 팀 도메인용이라 이 이름과 맞지 않음 (10/11 실제 배포에서 확인) */
+function isAwsDefaultHttps(url: string): boolean {
+  try {
+    const u = new URL(url)
+    return u.protocol === 'https:' && u.hostname.endsWith('.elb.amazonaws.com')
+  } catch {
+    return false
+  }
+}
+
 export default function DeployStep({
   status,
   targetName,
@@ -87,6 +97,11 @@ export default function DeployStep({
                 {domainMode === 'none' || !status.domain || status.domain.state === 'skipped'
                   ? '미리보기 주소입니다. 도메인은 연결되지 않았습니다.'
                   : '미리보기 주소입니다. 주소 연결은 아래에서 진행 중입니다.'}
+              </span>
+            )}
+            {status.url && isAwsDefaultHttps(status.url) && (
+              <span className="muted small">
+                AWS 기본 주소에는 이 주소용 HTTPS 인증서가 없어 브라우저가 &lsquo;안전하지 않음&rsquo; 경고를 띄울 수 있습니다. 앱은 정상이며, 경고 없는 주소는 도메인 연결 뒤에 생깁니다.
               </span>
             )}
           </div>

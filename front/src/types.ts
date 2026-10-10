@@ -154,6 +154,10 @@ export interface PlanInfo {
   /** AWS는 Terraform plan 파일이 서버에 올라와 있어야 승인 가능 */
   ready: boolean
   pricingAsOf?: string
+  /** 계획 금액에 넣지 않은 비용 (worker의 cost.excluded). 총액이 전부를 덮는 것처럼 보이지 않게 승인 화면에 같이 보여 줌 */
+  excludedCosts?: string[]
+  /** AWS 공용 기반(ALB·RDS 등) 몫으로 금액에 포함한 월 비용 */
+  sharedMonthlyUsd?: number
 }
 
 export interface TerraformBundle {
