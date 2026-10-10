@@ -125,6 +125,32 @@ class State:
     retry_at: Dict[str, float] = field(default_factory=dict)
 
 
+# 인프라 worker(cost.recommend)가 받는 값. 프런트 첫 화면의 선택지와 같음
+EXPECTED_USERS = {"~100", "~1,000", "~10,000", "10,000+"}
+TRAFFIC_PATTERNS = {"steady", "peak", "unknown"}
+
+
+def scale_from_project(project: dict) -> Optional[dict]:
+    """사용자가 입력한 사용 규모·예산을 그대로 넘김 (LLM이 추측하거나 바꾸지 않음).
+
+    백엔드가 project.scale 객체로 주든 최상위 필드로 주든 받는다. 형식이 틀린 값은 버림(추측해서 고치지 않음).
+    하나도 없으면 None → worker는 권장 단계로 시작하고 예산 검사는 하지 않음.
+    """
+    src = project.get("scale") if isinstance(project.get("scale"), dict) else project
+    scale: dict = {}
+    if src.get("expected_users") in EXPECTED_USERS:
+        scale["expected_users"] = src["expected_users"]
+    if src.get("traffic_pattern") in TRAFFIC_PATTERNS:
+        scale["traffic_pattern"] = src["traffic_pattern"]
+    budget = src.get("monthly_budget_usd")
+    try:
+        if budget is not None and not isinstance(budget, bool) and float(budget) > 0:
+            scale["monthly_budget_usd"] = float(budget)
+    except (TypeError, ValueError):
+        pass
+    return scale or None
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -192,7 +218,7 @@ def analyze_project(project: dict, upload_dir: Path, llm=None, model: str = DEFA
         except LlmUnavailable as e:
             log.warning("프로젝트 %s LLM 보조를 건너뜁니다: %s", project["id"], e)
             analysis.info("AI 보조 분석을 하지 못했습니다", f"{e} 규칙으로 찾은 값만 기록합니다.")
-    result = analysis.to_result(scale=None)
+    result = analysis.to_result(scale=scale_from_project(project))
     unsafe = backend_unsafe_paths(result)
     if unsafe:
         # 가리기에서 놓친 것. 기록하지 않음

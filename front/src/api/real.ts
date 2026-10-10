@@ -47,10 +47,22 @@ interface ProjectOut {
 }
 
 /** ZIP은 원본 바이트를 그대로, GitHub는 주소와 ref를 JSON으로 */
-function createProject(source: Source): Promise<ProjectOut> {
+/**
+ * 사용 규모·예산. 인프라 worker가 구성 단계와 예산 검사에 쓰는 사용자 입력이라 그대로 보냄 (AI가 바꾸지 않음).
+ * 백엔드가 저장하면 AI runner가 분석 결과 scale 로 복사해 worker에 넘김
+ */
+function scaleParams(scale: ScaleInput): Record<string, string> {
+  const p: Record<string, string> = { expected_users: scale.expectedUsers, traffic_pattern: scale.pattern }
+  if (Number.isFinite(scale.monthlyBudgetUsd)) p.monthly_budget_usd = String(scale.monthlyBudgetUsd)
+  if (scale.purpose.trim()) p.purpose = scale.purpose.trim().slice(0, 500)
+  return p
+}
+
+function createProject(source: Source, scale: ScaleInput): Promise<ProjectOut> {
   const name = sourceName(source)
   if (source.kind === 'zip') {
-    const q = new URLSearchParams({ name, filename: source.file.name })
+    // 본문이 ZIP 원본이라 사용 규모는 쿼리로. 아직 저장하지 않는 백엔드는 모르는 쿼리를 무시함
+    const q = new URLSearchParams({ name, filename: source.file.name, ...scaleParams(scale) })
     return req<ProjectOut>(`/projects?${q}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/zip' },
@@ -59,6 +71,7 @@ function createProject(source: Source): Promise<ProjectOut> {
       timeoutMs: 10 * 60 * 1000,
     })
   }
+  // GitHub 본문에는 아직 scale 을 넣지 않음: 백엔드가 정의 밖 필드를 422로 거절함. 백엔드가 받기 시작하면 추가
   return req<ProjectOut>(
     '/projects/github',
     send('POST', { name, repository_url: source.url, ref: source.branch || undefined }),
@@ -108,8 +121,8 @@ function toAnalysis(out: AnalysisOut): Analysis {
  * 백엔드 API는 LLM 분석을 직접 돌리지 않음 → 분석 담당 모듈이 POST /analyses 로 결과를 남겨야 끝남
  * 사용 규모·예산(scale)은 백엔드 API에 받는 곳이 없어 화면에서 추천을 거를 때만 씀
  */
-export async function analyze(source: Source, _scale: ScaleInput): Promise<Analysis> {
-  const project = await createProject(source)
+export async function analyze(source: Source, scale: ScaleInput): Promise<Analysis> {
+  const project = await createProject(source, scale)
   const out = await poll(() => reqOrNull<AnalysisOut>(`/projects/${project.id}/analyses/latest`), {
     intervalMs: 2000,
     timeoutMs: 5 * 60 * 1000,

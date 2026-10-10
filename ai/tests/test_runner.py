@@ -110,10 +110,10 @@ class RunnerTests(unittest.TestCase):
         self.backend.close()
         shutil.rmtree(self.uploads, ignore_errors=True)
 
-    def add_project(self, pid: str, files: dict = APP, sha: str = None) -> bytes:
+    def add_project(self, pid: str, files: dict = APP, sha: str = None, **extra) -> bytes:
         data = make_zip(files)
         (self.uploads / f"{pid}.zip").write_bytes(data)
-        self.backend.projects.append({"id": pid, "name": pid, "source_sha256": sha or hashlib.sha256(data).hexdigest()})
+        self.backend.projects.append({"id": pid, "name": pid, "source_sha256": sha or hashlib.sha256(data).hexdigest(), **extra})
         return data
 
     def run_once(self):
@@ -174,6 +174,24 @@ class RunnerTests(unittest.TestCase):
         self.now += runner.RETRY_AFTER * 10
         self.run_once()
         self.assertEqual(self.backend.posts, 1, "같은 결과를 계속 보내지 않음")
+
+    def test_scale_is_passed_through_unchanged(self):
+        user_input = {"expected_users": "~1,000", "traffic_pattern": "peak", "monthly_budget_usd": 30, "purpose": "동아리"}
+        self.add_project("nested", scale=user_input)
+        self.add_project("flat", expected_users="~100", traffic_pattern="steady", monthly_budget_usd="12.5")
+        self.add_project("none")
+        self.run_once()
+        scale = lambda pid: self.backend.analyses[pid]["result"]["scale"]
+        self.assertEqual(scale("nested"), {"expected_users": "~1,000", "traffic_pattern": "peak", "monthly_budget_usd": 30.0})
+        self.assertEqual(scale("flat"), {"expected_users": "~100", "traffic_pattern": "steady", "monthly_budget_usd": 12.5})
+        self.assertIsNone(scale("none"))
+
+    def test_invalid_scale_values_are_dropped_not_guessed(self):
+        self.assertIsNone(runner.scale_from_project({"scale": {"expected_users": "많음", "monthly_budget_usd": -5}}))
+        self.assertEqual(
+            runner.scale_from_project({"scale": {"expected_users": "~10,000", "traffic_pattern": "busy", "monthly_budget_usd": True}}),
+            {"expected_users": "~10,000"},
+        )
 
     def test_pagination(self):
         self.backend.page_size = 2
