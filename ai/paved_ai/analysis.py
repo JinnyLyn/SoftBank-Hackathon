@@ -76,6 +76,8 @@ class Analysis:
     # LLM이 채운 값 (규칙이 못 찾은 것만). 화면에서 근거 확인을 권함
     ai_filled: List[str] = field(default_factory=list)
     ai_model: Optional[str] = None
+    # LLM 사용량 {input_tokens, output_tokens, elapsed_ms, cached}. 부르지 않았으면 None
+    ai_usage: Optional[dict] = None
     # Dockerfile이 없을 때 만든 초안 {path, content, port, based_on}. 사용자가 저장소에 넣고 다시 올리는 제안
     dockerfile_draft: Optional[dict] = None
 
@@ -130,7 +132,7 @@ class Analysis:
                 if self.dockerfile_draft else None
             ),
             "masking": {"withheld_files": self.withheld_files, "redactions": self.redactions},
-            "ai": {"model": self.ai_model, "filled": self.ai_filled},
+            "ai": {"model": self.ai_model, "filled": self.ai_filled, "usage": self.ai_usage},
         }
 
 

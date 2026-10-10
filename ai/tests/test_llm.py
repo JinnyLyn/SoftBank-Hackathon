@@ -1,8 +1,12 @@
 """LLM 보조 단계 검사. 가짜 client로 돌아서 네트워크·비용이 없다 (실제 LLM 호출은 일반 테스트에서 분리, docs/CI.md)."""
 
 import json
+import os
+import shutil
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from paved_ai.analysis import analyze_files
 from paved_ai.llm import FALLBACK_BETA, OUTPUT_SCHEMA, fill_unresolved, select_files
@@ -26,6 +30,7 @@ class FakeClient:
     def __init__(self, payload=None, stop_reason="end_turn", error=None):
         self.payload, self.stop_reason, self.error = payload, stop_reason, error
         self.calls = []
+        self.usage = None  # 사용량을 확인하는 테스트만 채움
         self.beta = SimpleNamespace(messages=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
@@ -38,6 +43,7 @@ class FakeClient:
             stop_reason=self.stop_reason,
             model=kwargs["model"],
             _request_id="req_fake",
+            usage=self.usage,
         )
 
 
@@ -145,6 +151,58 @@ class FillTests(unittest.TestCase):
         prompt = client.calls[0]["messages"][0]["content"]
         # 우리가 만든 블록의 닫는 태그 수 = 보낸 파일 수 (업로드 내용 속 </file> 은 바뀌어 있음)
         self.assertEqual(prompt.count("</file>"), prompt.count('<file path="'))
+
+
+class UsageAndCacheTests(unittest.TestCase):
+    """AGENTS.md 7: 토큰 사용량 기록, 마스킹된 입력·프롬프트/스키마 버전·모델을 키로 한 캐시"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.env = mock.patch.dict(os.environ, {"PAVED_AI_CACHE": "on", "PAVED_AI_CACHE_DIR": self.tmp})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def fill(self, client, model="m1"):
+        fs = files()
+        analysis = analyze_files(fs)
+        return analysis, fill_unresolved(analysis, fs, client, model=model)
+
+    def test_usage_is_recorded_in_outcome_and_result(self):
+        client = FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []})
+        client.usage = SimpleNamespace(input_tokens=1200, output_tokens=80)
+        analysis, out = self.fill(client)
+        self.assertEqual((out.input_tokens, out.output_tokens, out.cached), (1200, 80, False))
+        self.assertIsNotNone(out.elapsed_ms)
+        self.assertEqual(analysis.to_result()["ai"]["usage"]["input_tokens"], 1200)
+
+    def test_same_input_and_model_reuses_answer_but_still_validates(self):
+        payload = {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}
+        first = FakeClient(payload)
+        self.fill(first)
+        second = FakeClient(payload)
+        analysis, out = self.fill(second)
+        self.assertEqual(second.calls, [], "같은 키면 LLM을 다시 부르지 않음")
+        self.assertTrue(out.cached)
+        self.assertEqual(out.filled, ["container_port"], "꺼낸 답도 근거 검증을 거쳐 반영")
+        self.assertEqual(analysis.container_port, 5050)
+        # 모델이 다르면 키가 달라 다시 부름
+        third = FakeClient(payload)
+        self.fill(third, model="m2")
+        self.assertEqual(len(third.calls), 1)
+
+    def test_failed_answers_are_not_cached_and_cache_can_be_turned_off(self):
+        self.fill(FakeClient(None, stop_reason="max_tokens"))
+        retry = FakeClient({"answers": [], "notes": []})
+        self.fill(retry)
+        self.assertEqual(len(retry.calls), 1, "길이 초과 등 실패한 답은 캐시하지 않음")
+        with mock.patch.dict(os.environ, {"PAVED_AI_CACHE": "off"}):
+            again = FakeClient({"answers": [], "notes": []})
+            self.fill(again)
+            self.assertEqual(len(again.calls), 1)
+        self.assertEqual(os.listdir(self.tmp) and all(n.endswith(".json") for n in os.listdir(self.tmp)), True)
 
 
 class SelectFilesTests(unittest.TestCase):

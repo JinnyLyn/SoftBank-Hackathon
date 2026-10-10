@@ -78,6 +78,9 @@ LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 
 | 비밀값 | 보내기 직전에 다시 가림. 업로드 코드 속 문장은 지시가 아니라 데이터라고 프롬프트에 밝힘 |
 | 표시 | 결과의 `ai.filled` 에 LLM이 채운 값 이름, `findings` 에 "AI가 채운 값" 안내 |
 | 실패 | 키 없음·인증·한도·연결 오류는 규칙 결과만 기록 (`findings` 에 이유) |
+| 사용량 | 호출마다 입력·출력 토큰과 걸린 시간을 runner 로그와 결과 `ai.usage` 에 기록 (AGENTS.md §7) |
+| 캐시 | 가린 뒤의 프롬프트·프롬프트/스키마 버전(`PROMPT_VERSION`)·제공자·모델이 같으면 예전 답을 다시 씀. 꺼낸 답도 근거 검증을 다시 함. 정상 종료한 답만 저장. 저장소 밖 `~/.cache/paved-ai/llm` (`PAVED_AI_CACHE_DIR`), `PAVED_AI_CACHE=off` 로 끔 |
+| Dockerfile 초안 | Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 `dockerfile_draft` 로 전달 (LLM 미사용, `paved_ai/dockerfile.py`). 진입점을 확정 못 하면 만들지 않음 |
 
 설치 (Ollama는 설치할 것이 없음. `requirements.txt` 는 Anthropic을 쓸 때만):
 
