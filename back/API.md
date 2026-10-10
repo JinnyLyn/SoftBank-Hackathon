@@ -164,6 +164,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 - `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 허용되는 진행은 `queued → provisioning → deploying → healthy`이며 실패/롤백 상태 전이도 제한적으로 허용합니다. 현재 상태와 같은 상태를 보내면 상태와 URL은 그대로 두고 로그 이벤트만 추가합니다. 다른 상태에서 `healthy`로 전이할 때는 HTTP(S) `url`이 필요합니다.
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.
 
+worker 이벤트의 `message`와 `details`는 DB 저장 전에 비밀값을 마스킹합니다. `AWS_SECRET_ACCESS_KEY`, `SecretAccessKey`, `SessionToken`처럼 snake_case, kebab-case, camelCase/PascalCase로 표기된 민감 키를 처리하며, 이벤트 및 프로젝트 상태 로그를 조회할 때도 기존 저장 데이터의 값이 다시 노출되지 않도록 마스킹합니다.
+
 현재 API는 Terraform, Docker 또는 AWS 명령을 직접 실행하지 않습니다. 실제 worker 구현과 AWS 배포 검증은 별도 작업입니다.
 
 대기열에서 가져온 작업의 Terraform plan 파일이 없거나 해시가 맞지 않으면 해당 배포를 `failed`로 바꾸고 오류 이벤트를 남긴 뒤, 다음 대기 작업을 계속 찾습니다. 하나의 손상된 작업이 나머지 작업을 막지 않도록 처리합니다.

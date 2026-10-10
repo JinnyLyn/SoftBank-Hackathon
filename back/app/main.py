@@ -61,7 +61,7 @@ _SECRET_KEY = re.compile(
     r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)"
 )
 _SECRET_VALUE = re.compile(
-    r"""(?ix)(?<![A-Z0-9])(?P<key_quote>["']?)(?P<key>(?:[A-Z0-9]+[_-])*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)(?:[_-][A-Z0-9]+)*)(?P=key_quote)(?P<separator>\s*[:=]\s*)(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"""
+    r"""(?ix)(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)(?P<separator>\s*[:=]\s*)(?P<value>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"""
 )
 _CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
@@ -590,7 +590,7 @@ def project_deployment_status(project_id: UUID) -> FrontDeployStatus:
             "SELECT message FROM deployment_events WHERE deployment_id = %s ORDER BY created_at, id",
             (deployment["id"],),
         )
-        log = [row["message"] for row in cursor.fetchall()]
+        log = [_redact(row["message"]) for row in cursor.fetchall()]
     state = "running" if deployment["status"] in {"queued", "provisioning", "deploying", "rolling_back"} else (
         "success" if deployment["status"] == "healthy" else "failed"
     )
@@ -805,7 +805,7 @@ def _insert_event(cursor: Any, deployment_id: UUID, level: str, event_type: str,
 def _reject_secret_fields(value: Any, path: str = "") -> None:
     if isinstance(value, dict):
         for key, nested in value.items():
-            if _SECRET_KEY.search(str(key)):
+            if _is_secret_key(str(key)):
                 raise HTTPException(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     f"비밀값으로 보이는 필드는 저장할 수 없습니다: {path}{key}",
@@ -832,18 +832,29 @@ def _redact(text: str) -> str:
     text = _AWS_ACCESS_KEY.sub("[REDACTED_AWS_ACCESS_KEY]", text)
 
     def replace_secret(match: re.Match[str]) -> str:
+        key = match.group("key")
+        if not _is_secret_key(key):
+            return match.group(0)
         value = match.group("value")
         quote = value[0] if len(value) >= 2 and value[0] in {"'", '"'} and value[-1] == value[0] else ""
         redacted = f"{quote}[REDACTED]{quote}" if quote else "[REDACTED]"
-        return f"{match.group('key_quote')}{match.group('key')}{match.group('key_quote')}{match.group('separator')}{redacted}"
+        return f"{match.group('key_quote')}{key}{match.group('key_quote')}{match.group('separator')}{redacted}"
 
     return _SECRET_VALUE.sub(replace_secret, text)
+
+
+def _is_secret_key(key: str) -> bool:
+    # Normalize camelCase/PascalCase and acronym boundaries before checking
+    # the same sensitive-name list used for snake_case and kebab-case keys.
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", key)
+    separated = re.sub(r"([A-Z])([A-Z][a-z])", r"\1_\2", separated)
+    return _SECRET_KEY.search(separated) is not None
 
 
 def _redact_tree(value: Any) -> Any:
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]" if _SECRET_KEY.search(str(key)) else _redact_tree(nested)
+            key: "[REDACTED]" if _is_secret_key(str(key)) else _redact_tree(nested)
             for key, nested in value.items()
         }
     if isinstance(value, list):
@@ -943,7 +954,9 @@ def _deployment_out(row: dict[str, Any]) -> DeploymentOut:
 def _event_out(row: dict[str, Any]) -> DeploymentEventOut:
     return DeploymentEventOut(
         id=row["id"], level=row["level"], event_type=row["event_type"],
-        message=row["message"], details=_json_value(row["details"]), created_at=_as_utc(row["created_at"]),
+        message=_redact(row["message"]),
+        details=_redact_tree(_json_value(row["details"])) if row["details"] is not None else None,
+        created_at=_as_utc(row["created_at"]),
     )
 
 
