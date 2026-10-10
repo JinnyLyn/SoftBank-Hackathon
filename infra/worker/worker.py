@@ -36,6 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -63,6 +64,14 @@ ROLE_SIDE_ERRORS = {"ValidationError", "RegionDisabledException"}
 AMBIGUOUS_ERRORS = {"AccessDenied"}
 VERIFY_SESSION_NAME = "paved-clouds-verify"
 ASSUME_ROLE_TIMEOUT = 15   # 초. aws sts assume-role 한 번의 제한 시간. 시험에서는 줄인다
+# Fargate On-Demand vCPU 할당량("Fargate On-Demand vCPU resource count", 리전당 기본 6, 계정마다 다를 수 있다)과 그 사용량 지표.
+# 사용량 지표는 AWS/Usage 네임스페이스의 ResourceCount이고 단위는 vCPU다(Amazon ECS 개발자 안내서 "AWS Fargate usage metrics").
+# 할당량 응답의 UsageMetric이 있으면 그 값을 우선하고, 없을 때만 아래 차원을 쓴다
+FARGATE_QUOTA_SERVICE = "fargate"
+FARGATE_QUOTA_CODE = "L-3032A538"
+FARGATE_USAGE_DIMENSIONS = {"Service": "Fargate", "Type": "Resource", "Resource": "vCPU", "Class": "Standard/OnDemand"}
+QUOTA_TIMEOUT = 30           # 초. aws CLI 호출 한 번의 제한 시간
+USAGE_WINDOW_MINUTES = 30    # 사용 중인 vCPU를 이 시간 동안의 최댓값으로 본다(지표는 몇 분 늦게 올라오고, 늘었다 줄어드는 사용량의 최대를 잡으려고)
 # 로그를 백엔드로 보내기 전에 한 번 더 가린다(백엔드도 가리지만 호출 측에서도 비밀을 보내지 않아야 한다)
 REDACT_RES = [
     re.compile(r"(?i)\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -82,6 +91,10 @@ class PlanError(Exception):
     """계획을 만들 수 없는 프로젝트(분석 결과 부족, 예산 초과 등)."""
 
 
+class CapacityWait(PlanError):
+    """다른 계획이 예약한 Fargate vCPU 때문에 지금은 계획을 만들 수 없다. 그 계획이 처리되면 만들 수 있어서 실패로 세지 않고 기다린다."""
+
+
 class ApiError(Exception):
     def __init__(self, status, body):
         super().__init__(f"HTTP {status}: {body[:200]}")
@@ -96,7 +109,8 @@ class Config:
     deploy_sh: Path = INFRA / "scripts" / "deploy.sh"
     deployments_dir: Path = INFRA / "deployments"
     bash: str = field(default_factory=lambda: find_bash())
-    aws_cmd: list = field(default_factory=lambda: ["aws"])   # 연결 확인에 쓰는 AWS CLI. 시험에서는 가짜 스크립트로 바꾼다
+    aws_cmd: list = field(default_factory=lambda: ["aws"])   # 연결 확인과 Fargate 할당량 조회에 쓰는 AWS CLI. 시험에서는 가짜 스크립트로 바꾼다
+    quota_check: bool = True   # False면 Fargate vCPU 할당량을 조회하지 않고 제한하지 않는다(--skip-quota-check)
     region: str = ""
     poll_seconds: float = 5.0
     plan_timeout: int = 900
@@ -259,13 +273,14 @@ def deploy(cfg, *args):
 
 
 # --- planner ---------------------------------------------------------------------------------------
-def app_config_from_analysis(result, tier):
+def app_config_from_analysis(result, tier, tier_cfg=None):
     """분석 결과(result)에서 앱 설정과 Dockerfile 경로를 읽어 app-config.schema.json 규칙으로 검증한다.
 
     분석 결과의 계약(LLM 담당과 합의 필요):
       result["app_config"]  container_port, health_check_path, use_database, environment, init_command(선택)
       result["dockerfile"]  소스 안의 Dockerfile 상대 경로(생략하면 Dockerfile)
-    task_size·min_tasks·max_tasks 는 LLM이 아니라 선택한 구성 단계(tier)가 정한다.
+    task_size·min_tasks·max_tasks 는 LLM이 아니라 선택한 구성 단계(tier)가 정한다. 예산으로 max_tasks를 정한 구성은
+    tier_cfg(cost.estimate의 결과처럼 task_size·min_tasks·max_tasks를 가진 딕셔너리)로 넘기고, 없으면 TIERS 프리셋을 쓴다.
     """
     if not isinstance(result, dict) or not isinstance(result.get("app_config"), dict):
         raise PlanError("분석 결과에 app_config가 없습니다(container_port, health_check_path 등이 필요합니다)")
@@ -292,7 +307,7 @@ def app_config_from_analysis(result, tier):
     dockerfile = result.get("dockerfile", "Dockerfile")
     if not isinstance(dockerfile, str) or not dockerfile or dockerfile.startswith("/") or ".." in dockerfile or len(dockerfile) > 200:
         raise PlanError(f"dockerfile 경로가 올바르지 않습니다: {dockerfile!r}")
-    t = cost.TIERS[tier]
+    t = tier_cfg if tier_cfg is not None else cost.TIERS[tier]
     app = {"container_port": port, "health_check_path": health, "task_size": t["task_size"],
            "min_tasks": t["min_tasks"], "max_tasks": t["max_tasks"],
            "use_database": bool(c.get("use_database", False)), "environment": dict(env)}
@@ -301,28 +316,39 @@ def app_config_from_analysis(result, tier):
     return app, dockerfile
 
 
-def scale_from_analysis(result):
-    """사용 규모·예산. 백엔드 API에 받는 곳이 없어서 분석 결과의 scale 필드에서 읽는다(없으면 기본값)."""
+def scale_from_analysis(result, project=None):
+    """사용 규모·예산을 (expected_users, traffic_pattern, monthly_budget_usd)로 돌려준다.
+
+    프로젝트 API의 값(사용자가 프로젝트를 등록할 때 입력해 백엔드가 저장한 ProjectOut.expected_users·traffic_pattern·monthly_budget_usd)을
+    우선 읽고, 프로젝트에 값이 없을 때만 분석 결과의 scale 필드(백엔드에 저장 필드가 없던 때의 호환용)에서 읽는다. 항목마다 따로 대체한다.
+    둘 다 없으면 기본값(None)이다. 분석기가 프로젝트 값을 scale에 복사해 주지 않아도 사용자가 입력한 예산이 적용돼야 한다."""
     s = result.get("scale") if isinstance(result, dict) else None
     s = s if isinstance(s, dict) else {}
-    # 분석 결과는 외부 모듈이 만든 값이라 타입을 믿지 않는다. 리스트·객체가 들어오면 cost.recommend의 딕셔너리 조회가
+    p = project if isinstance(project, dict) else {}
+
+    def pick(key):
+        """(값, 오류 문구에 쓸 출처). 프로젝트 값이 None이 아니면 그것을, 아니면 분석 결과의 scale 값을 쓴다."""
+        return (p[key], f"프로젝트 {key}") if p.get(key) is not None else (s.get(key), f"scale.{key}")
+
+    # 프로젝트 값도 분석 결과의 값도 타입을 믿지 않는다. 리스트·객체가 들어오면 cost.recommend의 딕셔너리 조회가
     # 처리되지 않은 TypeError를 내서 worker 전체가 멈췄다(프로젝트 하나의 잘못된 입력은 그 프로젝트의 오류로만 처리한다)
-    users, pattern = s.get("expected_users"), s.get("traffic_pattern")
-    for name, value in (("expected_users", users), ("traffic_pattern", pattern)):
+    users, users_src = pick("expected_users")
+    pattern, pattern_src = pick("traffic_pattern")
+    for src, value in ((users_src, users), (pattern_src, pattern)):
         if value is not None and not isinstance(value, str):
-            raise PlanError(f"scale.{name}는 문자열이어야 합니다: {type(value).__name__}")
-    budget = s.get("monthly_budget_usd")
+            raise PlanError(f"{src}는 문자열이어야 합니다: {type(value).__name__}")
+    budget, src = pick("monthly_budget_usd")
     if budget is not None:
         if isinstance(budget, bool):   # float(True) == 1.0 이라 숫자처럼 통과해 버린다
-            raise PlanError("scale.monthly_budget_usd가 숫자가 아닙니다: bool")
+            raise PlanError(f"{src}가 숫자가 아닙니다: bool")
         try:
-            budget = float(budget)
+            budget = float(budget)   # 프로젝트 API는 예산을 "30.0000" 같은 문자열로 돌려준다
         except (TypeError, ValueError):
-            raise PlanError(f"scale.monthly_budget_usd가 숫자가 아닙니다: {type(budget).__name__}") from None
+            raise PlanError(f"{src}가 숫자가 아닙니다: {type(budget).__name__}") from None
         if not math.isfinite(budget):   # NaN·inf는 예산 비교를 모두 거짓으로 만든다
-            raise PlanError("scale.monthly_budget_usd는 유한한 숫자여야 합니다")
+            raise PlanError(f"{src}는 유한한 숫자여야 합니다")
         if budget < 0:
-            raise PlanError("scale.monthly_budget_usd는 0 이상이어야 합니다")
+            raise PlanError(f"{src}는 0 이상이어야 합니다")
     return users, pattern, budget
 
 
@@ -364,6 +390,113 @@ def fetch_foundation(cfg, env):
     if not isinstance(d, dict):
         raise PlanError("foundation 정보를 해석하지 못했습니다(deploy.sh foundation-info의 출력이 JSON이 아닙니다)")
     return d or None
+
+
+class QuotaError(Exception):
+    """AWS CLI로 할당량·사용량을 읽지 못했다(권한 부족, 네트워크, 응답 형식). fetch_fargate_capacity가 PlanError로 바꾼다."""
+
+
+def aws_json(cfg, env, args):
+    """aws CLI를 JSON 출력으로 불러 결과를 돌려준다. 실패하면 QuotaError."""
+    region = ["--region", cfg.region] if cfg.region else []
+    name = " ".join(args[:2])
+    try:
+        rc, out, err = run_capture([*cfg.aws_cmd, *args, *region, "--output", "json"], QUOTA_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise QuotaError(f"aws {name}이 {QUOTA_TIMEOUT}초 안에 끝나지 않았습니다") from None
+    except OSError as e:
+        raise QuotaError(f"aws CLI를 실행하지 못했습니다({type(e).__name__})") from None
+    if rc != 0:
+        raise QuotaError(f"aws {name} 실패: {redact((err or out).strip())[-200:]}")
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise QuotaError(f"aws {name}의 출력이 JSON이 아닙니다") from None
+    if not isinstance(data, dict):
+        raise QuotaError(f"aws {name}의 출력 형식이 올바르지 않습니다")
+    return data
+
+
+def fetch_fargate_capacity(cfg, env):
+    """이 계정·리전의 Fargate On-Demand vCPU 할당량과 사용 중인 vCPU를 읽어 {quota_vcpu, used_vcpu, available_vcpu}로 돌려준다.
+
+    예산만으로 max_tasks를 정하면 할당량(리전당 기본 6 vCPU)보다 큰 최대 구성이 추천돼, 승인된 계획이 광고한 최대 용량에 닿지 못할 수 있다.
+    그래서 최대 안을 만들기 전에 한도를 읽는다. 사용 중인 vCPU(다른 앱 포함)는 최근 USAGE_WINDOW_MINUTES분 지표의 최댓값이다.
+    다른 앱이 부하로 최대까지 늘어날 때 쓸 몫은 따로 잡아 두지 않는다(현재 사용량만 뺀다).
+    읽지 못하면 한도를 모른 채로 추천하지 않고 PlanError로 멈춘다(fetch_foundation과 같은 원칙). 확인을 건너뛰려면 cfg.quota_check=False."""
+    try:
+        try:
+            data = aws_json(cfg, env, ["service-quotas", "get-service-quota", "--service-code", FARGATE_QUOTA_SERVICE, "--quota-code", FARGATE_QUOTA_CODE])
+        except QuotaError:
+            # 적용된 값이 따로 없는 계정은 기본 할당량만 조회된다
+            data = aws_json(cfg, env, ["service-quotas", "get-aws-default-service-quota", "--service-code", FARGATE_QUOTA_SERVICE, "--quota-code", FARGATE_QUOTA_CODE])
+        quota = data.get("Quota")
+        value = quota.get("Value") if isinstance(quota, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise QuotaError("Fargate vCPU 할당량 값을 해석하지 못했습니다")
+        metric = quota.get("UsageMetric") if isinstance(quota.get("UsageMetric"), dict) else {}
+        dims = metric.get("MetricDimensions")
+        if not isinstance(dims, dict) or not dims or not all(isinstance(k, str) and isinstance(v, str) for k, v in dims.items()):
+            dims = FARGATE_USAGE_DIMENSIONS
+        end = datetime.now(timezone.utc).replace(microsecond=0)
+        start = end - timedelta(minutes=USAGE_WINDOW_MINUTES)
+        stamp = "%Y-%m-%dT%H:%M:%SZ"
+        stats = aws_json(cfg, env, [
+            "cloudwatch", "get-metric-statistics",
+            "--namespace", metric.get("MetricNamespace") or "AWS/Usage", "--metric-name", metric.get("MetricName") or "ResourceCount",
+            "--dimensions", *[f"Name={k},Value={v}" for k, v in dims.items()],
+            "--start-time", start.strftime(stamp), "--end-time", end.strftime(stamp), "--period", "300", "--statistics", "Maximum"])
+        points = stats.get("Datapoints")
+        if not isinstance(points, list):
+            raise QuotaError("Fargate 사용량 지표의 Datapoints를 해석하지 못했습니다")
+        seen = [p["Maximum"] for p in points if isinstance(p, dict) and isinstance(p.get("Maximum"), (int, float)) and not isinstance(p["Maximum"], bool)]
+        used = float(max(seen)) if seen else 0.0   # 지표가 없으면 그 시간 동안 실행 중인 Fargate 작업이 없었다고 본다
+    except QuotaError as e:
+        raise PlanError(f"Fargate 할당량을 읽지 못해 계획을 만들 수 없습니다({e}). 배포 계정에 servicequotas:GetServiceQuota, "
+                        "servicequotas:GetAWSDefaultServiceQuota, cloudwatch:GetMetricStatistics 권한이 있는지 확인하세요. "
+                        "확인을 건너뛰려면 worker를 --skip-quota-check로 실행하세요(할당량보다 큰 최대 구성이 추천될 수 있습니다)") from None
+    return {"quota_vcpu": float(value), "used_vcpu": used, "available_vcpu": max(float(value) - used, 0.0)}
+
+
+# 아직 배포되지 않아 CloudWatch 사용량에는 없지만 승인되면 최대 vCPU를 쓰는 계획. 이 상태의 계획이 쓸 몫은 새 계획에서 미리 뺀다.
+# 배포된 계획(consumed)은 뺀다: 이미 사용량에 잡히고, 삭제·실패한 배포의 예약이 영원히 남아 새 계획을 잘못 거절하는 것을 막으려고
+RESERVING_PLAN_STATUSES = ("awaiting_approval", "approved")
+
+
+def plan_peak_vcpu(plan):
+    """등록된 계획이 부하가 최대일 때 쓰는 vCPU. variables.cost.peak_vcpu를 읽고, 없으면(이 값이 생기기 전의 계획) 앱 설정(task_size × max_tasks)으로
+    계산한다. 읽을 수 없으면 None."""
+    v = plan.get("variables") if isinstance(plan, dict) else None
+    v = v if isinstance(v, dict) else {}
+    c = v.get("cost") if isinstance(v.get("cost"), dict) else {}
+    peak = c.get("peak_vcpu")
+    if isinstance(peak, (int, float)) and not isinstance(peak, bool) and math.isfinite(peak) and peak >= 0:
+        return float(peak)
+    app = v.get("app") if isinstance(v.get("app"), dict) else {}
+    size, n = app.get("task_size"), app.get("max_tasks")
+    if size in cost.SIZES and isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return cost.SIZES[size][0] * n
+    return None
+
+
+def reserved_vcpu(api, project_id):
+    """다른 프로젝트의 승인 대기·승인된 계획이 승인되면 쓸 최대 vCPU의 합. 같은 순회에서 먼저 만든 계획도 백엔드에 이미 등록돼 있어 여기에 잡힌다.
+    같은 몫을 두 계획에 나눠 주지 않으려고 새 계획의 남은 vCPU에서 이 값을 뺀다. 읽지 못하면 ApiError를 그대로 올린다(예약을 모른 채 계획하지 않는다).
+    한계: approved 계획이 이미 태스크를 띄운 뒤에도 사용량과 예약에 함께 잡혀 그 몫만큼 보수적이다."""
+    total = 0.0
+    for other in list_projects(api):
+        pid = other.get("id")
+        if pid == project_id:
+            continue   # 이 프로젝트는 활성 계획이 없을 때만 계획한다(plan_pending)
+        for plan in api.get(f"/api/projects/{pid}/plans") or []:
+            if plan.get("status") not in RESERVING_PLAN_STATUSES:
+                continue
+            peak = plan_peak_vcpu(plan)
+            if peak is None:
+                log(f"계획 {plan.get('id')}: 최대 vCPU를 읽지 못해 예약에 넣지 않습니다(variables.cost.peak_vcpu 또는 variables.app 확인)")
+                continue
+            total += peak
+    return total
 
 
 def upload_plan(api, plan_id, plan_file):
@@ -420,16 +553,26 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     if not isinstance(src_sha, str) or not SHA256_RE.match(src_sha):
         raise PlanError("프로젝트의 source_sha256을 읽지 못했습니다(승인한 소스를 배포 직전에 확인하려면 필요합니다)")
     result = analysis.get("result", {})
-    users, pattern, budget = scale_from_analysis(result)   # 입력 검증을 먼저 한다(잘못된 입력에 deploy.sh를 부르지 않는다)
+    users, pattern, budget = scale_from_analysis(result, project)   # 입력 검증을 먼저 한다(잘못된 입력에 deploy.sh를 부르지 않는다)
     app_config_from_analysis(result, "lean")   # 앱 설정도 검증만 먼저 한다. 단계별 크기는 아래에서 고른 단계로 다시 정한다
     env = child_env(cfg)
     foundation = fetch_foundation(cfg, env)   # 비용을 확정하기 전에 최신 foundation 구성을 읽는다
-    rec = cost.recommend(users, pattern, budget, prices, arch, foundation)
+    capacity = fetch_fargate_capacity(cfg, env) if cfg.quota_check else None   # 최대 구성이 Fargate vCPU 할당량을 넘지 않게 한도를 읽는다
+    reserved = 0.0
+    if capacity:
+        # 승인 대기·승인된 다른 계획은 아직 사용량에 없지만 승인되면 최대 vCPU를 쓴다. 같은 남은 몫을 두 계획에 나눠 주지 않으려고 미리 뺀다
+        reserved = capacity["reserved_vcpu"] = reserved_vcpu(api, project["id"])
+        capacity["available_vcpu"] = max(capacity["quota_vcpu"] - capacity["used_vcpu"] - reserved, 0.0)
+    rec = cost.recommend(users, pattern, budget, prices, arch, foundation, capacity["available_vcpu"] if capacity else None)
     if rec["recommended"] is None:
+        # 다른 계획의 예약이 없었다면 만들 수 있었을 때는 영구 실패가 아니라 기다린다(그 계획이 승인·대체되면 예약이 풀린다)
+        if reserved > 0 and cost.recommend(users, pattern, budget, prices, arch, foundation,
+                                           max(capacity["quota_vcpu"] - capacity["used_vcpu"], 0.0))["recommended"] is not None:
+            raise CapacityWait(f"{rec['reason']} 승인 대기·승인된 다른 계획이 {reserved:g} vCPU를 예약 중이라 그 계획이 처리되면 다시 계획합니다")
         raise PlanError(rec["reason"])
     tier = rec["recommended"]
     est = rec["estimates"][tier]
-    app, dockerfile = app_config_from_analysis(result, tier)
+    app, dockerfile = app_config_from_analysis(result, tier, est)   # est가 예산으로 정한 task_size·min_tasks·max_tasks를 가진다
 
     rc, out, err = run_capture(deploy(cfg, "make-id", f"{project['name']}|{project['id']}"), 60, env=env)
     deploy_id = out.strip()
@@ -464,25 +607,49 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         raise PlanError("계획 파일(tfplan)이 만들어지지 않았습니다")
     digest = sha256_file(plan_file)
 
+    # 승인 금액(cost_estimate.amount)은 월 예산을 판정한 기준과 같은 "부하가 최대일 때의 월 비용"이다. 평소 비용만 보여주면 사용자는 오토스케일링으로
+    # 늘어난 청구를 모른 채 승인한다. 승인 화면은 리소스 행을 나열하고 합계를 amount로 보여주므로, 행의 합이 합계와 맞도록 최대 시 추가분을 행으로 더한다
+    resources = list(est["resources"])
+    extra = round(est["peak_monthly"] - est["total_monthly"], 2)
+    if extra > 0:
+        resources.append({"service": "ECS Fargate 오토스케일링 최대 시 추가분",
+                          "spec": f"태스크 {app['max_tasks'] - app['min_tasks']}개 더 (최대 {app['max_tasks']}개)", "monthlyUsd": extra,
+                          "why": "부하가 늘어 태스크가 최대 개수까지 늘었을 때만 더해지는 비용(평소에는 청구되지 않음). 승인 금액과 월 예산은 이 최대 비용 기준"})
     variables = {
         "deploy_id": deploy_id, "image": image, "dockerfile": dockerfile, "app": app,
         # 승인된 소스(ZIP)의 SHA-256과 이미지 아키텍처: executor가 빌드 직전에 확인하고 같은 아키텍처로 빌드한다
         "source_sha256": src_sha, "cpu_architecture": arch,
         "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
-        "resources": est["resources"],
-        "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "excluded": est["excluded"]},
+        "resources": resources,
+        # total_monthly는 평소(min_tasks개) 월 비용, peak_monthly는 부하가 최대일 때의 월 비용이다. cost_estimate.amount는 peak_monthly다(amount_basis)
+        "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "total_monthly": est["total_monthly"],
+                 "peak_monthly": est["peak_monthly"], "amount_basis": "peak_monthly",
+                 "peak_vcpu": est["peak_vcpu"], "budget_usd": budget, "excluded": est["excluded"]},
+        # Fargate On-Demand vCPU 할당량 조회 결과(quota_vcpu, used_vcpu, reserved_vcpu, available_vcpu). 조회를 건너뛰었으면 None
+        "fargate_vcpu": capacity,
+        # 최저·평균·최대 금액 순의 비교 안. 승인 화면이 세 안을 나란히 보여주는 데 쓴다(선택한 안은 recommended=True)
+        "options": rec["options"],
     }
+    comparison = " / ".join(f"{cost.RANKS[o['rank']]} {o['label']}: 평소 ${o['total_monthly']:.2f}·최대 ${o['peak_monthly']:.2f}" for o in rec["options"])
     summary = "\n".join([
         f"{est['label']} 구성({tier}): {app['task_size']} 태스크 {app['min_tasks']}개(최대 {app['max_tasks']}개), 포트 {app['container_port']}, "
         f"헬스체크 {app['health_check_path']}, 앱 전용 DB {'사용' if app['use_database'] else '미사용'}",
-        f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
+        f"평소 월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
+        f"승인 금액은 부하가 최대일 때(태스크 {app['max_tasks']}개)의 월 ${est['peak_monthly']:.2f}"
+        + (f"이며 월 예산 ${budget:.2f} 이내" if budget is not None else "이며 월 예산 입력 없음"),
+        (f"Fargate vCPU 할당량: 한도 {capacity['quota_vcpu']:g}, 사용 중 {capacity['used_vcpu']:g}, "
+         f"승인 대기·승인된 다른 계획이 예약 {capacity['reserved_vcpu']:g}, 남은 {capacity['available_vcpu']:g}. "
+         f"부하가 최대일 때 이 앱은 {est['peak_vcpu']:g} vCPU" if capacity else
+         f"Fargate vCPU 할당량 확인을 건너뜀(--skip-quota-check): 부하가 최대일 때 이 앱은 {est['peak_vcpu']:g} vCPU이며 할당량 안인지 확인하지 않았다"),
+        f"안 비교(평소·최대 월 비용): {comparison}",
         f"기준: {est['region']}, {est['pricing_as_of']} 가격표. 제외: " + "; ".join(est["excluded"]),
         f"선택 이유: {rec['reason']}",
     ])
     body = {
         "project_id": project["id"], "analysis_id": analysis.get("id"), "target": "aws", "module_id": "ecs-web-app",
         "variables": variables, "summary": summary,
-        "cost_estimate": {"amount": f"{est['total_monthly']:.4f}", "currency": est["currency"], "period": "month",
+        # 백엔드 CostEstimate는 필드를 더 받지 않는다(extra=forbid). amount가 승인 화면·정렬·예산 판정·이력에 쓰이므로 최대 월 비용을 담는다
+        "cost_estimate": {"amount": f"{est['peak_monthly']:.4f}", "currency": est["currency"], "period": "month",
                           "pricing_as_of": est["pricing_as_of"]},
         "terraform_plan_sha256": digest,
     }
@@ -511,7 +678,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         log(f"plan 파일 업로드 실패(계획 {plan['id']}은 등록됨, 파일은 남겨 다시 올립니다): {e}")
         plan["_upload_pending"] = True
         return plan
-    log(f"계획 등록 완료: {plan['id']} (월 ${est['total_monthly']:.2f}, sha {digest[:12]})")
+    log(f"계획 등록 완료: {plan['id']} (월 최대 ${est['peak_monthly']:.2f}, 평소 ${est['total_monthly']:.2f}, sha {digest[:12]})")
     return plan
 
 
@@ -779,6 +946,7 @@ def verify_connections(api, cfg, state):
 @dataclass
 class State:
     failures: dict = field(default_factory=dict)   # 프로젝트 id → (실패 횟수, 마지막 시각)
+    waiting: dict = field(default_factory=dict)    # 프로젝트 id → 다른 계획이 예약한 vCPU 때문에 기다리기 시작한 시각. 실패 횟수에 세지 않고 retry_after마다 다시 시도한다
     done: dict = field(default_factory=dict)       # 프로젝트 id → 활성 계획이 있는 것을 마지막으로 확인한 시각(time.time())
     repair: set = field(default_factory=set)       # plan 파일 업로드가 남은 프로젝트(점검마다 다시 올린다)
     recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
@@ -816,6 +984,8 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
         tries, last = state.failures.get(pid, (0, 0.0))
         if pid not in state.repair and (tries >= state.max_tries or (tries and time.time() - last < state.retry_after)):
             continue
+        if pid in state.waiting and pid not in state.repair and time.time() - state.waiting[pid] < state.retry_after:
+            continue   # 다른 계획이 예약한 vCPU를 기다리는 중이다(계획이 처리되면 풀린다)
         plans = api.get(f"/api/projects/{pid}/plans") or []
         if repair_plan_uploads(api, cfg, plans):
             state.repair.add(pid)
@@ -835,8 +1005,13 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
         try:
             plan = plan_project(api, cfg, project, analysis, prices, arch)
             state.done[pid] = time.time()
+            state.waiting.pop(pid, None)
             if plan.get("_upload_pending"):
                 state.repair.add(pid)
+        except CapacityWait as e:
+            if pid not in state.waiting:   # 같은 사유로 기다리는 동안은 매번 로그를 남기지 않는다
+                log(f"계획 대기(프로젝트 {pid}): {redact(str(e))[:300]}")
+            state.waiting[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(잘못된 분석 결과 등)가 worker 전체를 멈추지 않게 한다
             state.failures[pid] = (tries + 1, time.time())
             expected = isinstance(e, (PlanError, ApiError, subprocess.TimeoutExpired, OSError))
@@ -864,12 +1039,15 @@ def main(argv=None):
     p.add_argument("--poll", type=float, default=float(os.environ.get("POLL_SECONDS", "5")), help="점검 간격(초)")
     p.add_argument("--once", action="store_true", help="한 번만 점검하고 끝낸다")
     p.add_argument("--arch", default=os.environ.get("TARGET_ARCH", ""), help="X86_64 또는 ARM64(기본: 이 PC의 docker)")
+    p.add_argument("--skip-quota-check", action="store_true",
+                   help="Fargate vCPU 할당량을 조회하지 않는다. 배포 계정에 servicequotas·cloudwatch 읽기 권한이 없을 때만 쓴다(할당량보다 큰 구성이 추천될 수 있다)")
     a = p.parse_args(argv)
     token = os.environ.get("WORKER_API_TOKEN", "")
     if not token:
         print("오류: WORKER_API_TOKEN 환경 변수가 필요합니다(백엔드와 같은 값)", file=sys.stderr)
         return 2
-    cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll)
+    cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll,
+                 quota_check=not a.skip_quota_check)
     arch = a.arch
     if not arch:
         rc, out, _ = run_capture(deploy(cfg, "detect-arch"), 30, env=child_env(cfg))

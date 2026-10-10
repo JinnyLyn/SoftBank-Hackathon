@@ -190,6 +190,28 @@ variable "db_multi_az" {
   default     = false
 }
 
+variable "budget_monthly_usd" {
+  description = "계정의 월 비용 알림 기준 금액(USD). 0(기본)이면 AWS Budgets 알림을 만들지 않는다. 알림만 보내고 비용을 차단하지는 않는다. 사용자가 입력한 앱별 월 예산과는 별개인 운영자용 안전망이다"
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.budget_monthly_usd >= 0
+    error_message = "budget_monthly_usd는 0 이상이어야 합니다(0이면 알림을 만들지 않습니다)."
+  }
+}
+
+variable "budget_alert_emails" {
+  description = "AWS Budgets 알림을 받을 이메일(최대 10개). 개인 정보라 코드에 적지 말고 -var 또는 tfvars로 넘긴다. budget_monthly_usd가 0이면 쓰지 않는다"
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.budget_alert_emails) <= 10 && alltrue([for e in var.budget_alert_emails : can(regex("^[^@[:space:]]+@[^@[:space:]]+[.][^@[:space:]]+$", e))])
+    error_message = "budget_alert_emails는 이메일 주소 최대 10개여야 합니다."
+  }
+}
+
 variable "final_snapshot" {
   description = "true면 RDS를 지울 때 최종 스냅샷을 남긴다. 시험용으로 지우고 다시 만들 때만 false로 한다"
   type        = bool
