@@ -72,6 +72,9 @@ class Analysis:
     evidence: List[Evidence] = field(default_factory=list)
     withheld_files: List[str] = field(default_factory=list)
     redactions: int = 0
+    # LLM이 채운 값 (규칙이 못 찾은 것만). 화면에서 근거 확인을 권함
+    ai_filled: List[str] = field(default_factory=list)
+    ai_model: Optional[str] = None
 
     def warn(self, title: str, detail: str) -> None:
         self.findings.append(Finding("warn", title, detail))
@@ -119,6 +122,7 @@ class Analysis:
             "sizing_hints": self.sizing_hints,
             "has_dockerfile": self.has_dockerfile,
             "masking": {"withheld_files": self.withheld_files, "redactions": self.redactions},
+            "ai": {"model": self.ai_model, "filled": self.ai_filled},
         }
 
 

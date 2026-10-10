@@ -188,7 +188,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_once_exit_code(self):
         self.add_project("p1")
-        code = runner.main(["--once", "--api-url", self.backend.url, "--upload-dir", str(self.uploads)])
+        code = runner.main(["--once", "--no-llm", "--api-url", self.backend.url, "--upload-dir", str(self.uploads)])
         self.assertEqual(code, 0)
         self.assertIn("p1", self.backend.analyses)
 

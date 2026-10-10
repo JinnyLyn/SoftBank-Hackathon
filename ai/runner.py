@@ -10,6 +10,9 @@
 |---|---|
 | PLATFORM_API_URL / --api-url | http://127.0.0.1:8000 |
 | UPLOAD_DIR / --upload-dir    | back/data/uploads (백엔드와 같은 변수·기본값) |
+| ANTHROPIC_API_KEY            | 환경 변수 또는 ai/.env. 없으면 규칙 분석만 |
+| PAVED_AI_MODEL / --model     | claude-opus-5-5 |
+| --no-llm                     | LLM을 부르지 않음 |
 
 백엔드로 옮길 때는 이 파일을 버리고 paved_ai 를 직접 부른다 (paved_ai 에는 HTTP 코드가 없음).
 """
@@ -33,11 +36,13 @@ from typing import Callable, Dict, Iterator, Optional, Set, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from paved_ai.analysis import SCHEMA_VERSION, analyze_files  # noqa: E402
+from paved_ai.llm import DEFAULT_MODEL, LlmUnavailable, fill_unresolved  # noqa: E402
 from paved_ai.masking import backend_unsafe_paths  # noqa: E402
 from paved_ai.source import SourceError, files_from_zip  # noqa: E402
 
 DEFAULT_API = "http://127.0.0.1:8000"
 DEFAULT_UPLOAD_DIR = Path(__file__).resolve().parents[1] / "back" / "data" / "uploads"
+DOTENV = Path(__file__).resolve().parent / ".env"
 REQUEST_TIMEOUT = 20
 MAX_FAILURES = 3  # 같은 프로젝트가 이만큼 실패하면 멈춤
 RETRY_AFTER = 120  # 실패한 프로젝트는 2분 뒤에 다시
@@ -127,8 +132,39 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def analyze_project(project: dict, upload_dir: Path) -> Tuple[dict, str]:
-    """업로드된 ZIP을 읽어 분석. 백엔드가 기록한 지문과 같은 파일일 때만 분석한다."""
+def load_dotenv(path: Path = DOTENV) -> None:
+    """ai/.env 의 KEY=값을 환경 변수로. 이미 있는 환경 변수는 덮어쓰지 않고, 값은 어디에도 출력하지 않음"""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def make_llm_client(enabled: bool = True):
+    """키와 SDK가 있으면 Anthropic client, 없으면 None (규칙 분석만)"""
+    if not enabled:
+        log.info("LLM을 쓰지 않습니다 (--no-llm). 규칙 분석만 합니다.")
+        return None
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        log.info("ANTHROPIC_API_KEY가 없어 규칙 분석만 합니다 (ai/.env 또는 환경 변수).")
+        return None
+    try:
+        import anthropic
+    except ImportError:
+        log.warning("anthropic SDK가 없어 규칙 분석만 합니다: pip install -r ai/requirements.txt")
+        return None
+    return anthropic.Anthropic(timeout=120.0, max_retries=2)
+
+
+def analyze_project(project: dict, upload_dir: Path, llm=None, model: str = DEFAULT_MODEL) -> Tuple[dict, str]:
+    """업로드된 ZIP을 읽어 분석. 백엔드가 기록한 지문과 같은 파일일 때만 분석한다.
+    llm(Anthropic client)이 있으면 규칙이 못 찾은 값만 LLM에 묻는다. LLM이 실패해도 규칙 결과는 기록한다."""
     path = upload_dir / f"{project['id']}.zip"
     if not path.is_file():
         raise RunnerError(f"소스 ZIP이 없습니다({path}). runner를 백엔드와 같은 PC에서 돌리고 UPLOAD_DIR을 맞춰 주세요.")
@@ -140,7 +176,19 @@ def analyze_project(project: dict, upload_dir: Path) -> Tuple[dict, str]:
     except SourceError as e:
         raise RunnerError(str(e), permanent=True) from None
 
-    result = analyze_files(files).to_result(scale=None)
+    analysis = analyze_files(files)
+    if llm is not None and analysis.unresolved:
+        try:
+            outcome = fill_unresolved(analysis, files, llm, model)
+            if outcome.asked:
+                log.info(
+                    "프로젝트 %s LLM 보조: 채움 %s, 버림 %s (모델 %s, 요청 %s)",
+                    project["id"], outcome.filled or "-", list(outcome.rejected) or "-", outcome.model, outcome.request_id,
+                )
+        except LlmUnavailable as e:
+            log.warning("프로젝트 %s LLM 보조를 건너뜁니다: %s", project["id"], e)
+            analysis.info("AI 보조 분석을 하지 못했습니다", f"{e} 규칙으로 찾은 값만 기록합니다.")
+    result = analysis.to_result(scale=None)
     unsafe = backend_unsafe_paths(result)
     if unsafe:
         # 가리기에서 놓친 것. 기록하지 않음
@@ -158,7 +206,9 @@ def _fail(state: State, pid: str, reason: str, permanent: bool, now: float) -> N
         log.warning("프로젝트 %s 분석 실패(%d/%d), %d초 뒤 다시: %s", pid, state.failures[pid], MAX_FAILURES, RETRY_AFTER, reason)
 
 
-def run_once(api: Api, upload_dir: Path, state: State, clock: Callable[[], float] = time.time) -> Dict[str, int]:
+def run_once(
+    api: Api, upload_dir: Path, state: State, clock: Callable[[], float] = time.time, llm=None, model: str = DEFAULT_MODEL
+) -> Dict[str, int]:
     """한 번 점검. 기록·건너뜀·실패 개수를 돌려줌"""
     counts = {"recorded": 0, "skipped": 0, "failed": 0}
     try:
@@ -178,7 +228,7 @@ def run_once(api: Api, upload_dir: Path, state: State, clock: Callable[[], float
                 state.done.add(pid)
                 counts["skipped"] += 1
                 continue
-            result, digest = analyze_project(project, upload_dir)
+            result, digest = analyze_project(project, upload_dir, llm, model)
             api.record_analysis(pid, digest, result)
         except RunnerError as e:
             counts["failed"] += 1
@@ -211,16 +261,20 @@ def main(argv=None) -> int:
     parser.add_argument("--upload-dir", type=Path, default=Path(os.getenv("UPLOAD_DIR", DEFAULT_UPLOAD_DIR)))
     parser.add_argument("--poll", type=float, default=5.0, help="점검 간격(초)")
     parser.add_argument("--once", action="store_true", help="한 번만 점검")
+    parser.add_argument("--model", default=os.getenv("PAVED_AI_MODEL", DEFAULT_MODEL))
+    parser.add_argument("--no-llm", action="store_true", help="LLM을 부르지 않고 규칙 분석만")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    load_dotenv()
+    llm = make_llm_client(enabled=not args.no_llm)
     api, state = Api(args.api_url), State()
     upload_dir = args.upload_dir.expanduser().resolve()
-    log.info("시작: 백엔드 %s, 업로드 폴더 %s", api.base, upload_dir)
+    log.info("시작: 백엔드 %s, 업로드 폴더 %s, LLM %s", api.base, upload_dir, args.model if llm else "끔")
 
     try:
         while True:
-            counts = run_once(api, upload_dir, state)
+            counts = run_once(api, upload_dir, state, llm=llm, model=args.model)
             if args.once:
                 log.info("한 번 점검 끝: 기록 %d, 건너뜀 %d, 실패 %d", counts["recorded"], counts["skipped"], counts["failed"])
                 return 0 if counts["failed"] == 0 else 1
