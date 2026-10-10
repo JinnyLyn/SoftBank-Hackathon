@@ -11,6 +11,9 @@
   connector 사용자가 CloudFormation으로 만든 역할(콜백으로 백엔드에 저장된 계정 ID·역할 ARN)을 실제로 AssumeRole 해 보고
             `complete`(성공) 또는 `fail`(역할 쪽 문제로 끝내 실패)을 보고한다. 사용자 계정 연결은 기본 제품 흐름이 아니다(docs/PRODUCT_DIRECTION.md).
 
+기본은 AWS만 다룬다. `--targets local_docker`를 주면 같은 planner·executor가 발표자 PC의 로컬 Docker(compose)로도 계획·실행한다.
+팀이 확정한 제품 범위가 아닌 시연용 선택 기능이다(local_docker.py, README의 "로컬 Docker 배포", docs/OPEN_QUESTIONS.md).
+
 지키는 규칙(AGENTS.md)
   - 승인된 저장 plan만 적용한다. 적용 직전에 plan 파일의 SHA-256이 승인된 값과 같은지 확인한다.
   - Docker 빌드는 승인된 작업에서만 한다(planner는 이미지를 만들지 않는다).
@@ -44,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cost  # noqa: E402
+import local_docker  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 INFRA = HERE.parent
@@ -124,6 +128,10 @@ class Config:
     apply_timeout: int = 1500
     max_source_bytes: int = 512 * 1024 * 1024   # API에서 내려받는 소스 ZIP의 크기 한도(백엔드 업로드 한도 기본 200 MiB보다 넉넉히)
     download_timeout: int = 900                 # 소스 ZIP 한 번을 내려받는 전체 제한 시간(초)
+    # 이 worker가 다루는 배포 대상. 기본은 AWS만이다. "local_docker"를 더하면 이 PC의 Docker로 배포하는 계획·실행도 한다(--targets).
+    # 팀 결정이 아니라 발표자 PC 시연용 선택 기능이다(docs/OPEN_QUESTIONS.md)
+    targets: tuple = ("aws",)
+    local: local_docker.LocalConfig = field(default_factory=local_docker.LocalConfig)
 
 
 def log(msg):
@@ -547,8 +555,8 @@ def reserved_vcpu(api, project_id):
         if pid == project_id:
             continue   # 이 프로젝트는 활성 계획이 없을 때만 계획한다(plan_pending)
         for plan in api.get(f"/api/projects/{pid}/plans") or []:
-            if plan.get("status") not in RESERVING_PLAN_STATUSES:
-                continue
+            if plan.get("status") not in RESERVING_PLAN_STATUSES or plan.get("target", "aws") != "aws":
+                continue   # 로컬 Docker 계획은 Fargate vCPU를 쓰지 않는다
             peak = plan_peak_vcpu(plan)
             if peak is None:
                 log(f"계획 {plan.get('id')}: 최대 vCPU를 읽지 못해 예약에 넣지 않습니다(variables.cost.peak_vcpu 또는 variables.app 확인)")
@@ -569,6 +577,12 @@ def upload_plan(api, plan_id, plan_file):
 
 
 ACTIVE_PLAN_STATUSES = ("awaiting_approval", "approved", "consumed")   # superseded만 남은 프로젝트는 다시 계획한다
+DECIDED_PLAN_STATUSES = ("approved", "consumed")                       # 사용자가 승인한 계획. 그 프로젝트는 배포 대상이 정해진 것이다
+
+
+def decided_elsewhere(plans, target):
+    """프로젝트가 target이 아닌 다른 대상의 계획을 이미 승인·배포했는지. 그렇다면 target 쪽 계획을 새로 만들지 않는다(계획에 target이 없으면 aws)."""
+    return any(p.get("status") in DECIDED_PLAN_STATUSES and p.get("target", "aws") != target for p in plans)
 
 
 def repair_plan_uploads(api, cfg, plans):
@@ -740,6 +754,91 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     return plan
 
 
+# --- planner: 로컬 Docker (target=local_docker) -------------------------------------------------------
+def local_app_config(result):
+    """분석 결과에서 로컬 Docker용 앱 설정을 읽는다. 검증은 AWS와 같은 규칙이고(app_config_from_analysis), Fargate 태스크 크기·개수는 뺀다."""
+    app, dockerfile = app_config_from_analysis(result, "lean", {"task_size": "xsmall", "min_tasks": 1, "max_tasks": 1})
+    for k in ("task_size", "min_tasks", "max_tasks"):
+        app.pop(k, None)
+    return app, dockerfile
+
+
+def plan_local_project(api, cfg, project, analysis):
+    """프로젝트의 로컬 Docker 배포 계획(compose 파일)을 만들어 백엔드에 등록한다. 등록한 계획(PlanOut)을 돌려준다.
+
+    계획 본문은 compose 파일이고 그 SHA-256이 승인 대상이다(terraform_plan_sha256 자리). 파일은 계획 변수에 들어 있어 별도 업로드가 없다.
+    이 단계는 이미지를 만들지 않고 컨테이너를 띄우지도 않는다(승인 뒤에만)."""
+    lc = cfg.local
+    src_sha = project.get("source_sha256")
+    if not isinstance(src_sha, str) or not SHA256_RE.match(src_sha):
+        raise PlanError("프로젝트의 source_sha256을 읽지 못했습니다(승인한 소스를 배포 직전에 확인하려면 필요합니다)")
+    result = analysis.get("result", {})
+    users, pattern, _budget = scale_from_analysis(result, project)   # 예산은 로컬 Docker의 추가 비용이 0이라 판정에 쓰지 않는다
+    app, dockerfile = local_app_config(result)
+    try:
+        info = local_docker.docker_info(lc)
+        base, reasons = local_docker.recommend_tier(users, pattern)
+        tier, profile, lowered = local_docker.fit_tier(base, app["use_database"], info["ncpu"], info["mem_mb"])
+        deploy_id = local_docker.local_deploy_id(project["id"])
+        port = local_docker.pick_host_port(deploy_id, lc.bind)
+        plan = local_docker.make_plan(deploy_id=deploy_id, image=local_docker.image_ref(deploy_id, src_sha), dockerfile=dockerfile, app=app,
+                                      source_sha256=src_sha, tier=tier, profile=profile, reasons=reasons + lowered, host_port=port, bind=lc.bind,
+                                      public_host=lc.public_host, docker_info=info)
+    except local_docker.LocalError as e:
+        raise PlanError(e.message) from None
+    body = {"project_id": project["id"], "analysis_id": analysis.get("id"), "target": local_docker.TARGET, "module_id": local_docker.MODULE_ID,
+            "variables": plan["variables"], "summary": plan["summary"], "cost_estimate": plan["cost_estimate"], "terraform_plan_sha256": plan["digest"]}
+    log(f"로컬 Docker 계획 생성: 프로젝트 {project['id']} → 배포 ID {deploy_id}, 단계 {tier}, 포트 {port}")
+    try:
+        created = api.post("/api/plans", body)
+    except ApiError as e:
+        if e.status != 0 and e.status < 500:
+            raise
+        # 연결이 끊겼거나 5xx: 서버는 등록을 끝냈는데 응답만 잃었을 수 있다. 같은 계획이 이미 승인 대기로 있으면 그것을 쓴다(중복 등록 방지)
+        created = next((p for p in api.get(f"/api/projects/{project['id']}/plans") or []
+                        if p.get("target") == local_docker.TARGET and p.get("status") == "awaiting_approval"
+                        and p.get("terraform_plan_sha256") == plan["digest"]), None)
+        if created is None:
+            raise
+        log(f"등록 응답은 유실됐지만 서버에 계획 {created['id']}이 있습니다")
+    log(f"로컬 Docker 계획 등록 완료: {created['id']} (compose sha {plan['digest'][:12]})")
+    return created
+
+
+def plan_pending_local(api, cfg, state):
+    """로컬 Docker 계획이 없는 프로젝트마다 계획을 만든다. AWS 계획과 따로 센다(한 프로젝트가 두 대상의 계획을 함께 가질 수 있다).
+
+    승인한 계획(approved·consumed)이 이미 있는 프로젝트는 대상이 정해진 것이라 건너뛴다. 그렇지 않으면 과거에 AWS로 배포한 프로젝트마다
+    쓰지 않을 로컬 계획이 생긴다. 승인 대기 계획은 사용자가 두 대상을 비교하도록 둘 다 둔다."""
+    for project in list_projects(api):
+        pid = project["id"]
+        if pid in state.local_done and time.time() - state.local_done[pid] < state.recheck_after:
+            continue
+        tries, last = state.local_failures.get(pid, (0, 0.0))
+        if tries >= state.max_tries or (tries and time.time() - last < state.retry_after):
+            continue
+        plans = api.get(f"/api/projects/{pid}/plans") or []
+        if (any(p.get("status") in ACTIVE_PLAN_STATUSES and p.get("target") == local_docker.TARGET for p in plans)
+                or decided_elsewhere(plans, local_docker.TARGET)):
+            state.local_done[pid] = time.time()
+            continue
+        state.local_done.pop(pid, None)
+        try:
+            analysis = api.get(f"/api/projects/{pid}/analyses/latest")
+        except ApiError as e:
+            if e.status == 404:
+                continue   # 분석 결과가 아직 없다
+            raise
+        try:
+            plan_local_project(api, cfg, project, analysis)
+            state.local_done[pid] = time.time()
+        except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 오류가 worker 전체를 멈추지 않게 한다
+            state.local_failures[pid] = (tries + 1, time.time())
+            expected = isinstance(e, (PlanError, ApiError, OSError))
+            kind = "" if expected else f"{type(e).__name__}: "
+            log(f"로컬 Docker 계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {kind}{redact(str(e))[:300]}")
+
+
 # --- executor --------------------------------------------------------------------------------------
 REPORT_RETRIES = 4
 REPORT_RETRY_DELAY = 2.0   # 초. 시험에서는 0으로 줄인다
@@ -828,6 +927,8 @@ def fetch_source(api, cfg, job, expected):
 
 def execute_job(api, cfg, job):
     """claim한 작업 하나를 실행한다. 어떤 경우에도 결과를 failed 또는 healthy 로 보고한다(처리 도중 멈춘 채 두지 않는다)."""
+    if job.get("target") == local_docker.TARGET:
+        return execute_local_job(api, cfg, job)   # 이 PC의 Docker로 배포(AWS 경로와 별개)
     dep = job["deployment_id"]
     v = job.get("variables") or {}
     deploy_id = v.get("deploy_id", "")
@@ -903,6 +1004,92 @@ def execute_job(api, cfg, job):
             report(api, dep, "deploying", "apply_done", "인프라 적용이 끝났습니다")
         report(api, dep, "healthy", "healthy", "헬스체크를 통과했습니다", details={"log_tail": tail(out, 12)}, url=url)
         log(f"배포 완료: {url}")
+    except ApiError as e:
+        log(f"백엔드 보고 실패: {e}")   # 보고가 안 되면 더 할 수 있는 것이 없다. 작업은 다음 점검에서 사람이 확인한다
+    except Exception as e:   # noqa: BLE001 - 예상 못 한 오류도 failed로 남긴다
+        try:
+            fail_job(api, dep, "worker_error", f"worker 오류: {type(e).__name__}: {redact(str(e))[:300]}")
+        except ApiError as e2:
+            log(f"백엔드 보고 실패: {e2}")
+    finally:
+        if src_tmp is not None:
+            shutil.rmtree(src_tmp, ignore_errors=True)
+
+
+def fit_details(details, limit=30 * 1024):
+    """이벤트 details가 백엔드 한도(32 KiB)를 넘으면 진단 JSON을 빼고 보낸다(AWS 경로와 같은 규칙)."""
+    if details is not None and len(json.dumps(details, ensure_ascii=False).encode("utf-8")) > limit:
+        details = {k: v for k, v in details.items() if k != "diagnose"}
+    return details
+
+
+def execute_local_job(api, cfg, job):
+    """승인된 로컬 Docker 작업을 실행한다(이미지 빌드 → docker compose up → 앱 초기화 → 헬스체크). 결과는 항상 healthy 또는 failed로 보고한다.
+
+    실행 전에 승인된 계획 그대로인지 확인한다: 계획 변수에서 compose 파일을 다시 만들어 승인된 본문과 같은지, 그 SHA-256이 승인된 값인지.
+    다르면 아무것도 하지 않고 failed로 보고한다. 롤백은 지원하지 않는다(백엔드도 로컬 Docker 롤백 계획을 만들지 않는다)."""
+    dep = job["deployment_id"]
+    v = job.get("variables") or {}
+    lc = cfg.local
+    src_tmp = None   # API에서 내려받은 소스의 임시 폴더. 어떤 경우에도 끝날 때 지운다
+    try:
+        if local_docker.TARGET not in cfg.targets:
+            return fail_job(api, dep, "unsupported_target", "이 worker는 로컬 Docker 배포를 하도록 켜져 있지 않습니다(--targets). 실행하지 않았습니다")
+        if job.get("operation_type", "deploy") != "deploy":
+            return fail_job(api, dep, "unsupported_operation", "로컬 Docker 배포는 롤백을 지원하지 않습니다. 실행하지 않았습니다")
+        deploy_id = v.get("deploy_id", "")
+        if not local_docker.ID_RE.match(deploy_id if isinstance(deploy_id, str) else ""):
+            return fail_job(api, dep, "invalid_job", f"작업의 deploy_id가 올바르지 않습니다: {deploy_id!r}")
+        try:
+            params = local_docker.params_from_variables(v)
+            rendered = local_docker.render_compose(params)
+            url = local_docker.public_url(v)
+            health = v["app"].get("health_check_path", "/")
+            if not isinstance(health, str) or not HEALTH_PATH_RE.match(health) or len(health) > 128:
+                raise ValueError(f"health_check_path가 올바르지 않습니다: {health!r}")
+            init = v["app"].get("init_command")
+            if init is not None and (not isinstance(init, list) or len(init) > 10 or not all(isinstance(x, str) and 0 < len(x) <= 200 for x in init)):
+                raise ValueError("init_command가 올바르지 않습니다")
+        except ValueError as e:
+            return fail_job(api, dep, "invalid_job", f"작업의 계획 변수가 올바르지 않습니다: {e}")
+        expected = job.get("terraform_plan_sha256") or ""
+        compose_text = v.get("compose_yaml")
+        if (not SHA256_RE.match(expected) or compose_text != rendered or local_docker.compose_digest(rendered) != expected):
+            return fail_job(api, dep, "plan_mismatch", "승인된 compose 파일이 계획 변수나 승인된 SHA-256과 다릅니다. 실행하지 않았습니다")
+        # 승인한 소스와 지금 소스가 같은지 확인한다(AWS 경로와 같은 규칙: 승인 뒤에 바뀐 코드는 실행하지 않는다)
+        src_expected = v.get("source_sha256", "")
+        job_sha = job.get("source_sha256")
+        if not isinstance(src_expected, str) or not SHA256_RE.match(src_expected) or (job_sha and job_sha != src_expected):
+            return fail_job(api, dep, *SOURCE_MISMATCH)
+        src_path, src_tmp, err = fetch_source(api, cfg, job, src_expected)
+        if err:
+            return fail_job(api, dep, *err)
+
+        log(f"이미지 빌드(로컬 Docker): {deploy_id}")
+        local_docker.build_image(lc, src_path, v.get("dockerfile", "Dockerfile"), params["image"])
+
+        state = {"deploying": False}
+
+        def on_deploying():
+            # 컨테이너를 띄우고 초기화 작업까지 끝낸 뒤 헬스체크를 기다리기 시작할 때 알린다. 보고가 실패해도 배포는 이어가고 healthy 전에 다시 보낸다
+            try:
+                report(api, dep, "deploying", "apply_done", "컨테이너를 시작했고 헬스체크를 기다립니다")
+                state["deploying"] = True
+            except ApiError as e:
+                log(f"deploying 보고 실패(배포는 이어갑니다): {e}")
+
+        log(f"적용(로컬 Docker): {deploy_id}")
+        local_docker.apply(lc, deploy_id, rendered, host_port=params["host_port"], health_path=health, init_command=init,
+                           use_database=params["use_database"], on_deploying=on_deploying)
+        if not state["deploying"]:
+            report(api, dep, "deploying", "apply_done", "컨테이너를 시작했습니다")
+        report(api, dep, "healthy", "healthy", "헬스체크를 통과했습니다", url=url, details={"image": params["image"], "compose_sha256": expected})
+        log(f"배포 완료(로컬 Docker): {url}")
+    except local_docker.LocalError as e:
+        try:
+            fail_job(api, dep, e.event_type, e.message, fit_details(e.details))
+        except ApiError as e2:
+            log(f"백엔드 보고 실패: {e2}")
     except ApiError as e:
         log(f"백엔드 보고 실패: {e}")   # 보고가 안 되면 더 할 수 있는 것이 없다. 작업은 다음 점검에서 사람이 확인한다
     except Exception as e:   # noqa: BLE001 - 예상 못 한 오류도 failed로 남긴다
@@ -1077,6 +1264,8 @@ class State:
     conn_budget: float = 15.0                        # 한 점검에서 연결 확인에 쓸 수 있는 시간(초). 넘으면 남은 연결은 다음 점검으로 미룬다
     assume_proven: bool = False                      # 이 프로세스에서 AssumeRole이 한 번이라도 성공했는가(= worker 권한이 증명됐는가)
     conn_warned_ids: set = field(default_factory=set)   # 권한 미증명 AccessDenied를 이미 로그로 알린 연결
+    local_done: dict = field(default_factory=dict)      # 로컬 Docker 계획: 프로젝트 id → 이미 계획했거나 결정이 끝난 것을 마지막으로 확인한 시각
+    local_failures: dict = field(default_factory=dict)  # 로컬 Docker 계획: 프로젝트 id → (실패 횟수, 마지막 시각)
 
 
 def list_projects(api, max_pages=10):
@@ -1108,8 +1297,9 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             state.repair.add(pid)
         else:
             state.repair.discard(pid)
-        # 진행 중이거나 끝난 계획(승인 대기·승인·배포됨)이 하나라도 있으면 건너뛴다. 모두 superseded(대체됨)이면 다시 계획한다
-        if any(p.get("status") in ACTIVE_PLAN_STATUSES for p in plans):
+        # 진행 중이거나 끝난 계획(승인 대기·승인·배포됨)이 하나라도 있으면 건너뛴다. 모두 superseded(대체됨)이면 다시 계획한다.
+        # AWS 계획만 센다(계획에 target이 없으면 aws). 다른 대상(로컬 Docker)으로 이미 승인·배포한 프로젝트는 결정이 끝난 것이라 AWS 계획을 새로 만들지 않는다
+        if any(p.get("status") in ACTIVE_PLAN_STATUSES and p.get("target", "aws") == "aws" for p in plans) or decided_elsewhere(plans, "aws"):
             state.done[pid] = time.time()
             continue
         state.done.pop(pid, None)   # 활성 계획이 없다: 다시 계획할 대상이다
@@ -1136,16 +1326,29 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {kind}{redact(str(e))[:300]}")
 
 
+def claim_path(cfg):
+    """claim 요청 경로. 기본(AWS만)은 targets를 보내지 않아 예전 백엔드·worker와 같게 동작한다(백엔드의 기본값이 aws).
+    로컬 Docker를 켠 worker만 자기가 다루는 대상을 알린다."""
+    if tuple(cfg.targets) == ("aws",):
+        return "/api/worker/deployments/claim"
+    return "/api/worker/deployments/claim?targets=" + ",".join(cfg.targets)
+
+
 def tick(api, cfg, state, prices=None, arch="X86_64"):
     """한 번 점검한다: 승인된 작업이 있으면 먼저 실행하고, 대기 중인 연결을 확인하고, 계획이 없는 프로젝트가 있으면 계획을 만든다.
-    연결 확인은 기본 제품 흐름이 아닌 호환용이라 배포 작업을 가져오는 일보다 뒤에 두고, 시간 예산(state.conn_budget)을 둔다."""
-    got = api.post("/api/worker/deployments/claim")
+    연결 확인은 기본 제품 흐름이 아닌 호환용이라 배포 작업을 가져오는 일보다 뒤에 두고, 시간 예산(state.conn_budget)을 둔다.
+    로컬 Docker 계획은 몇 초면 끝나서 몇십 초 걸리는 AWS 계획보다 먼저 만든다(두 대상을 비교하는 화면이 로컬 계획을 오래 기다리지 않게)."""
+    got = api.post(claim_path(cfg))
     job = (got or {}).get("job")
     if job:
         log(f"작업 시작: 배포 {job['deployment_id']}")
         execute_job(api, cfg, job)
-    verify_connections(api, cfg, state)
-    plan_pending(api, cfg, state, prices, arch)
+    if "aws" in cfg.targets:
+        verify_connections(api, cfg, state)
+    if local_docker.TARGET in cfg.targets:
+        plan_pending_local(api, cfg, state)
+    if "aws" in cfg.targets:
+        plan_pending(api, cfg, state, prices, arch)
     return bool(job)
 
 
@@ -1165,13 +1368,29 @@ def main(argv=None):
     p.add_argument("--arch", default=os.environ.get("TARGET_ARCH", ""), help="X86_64 또는 ARM64(기본: 이 PC의 docker)")
     p.add_argument("--skip-quota-check", action="store_true",
                    help="Fargate vCPU 할당량을 조회하지 않는다. 배포 계정에 servicequotas·cloudwatch 읽기 권한이 없을 때만 쓴다(할당량보다 큰 구성이 추천될 수 있다)")
+    p.add_argument("--targets", default=os.environ.get("WORKER_TARGETS", "aws"),
+                   help="다룰 배포 대상(쉼표 구분): aws, local_docker. 기본 aws. local_docker는 이 PC의 Docker로 배포하는 발표자 PC 시연용이다(infra/worker/README.md)")
+    p.add_argument("--local-host", default=os.environ.get("LOCAL_DOCKER_HOST", "localhost"), help="로컬 Docker 배포의 접속 주소에 쓸 이름(기본 localhost)")
+    p.add_argument("--local-bind", default=os.environ.get("LOCAL_DOCKER_BIND", "127.0.0.1"),
+                   help="컨테이너 포트를 여는 주소(기본 127.0.0.1: 이 PC에서만 접속). 0.0.0.0이면 같은 네트워크의 다른 기기에서도 접속된다")
+    p.add_argument("--local-dir", default=os.environ.get("LOCAL_DOCKER_DIR", str(INFRA / "local-deployments")), help="로컬 Docker 배포 폴더(compose 파일, 비밀 파일)")
     a = p.parse_args(argv)
     token = os.environ.get("WORKER_API_TOKEN", "")
     if not token:
         print("오류: WORKER_API_TOKEN 환경 변수가 필요합니다(백엔드와 같은 값)", file=sys.stderr)
         return 2
+    targets = tuple(dict.fromkeys(t.strip() for t in a.targets.split(",") if t.strip()))
+    if not targets or any(t not in ("aws", local_docker.TARGET) for t in targets):
+        print("오류: --targets는 aws, local_docker 중에서 쉼표로 지정합니다", file=sys.stderr)
+        return 2
+    if not local_docker.HOST_RE.match(a.local_host) or not local_docker.BIND_RE.match(a.local_bind):
+        print("오류: --local-host는 호스트 이름 또는 IP, --local-bind는 IPv4 주소여야 합니다", file=sys.stderr)
+        return 2
     cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll,
-                 quota_check=not a.skip_quota_check)
+                 quota_check=not a.skip_quota_check, targets=targets)
+    cfg.local = local_docker.LocalConfig(root=Path(a.local_dir), bind=a.local_bind, public_host=a.local_host)
+    if local_docker.TARGET in targets and a.local_bind not in ("127.0.0.1", "localhost"):
+        log(f"경고: 컨테이너 포트를 {a.local_bind}에 엽니다. 로그인이 없는 앱이면 같은 네트워크의 누구나 접속할 수 있습니다")
     raw_max = os.environ.get("MAX_SOURCE_BYTES", "")
     if raw_max:
         if not raw_max.isdigit() or int(raw_max) < 1:
@@ -1180,12 +1399,13 @@ def main(argv=None):
         cfg.max_source_bytes = int(raw_max)
     warn_if_insecure(cfg.api_url)
     arch = a.arch
-    if not arch:
+    if not arch and "aws" in targets:
         rc, out, _ = run_capture(deploy(cfg, "detect-arch"), 30, env=child_env(cfg))
         arch = out.strip() if rc == 0 and out.strip() in ("X86_64", "ARM64") else "X86_64"
+    arch = arch or "X86_64"   # 로컬 Docker만 다루면 쓰지 않는 값이다
     api = Api(cfg.api_url, cfg.token)
     state = State()
-    log(f"worker 시작: {cfg.api_url} (아키텍처 {arch})")
+    log(f"worker 시작: {cfg.api_url} (대상 {','.join(targets)}, 아키텍처 {arch})")
     while True:
         try:
             tick(api, cfg, state, arch=arch)

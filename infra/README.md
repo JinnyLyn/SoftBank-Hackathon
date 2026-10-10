@@ -12,6 +12,8 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 - 앱 삭제와 도메인 등록 해지·갱신 중단은 별개다. 공유 인증서·hosted zone·다른 앱 레코드를 앱 destroy에 묶지 않는다. B를 구현할 경우 등록인 정보·구매 승인·중복 등록 방지도 별도 계약이 필요하다.
 - 검증은 앱의 `healthy`와 선택한 독립 도메인의 유효한 HTTPS·해당 앱 응답을 구분한다. 사전 확보 도메인의 수동 연결이나 자체 서명 인증서 시험을 신규 사용자의 구매부터 자동화한 것으로 보고하지 않는다.
 
+> 이 README의 모든 내용은 AWS 배포 계층이다. 발표자 PC의 Docker로 올리는 선택 기능(`target=local_docker`)은 Terraform·`deploy.sh`와 무관하게 worker가 `docker compose`로 실행하며 [worker/README.md](worker/README.md#로컬-docker-배포-발표자-pc-시연용-선택-기능)에 따로 적었다. 팀이 확정한 범위가 아니다.
+
 ## 구조
 
 | 경로 | 역할 | 누가 실행하나 |
