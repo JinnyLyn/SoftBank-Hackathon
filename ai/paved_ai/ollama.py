@@ -17,7 +17,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 DEFAULT_BASE_URL = "https://ollama.com"
-DEFAULT_MODEL = "glm-5.3"
+# 10/11 비교(시험 앱 2개 × 3회, 캐시 끔): gemma4:31b 중간값 1.2초·6/6로 가장 빠름 (glm-5.3 5.6초·6/6)
+DEFAULT_MODEL = "gemma4:31b"
 
 
 class OllamaError(Exception):
@@ -30,6 +31,9 @@ class Reply:
     stop_reason: str  # "end_turn" | "max_tokens" | 그 밖의 done_reason
     model: str
     request_id: Optional[str] = None
+    # 토큰 사용량 (Ollama prompt_eval_count / eval_count). 모르면 None
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
 
 
 @dataclass
@@ -67,7 +71,12 @@ class OllamaClient:
         text = message.get("content", "") if isinstance(message, dict) else ""
         done = data.get("done_reason", "stop") if isinstance(data, dict) else "stop"
         stop = {"stop": "end_turn", "length": "max_tokens"}.get(done, str(done))
-        return Reply(text=text or "", stop_reason=stop, model=str(data.get("model") or model), request_id=request_id)
+        def count(key):
+            v = data.get(key) if isinstance(data, dict) else None
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+        return Reply(text=text or "", stop_reason=stop, model=str(data.get("model") or model), request_id=request_id,
+                     input_tokens=count("prompt_eval_count"), output_tokens=count("eval_count"))
 
 
 def _http_reason(exc: urllib.error.HTTPError) -> str:

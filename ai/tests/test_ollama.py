@@ -91,9 +91,11 @@ class OllamaHttpTests(unittest.TestCase):
         _Handler.seen.clear()
 
     def test_request_shape_and_reply(self):
-        _Handler.status, _Handler.body = 200, {"model": "glm-5.3", "message": {"content": "{}", "thinking": "..."}, "done_reason": "length"}
+        _Handler.status, _Handler.body = 200, {"model": "glm-5.3", "message": {"content": "{}", "thinking": "..."}, "done_reason": "length",
+                                               "prompt_eval_count": 900, "eval_count": 120}
         reply = OllamaClient("k-test", base_url=self.url).chat("glm-5.3", "sys", "user", {"type": "object"}, 100)
         self.assertEqual((reply.text, reply.stop_reason, reply.model), ("{}", "max_tokens", "glm-5.3"))
+        self.assertEqual((reply.input_tokens, reply.output_tokens), (900, 120), "토큰 사용량을 읽음 (AGENTS.md 7)")
         sent = _Handler.seen[0]
         self.assertEqual(sent["path"], "/api/chat")
         self.assertEqual(sent["auth"], "Bearer k-test")
@@ -121,7 +123,7 @@ class ProviderChoiceTests(unittest.TestCase):
     def test_ollama_first_then_anthropic(self):
         client, model = self.pick({"OLLAMA_API_KEY": "x", "ANTHROPIC_API_KEY": "y"})
         self.assertIsInstance(client, OllamaClient)
-        self.assertEqual(model, "glm-5.3")
+        self.assertEqual(model, "gemma4:31b")
         self.assertEqual(self.pick({}), (None, None))
         client, _ = self.pick({"PAVED_AI_PROVIDER": "ollama"})
         self.assertIsNone(client, "Ollama를 고르고 키가 없으면 규칙 분석만")

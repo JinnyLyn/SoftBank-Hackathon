@@ -52,6 +52,14 @@ export interface Finding {
   detail: string
 }
 
+/** Dockerfile이 없을 때 분석기가 만든 초안 (사용자가 저장소에 넣는 제안) */
+export interface DockerfileDraft {
+  content: string
+  port: number
+  /** 초안을 만들 때 본 근거 (파일:줄) */
+  basedOn: string[]
+}
+
 export interface Analysis {
   projectId: string
   /** 코드에서 읽어낸 스택 정보 (프레임워크, 포트 등) */
@@ -64,6 +72,7 @@ export interface Analysis {
    * 하나라도 있으면 worker가 계획을 만들지 않으므로 기다리지 않고 이유를 보여 줌
    */
   blockers?: string[]
+  dockerfileDraft?: DockerfileDraft
 }
 
 export type TierKey = 'lean' | 'balanced' | 'roomy'
