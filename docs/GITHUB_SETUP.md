@@ -16,7 +16,7 @@
 
 `paved-main-pr-review`에만 JinnyLyn 계정의 **For pull requests only** 예외를 둔다. 본인 PR은 다른 팀원 승인 없이 검증·diff를 확인하고 PR 화면에서 우회 머지한다. 이 권한은 작성자 조건을 검사하지 않으므로 다른 사람 PR에도 쓸 수 있지만, 팀 운영에서는 본인 PR에만 사용한다. 명령행 main 직접 푸시는 이 예외로 허용되지 않는다.
 
-CODEOWNERS는 main의 파일을 사용하며 기본 리뷰 담당은 JinnyLyn이다. 2026-10-10 부재 중 임시 위임 요청에 따라 이 변경이 main에 합쳐지면 `JinVibe`, `Ophelia0419`, `totorosi`, `wisetg`도 코드오너가 된다. 기존 write 권한으로 작성자 외 코드오너 1명의 승인 후 머지할 수 있으며 관리자·ruleset 우회 권한은 추가하지 않는다. 자동 만료는 없고, JinnyLyn 복귀 후 원복 요청 시 [WORKFLOW §1.1](../WORKFLOW.md#11-jinnylyn-부재-중-임시-리뷰머지-위임)의 절차로 되돌린다.
+CODEOWNERS는 main의 파일을 사용하며 코드오너·기본 리뷰 담당은 JinnyLyn이다. 2026-10-11 복귀 후 원복 요청에 따라 PR #26의 임시 코드오너 위임을 종료한다. 팀원의 기존 write 권한과 서버 ruleset은 변경하지 않는다.
 
 2026-10-10 재확인한 서버 설정은 `require_last_push_approval: false`다. JinnyLyn은 팀원 PR의 작은 수정을 GitHub 웹에서 반영한 뒤 최종 변경을 검토·승인할 수 있다. 승인 1명·CODEOWNERS 승인·새 커밋 시 승인 무효화·리뷰 대화 해결 규칙은 유지한다. 이 웹 편집 방식은 로컬의 타인 브랜치 커밋·푸시 제한을 해제하지 않는다.
 
@@ -35,7 +35,7 @@ Actions 권한은 `contents: read`이고 저장소 인증 정보는 checkout에 
 
 추가한 `Application CI`는 main 대상 PR과 main push에서 구성요소별 검사를 실행한다. 마지막 고정 check는 `Available app checks`다. MOCK 브라우저, 실제 샘플 DB/API/브라우저, 플랫폼 프런트 빌드, 플랫폼 백엔드 기동·HTTP 기본 검사, Terraform 정적 검사를 코드 유무에 따라 수행하고 전체 플랫폼 미검증을 요약에 남긴다. 자세한 범위는 [CI.md](CI.md)를 참고한다.
 
-2026-10-10 임시 위임 작업에서 다시 조회한 `paved-main-ci`(ID `24706835`)는 `Available app checks`를 필수로 요구한다(`integration_id: 15368`, strict 모드, 우회 없음). 이 위임 PR은 서버 ruleset을 변경하지 않으며 실제 조회 결과에 맞춰 문서만 정정한다. 조건부 개별 job은 미구현 상태에서 skip되므로 필수 check로 각각 등록하지 않는다. 실제 배포 권한·승인·rollback 방식은 별도 합의한다.
+2026-10-10 PR #26에서 다시 조회한 `paved-main-ci`(ID `24706835`)는 `Available app checks`를 필수로 요구한다(`integration_id: 15368`, strict 모드, 우회 없음). PR #26은 서버 ruleset을 변경하지 않고 실제 조회 결과에 맞춰 문서만 정정했다. 임시 위임 종료 후에도 이 정정과 Git guard의 별도 성공 확인 절차는 유지한다. 조건부 개별 job은 미구현 상태에서 skip되므로 필수 check로 각각 등록하지 않는다. 실제 배포 권한·승인·rollback 방식은 별도 합의한다.
 
 ## 각 팀원이 한 번 실행
 
