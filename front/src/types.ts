@@ -72,6 +72,7 @@ export interface Analysis {
    * 하나라도 있으면 worker가 계획을 만들지 않으므로 기다리지 않고 이유를 보여 줌
    */
   blockers?: string[]
+  /** 있으면 저장소에 Dockerfile을 넣어야 배포할 수 있음 (worker는 소스 안의 Dockerfile로만 빌드) */
   dockerfileDraft?: DockerfileDraft
 }
 

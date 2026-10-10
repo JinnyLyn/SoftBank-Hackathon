@@ -83,7 +83,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
         </details>
       </section>
 
-      {blockers.length > 0 ? null : rec ? (
+      {blockers.length > 0 || analysis.dockerfileDraft ? null : rec ? (
         <Plans rec={rec} {...plans} />
       ) : (
         <section>

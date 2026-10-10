@@ -346,7 +346,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
         setAnalysis(a)
         await saveDomain(a.projectId)
         // 배포할 수 없는 앱이면 worker가 계획을 만들지 않으므로 기다리지 않음 (PR #25 리뷰)
-        if (!a.blockers?.length) loadRec(a.projectId)
+        if (!a.blockers?.length && !a.dockerfileDraft) loadRec(a.projectId)
       }
       setStep(ANALYSIS)
     })
@@ -427,7 +427,11 @@ export default function NewDeploy({ onShowHistory }: Props) {
     }
   if (step === DOMAIN && locked) next = { label: '다음', onClick: () => setStep(ANALYSIS) }
   if (step === ANALYSIS && !locked) {
-    if (!rec) next = { label: recError ? '비용 승인' : '계획 준비 중…', onClick: () => {}, disabled: true }
+    if (!rec) {
+      // 배포할 수 없거나 Dockerfile을 넣어야 하면 계획을 기다리지 않으므로 '준비 중'으로 보이지 않게
+      const waiting = !recError && !analysis?.blockers?.length && !analysis?.dockerfileDraft
+      next = { label: waiting ? '계획 준비 중…' : '비용 승인', onClick: () => {}, disabled: true }
+    }
     else if (codeState === 'error' && analysis && choice)
       next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
     else if (!choice) next = { label: '비용 승인', onClick: () => {}, disabled: true }

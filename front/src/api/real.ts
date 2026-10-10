@@ -135,7 +135,7 @@ function toAnalysis(out: AnalysisOut): Analysis {
       ? { content: d.content, port: Number(d.port) || 0, basedOn: Array.isArray(d.based_on) ? d.based_on.map(str) : [] }
       : undefined
 
-  return { projectId: out.project_id, stack, findings, evidence, blockers: blockersOf(r), dockerfileDraft }
+  return { projectId: out.project_id, stack, findings, evidence, blockers: blockersOf(r, !!dockerfileDraft), dockerfileDraft }
 }
 
 // worker가 계획을 만들려면 꼭 있어야 하는 값 (infra/worker app_config_from_analysis)
@@ -146,7 +146,7 @@ const REQUIRED_FOR_PLAN: Record<string, string> = {
 }
 
 /** 배포할 수 없는 이유. 미지원(supported: false)과, 계획에 꼭 필요한 값을 못 찾은 경우 */
-function blockersOf(r: Record<string, unknown>): string[] {
+function blockersOf(r: Record<string, unknown>, hasDraft: boolean): string[] {
   const out: string[] = []
   if (r.supported === false) {
     const reasons = Array.isArray(r.unsupported_reasons) ? r.unsupported_reasons.map(str).filter(Boolean) : []
@@ -154,6 +154,8 @@ function blockersOf(r: Record<string, unknown>): string[] {
   }
   const unresolved = isObj(r.unresolved) ? r.unresolved : {}
   for (const [key, label] of Object.entries(REQUIRED_FOR_PLAN)) {
+    // Dockerfile 초안이 있으면 Dockerfile·포트는 초안을 넣으면 해결됨(포트는 초안의 EXPOSE) → 오류가 아니라 남은 단계로 안내
+    if (hasDraft && (key === 'dockerfile' || key === 'container_port')) continue
     if (key in unresolved) out.push(`${label}: ${str(unresolved[key]) || '코드에서 찾지 못했습니다.'}`)
   }
   return out
