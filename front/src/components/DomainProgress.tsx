@@ -1,5 +1,9 @@
 import { useState } from 'react'
+import { isEnabled } from '../providers'
 import type { DnsRecord, DomainMode, DomainPlan, DomainStatus } from '../types'
+
+/** 도메인 없이 접속하는 미리보기 주소가 어디 것인지. 켜 둔 배포 대상을 따름 */
+const PREVIEW_ADDRESS = isEnabled('aws') ? (isEnabled('onprem') ? 'AWS 기본 주소 또는 이 PC의 로컬 주소' : 'AWS 기본 주소') : '이 PC의 로컬 주소'
 
 // 단계 순서. auto는 플랫폼이 DNS를 직접 넣으므로 사용자가 할 일이 없음
 const ORDER: Record<DomainMode, { state: DomainStatus['state']; label: string }[]> = {
@@ -27,7 +31,7 @@ export default function DomainProgress({ status, mode }: Props) {
       <div className="domain-progress">
         <div className="domain-head">
           <strong>도메인 미연결 · 미리보기</strong>
-          <span className="muted small">{status.message ?? '독립 도메인 없이 미리보기 주소(AWS 기본 주소)로 접속합니다. 도메인 연결 완료가 아닙니다.'}</span>
+          <span className="muted small">{status.message ?? `독립 도메인 없이 미리보기 주소(${PREVIEW_ADDRESS})로 접속합니다. 도메인 연결 완료가 아닙니다.`}</span>
         </div>
       </div>
     )

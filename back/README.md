@@ -20,7 +20,7 @@
 
 ### 로컬 Docker 개발 환경
 
-Docker Compose는 개발 PC에서 백엔드 API와 MySQL을 실행하는 용도입니다. 제품 배포 대상은 AWS 클라우드이며 온프레미스 배포는 지원하지 않습니다. API는 개발 PC의 `127.0.0.1:8000`에만 공개하고, MySQL, 업로드 소스 ZIP, Terraform plan artifact는 named volume에 보존합니다.
+Docker Compose는 개발 PC에서 백엔드 API와 MySQL을 실행하는 용도입니다. 제품 배포 대상은 AWS 클라우드입니다. 백엔드는 발표자 PC의 Docker로 올리는 시연용 선택 대상 `local_docker`의 계획·승인·대기열도 저장하지만(worker를 `--targets local_docker`로 켠 경우에만 실행되며 팀 결정이 아닌 선택 기능이다. `infra/worker/README.md`, `docs/OPEN_QUESTIONS.md`), 원격 서버(SSH)·사용자 서버 연결 같은 일반 온프레미스 배포는 지원하지 않습니다. API는 개발 PC의 `127.0.0.1:8000`에만 공개하고, MySQL, 업로드 소스 ZIP, Terraform plan artifact는 named volume에 보존합니다.
 
 ```powershell
 docker compose up -d --build db

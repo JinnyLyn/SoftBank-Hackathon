@@ -17,6 +17,8 @@ variable "platform" {
     health_check_grace_seconds = optional(number, 90)
     # 교체되는 태스크가 처리 중인 요청을 끝내도록 기다리는 시간(초)
     deregistration_delay_seconds = optional(number, 30)
+    # 앱에 비밀로 주입할 SSM 파라미터 {환경 변수 이름 = ARN}. deploy.sh up --secret 이 채운다. 플랫폼이 정하는 값이다(LLM 입력 아님)
+    secret_parameter_arns = optional(map(string), {})
     foundation = object({
       alb_arn      = string
       alb_dns_name = string

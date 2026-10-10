@@ -65,7 +65,7 @@ python3 scripts/ci/check_pr_report.py --body-file /path/to/pr-body.md
 | `CI coverage` | 항상 | 파일 계약·검사 판정·실패 진단의 회귀 테스트 | 플랫폼 동작 |
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
-| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
+| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, `node scripts/ci/test_platform_front.mjs`의 승인 파일 어댑터 회귀(HTTP 대역), TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
 | `Platform backend (API smoke and MySQL contracts)` | `back/` 구현 존재 | `.python-version`·requirements 기반 설치, 문법·DB 없는 smoke, 마스킹 회귀, 백엔드 Docker 빌드, 격리 MySQL 8.4 migration·재실행, 첫 실패 롤백 차단, 새 plan/diff 승인·claim, 오래된 승인·동시 등록 차단, 실제 API의 비밀 저장 거부·로그 마스킹 | 프런트 연동, LLM·AWS Terraform/ECS 실행, 업로드 앱 이미지 빌드 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
@@ -133,7 +133,7 @@ smoke 스크립트는 loopback의 임시 포트에서 실제 Uvicorn을 실행�
 bash scripts/ci/run_platform_stack.sh
 ```
 
-runner는 CI 전용 Compose 구성으로 임의 프로젝트·네트워크·볼륨을 만들고, 호스트 포트와 `.env`·AWS/LLM/기존 worker 키를 전달하지 않는다. API 기동 후 모든 migration을 두 차례 실행해 적용 이력을 확인하고 `test_platform_back_rollbacks.py`, `test_platform_back_masking.py`를 컨테이너 안에서 실행한다. 성공·실패 시 생성한 프로젝트만 `down --volumes`로 정리한다. 각 단계에 timeout을 두며 원문 서비스 로그는 출력하지 않는다.
+runner는 CI 전용 Compose 구성으로 임의 프로젝트·네트워크·볼륨을 만들고, 호스트 포트와 `.env`·AWS/LLM/기존 worker 키를 전달하지 않는다. API 기동 후 모든 migration을 두 차례 실행해 적용 이력을 확인하고 `test_platform_back_rollbacks.py`, `test_platform_back_masking.py`, `test_platform_back_local_docker.py`(발표자 PC 로컬 Docker 대상의 계획·승인·claim 계약. Docker·AWS는 실행하지 않는다)를 컨테이너 안에서 실행한다. 성공·실패 시 생성한 프로젝트만 `down --volumes`로 정리한다. 각 단계에 timeout을 두며 원문 서비스 로그는 출력하지 않는다.
 
 이 검사는 실제 DB·HTTP를 사용한다. 업로드하는 plan 바이트와 worker 상태 보고는 합성 테스트 데이터이며 실제 Terraform plan/apply·AWS rollback 성공을 의미하지 않는다. [Issue #16](https://github.com/JinnyLyn/SoftBank-Hackathon/issues/16) 이전에는 롤백 검사 파일만 있었고 workflow에서 호출하지 않았으며, 이 runner 연결부터 DB 검증 범위가 추가된다.
 

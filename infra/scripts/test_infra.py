@@ -234,6 +234,28 @@ def part_a(d):
                 lambda p: p.update(database_url_parameter_arn=FAKE_FOUNDATION["database_url_parameter_arn"]), why="database_url_parameter_arn")
     case_module(d, "정상: 이 배포의 앱 전용 DB 접속 정보 ARN", "통과",
                 lambda p: p.update(database_url_parameter_arn="arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/database-url"))
+    # 비밀 주입(secret_parameter_arns): 이 배포의 /apps/<id>/secrets/<이름> 파라미터만, 이름은 환경 변수 규칙, DATABASE_URL·environment와 겹치지 않게
+    sec_ok = {"WORKER_API_TOKEN": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/WORKER_API_TOKEN"}
+    case_module(d, "정상: 이 배포의 비밀 파라미터 ARN", "통과", lambda p: p.update(secret_parameter_arns=sec_ok))
+    case_module(d, "정상: 비밀 파라미터 없음(기본 {})", "통과", lambda p: p.update(secret_parameter_arns={}))
+    case_module(d, "다른 앱의 비밀 파라미터 ARN", "차단",
+                lambda p: p.update(secret_parameter_arns={"WORKER_API_TOKEN": sec_ok["WORKER_API_TOKEN"].replace("abcd1234", "other123")}),
+                why="secret_parameter_arns")
+    case_module(d, "비밀 파라미터 ARN의 끝 이름이 환경 변수 이름과 다름", "차단",
+                lambda p: p.update(secret_parameter_arns={"OTHER_NAME": sec_ok["WORKER_API_TOKEN"]}), why="secret_parameter_arns")
+    case_module(d, "비밀 파라미터가 앱 전용 DB 접속 정보를 가리킴", "차단",
+                lambda p: p.update(secret_parameter_arns={"WORKER_API_TOKEN": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/database-url"}),
+                why="secret_parameter_arns")
+    case_module(d, "비밀 이름이 DATABASE_URL", "차단", lambda p: p.update(secret_parameter_arns={
+        "DATABASE_URL": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/DATABASE_URL"}), why="DATABASE_URL")
+    case_module(d, "비밀 이름이 소문자", "차단", lambda p: p.update(secret_parameter_arns={
+        "lower": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/lower"}), why="secret_parameter_arns")
+    case_module(d, "비밀 파라미터 값이 ARN 형식이 아님", "차단", lambda p: p.update(secret_parameter_arns={"WORKER_API_TOKEN": "not-an-arn"}), why="secret_parameter_arns")
+    case_module(d, "같은 이름이 environment와 비밀에 함께 있음", "차단",
+                lambda p: p.update(secret_parameter_arns={"COOKIE_SECURE": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/COOKIE_SECURE"}),
+                why="environment")
+    case_module(d, "비밀 파라미터 11개", "차단", lambda p: p.update(secret_parameter_arns={
+        f"S{i}": f"arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/S{i}" for i in range(11)}), why="secret_parameter_arns")
     case_module(d, "deregistration_delay_seconds=301", "차단", lambda p: p.update(deregistration_delay_seconds=301), why="deregistration_delay_seconds")
     case_module(d, "정상: HTTPS + 인증서", "통과", lambda p: p["foundation"].update(listener_protocol="HTTPS", certificate_arn=FAKE_CERT))
 
@@ -289,6 +311,21 @@ def part_b(d):
         cd = json.loads(planned(plan, "module.app.aws_ecs_task_definition.app")[0]["container_definitions"])[0]
         sec = {s["name"]: s["valueFrom"] for s in cd.get("secrets", [])}
         is_("앱 전용 파라미터가 있으면 공유 파라미터 대신 쓴다", sec.get("DATABASE_URL") == app_arn, str(sec))
+    # 비밀 주입: secrets에만 들어가고(작업 정의의 평문 environment에 없다), 앱 전용 DB 접속 정보와 함께 들어간다
+    sec_arns = {"WORKER_API_TOKEN": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/WORKER_API_TOKEN",
+                "ANOTHER_KEY": "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/ANOTHER_KEY"}
+    plan, out = planned_with(pm=lambda p: p.update(secret_parameter_arns=sec_arns))
+    if plan:
+        cd = json.loads(planned(plan, "module.app.aws_ecs_task_definition.app")[0]["container_definitions"])[0]
+        sec = {s["name"]: s["valueFrom"] for s in cd.get("secrets", [])}
+        # 순서는 AWS provider가 이름순으로 정렬해 돌려주므로 보지 않는다. 이름과 ARN이 정확히 있어야 한다
+        is_("비밀 파라미터가 DATABASE_URL과 함께 secrets로 주입된다(이름·ARN 정확)",
+            sec == {"DATABASE_URL": FAKE_FOUNDATION["database_url_parameter_arn"], **sec_arns}, str(sec))
+        is_("비밀 이름은 평문 environment에 없다", all(e["name"] not in sec_arns for e in cd["environment"]), str(cd["environment"]))
+    plan, out = planned_with(pm=lambda p: p.update(secret_parameter_arns=sec_arns), am=lambda a: a.update(use_database=False))
+    if plan:
+        cd = json.loads(planned(plan, "module.app.aws_ecs_task_definition.app")[0]["container_definitions"])[0]
+        is_("DB를 안 써도 비밀 파라미터는 주입된다", [s["name"] for s in cd.get("secrets", [])] == ["ANOTHER_KEY", "WORKER_API_TOKEN"], str(cd.get("secrets")))
     plan, out = planned_with(am=lambda a: a.update(use_database=False))
     if plan:
         is_("DB를 안 쓰면 DB 보안 그룹 규칙이 없다", len(planned(plan, "module.app.aws_vpc_security_group_ingress_rule.db_from_task")) == 0)
@@ -468,6 +505,28 @@ def part_d():
     want = ["/paved-clouds/apps/abcd1234/database-url",
             "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/database-url", "app_abcd1234"]
     say("ok" if lines == want else "fail", "D 앱 전용 DB 이름·파라미터·ARN 규칙", "" if lines == want else f"{lines} {err[:80]}")
+
+    # up --secret: 비밀 파라미터 이름·ARN 규칙과 확인(없거나 SecureString이 아니면 멈춘다. 값은 읽지 않는다)
+    rc, out, err = sh('secret_param_name abcd1234 WORKER_API_TOKEN; secret_param_arn abcd1234 WORKER_API_TOKEN')
+    want = ["/paved-clouds/apps/abcd1234/secrets/WORKER_API_TOKEN",
+            "arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/WORKER_API_TOKEN"]
+    say("ok" if out.split() == want else "fail", "D 비밀 파라미터 이름·ARN 규칙(모듈 사전 조건·IAM /apps/* 과 같다)", "" if out.split() == want else f"{out.split()} {err[:80]}")
+    rc, out, err = sh('secret_arns_json abcd1234')
+    say("ok" if rc == 0 and json.loads(out) == {} else "fail", "D --secret이 없으면 빈 객체 {}", f"rc={rc} {out[:60]}")
+    rc, out, err = sh('aws() { echo "$*" >> "$AWS_LOG"; echo SecureString; }; secret_arns_json abcd1234 WORKER_API_TOKEN ANOTHER_KEY',
+                      {"AWS_LOG": (WORK / "secret_aws.log").as_posix()})
+    got = json.loads(out) if rc == 0 and out.strip() else None
+    ok = got == {"WORKER_API_TOKEN": want[1], "ANOTHER_KEY": want[1].replace("WORKER_API_TOKEN", "ANOTHER_KEY")}
+    say("ok" if ok else "fail", "D --secret 여러 개를 {이름: ARN} JSON으로 만든다", "" if ok else f"rc={rc} {out[:120]} {err[:80]}")
+    aws_log = (WORK / "secret_aws.log").read_text(encoding="utf-8") if (WORK / "secret_aws.log").exists() else ""
+    say("ok" if "--with-decryption" not in aws_log and "--query Parameter.Type" in aws_log else "fail",
+        "D 비밀 파라미터 확인은 값을 읽지 않는다(--with-decryption 없음, Type만 조회)", aws_log[:160])
+    for label, code in [("평문 String 파라미터", 'aws() { echo String; }; secret_arns_json abcd1234 WORKER_API_TOKEN'),
+                        ("파라미터 없음", 'aws() { return 255; }; secret_arns_json abcd1234 WORKER_API_TOKEN'),
+                        ("소문자 이름", 'aws() { echo SecureString; }; secret_arns_json abcd1234 lower'),
+                        ("DATABASE_URL", 'aws() { echo SecureString; }; secret_arns_json abcd1234 DATABASE_URL')]:
+        rc, out, err = sh(code)
+        say("ok" if rc != 0 else "fail", f"D --secret 거부: {label}", f"rc={rc} {out[:60]}")
 
     sample = ("connecting to mysql://paved_admin:Sup3rS3cretPw@host:3306/app\nAKIAABCDEFGHIJKLMNOP\npassword=hunter2 token: abc123\n"
               "PASSWORD=UpperPw1 Api-Key: UpperKey2 API_KEY=UpperKey3\n"

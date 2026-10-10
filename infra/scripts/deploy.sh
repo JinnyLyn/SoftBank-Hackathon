@@ -10,6 +10,7 @@
 #   deploy.sh detect-arch                  # 이 PC의 docker 기준 X86_64 또는 ARM64를 출력한다
 #   deploy.sh up       (--id a1b2c3d4 | --name "프로젝트 이름") --image <ecr_url>:a1b2c3d4-r1 --app app.json [--port 8001|auto] [--yes]
 #                      [--plan-only] [--shared-db] [--grace 초] [--skip-nat-check] [--arch ARM64]   # 아키텍처 기본값은 이 PC의 docker
+#                      [--secret 이름]...   # 환경 변수 <이름>을 SSM SecureString /<프로젝트>/apps/<id>/secrets/<이름> 에서 비밀로 주입(미리 만들어 둔다)
 #   deploy.sh update   a1b2c3d4 [--image <ecr_url>:tag] [--app app.json] [--yes] [--plan-only]
 #   deploy.sh rollback a1b2c3d4 --plan-only [--to <이미지>]   # 저수준 계획 생성. 제품 롤백은 아래 승인·연동 조건 필요
 #   deploy.sh apply    a1b2c3d4            # 위 명령을 --plan-only 로 만든, 승인된 저장 계획만 적용한다
@@ -366,6 +367,38 @@ db_param_name() {
 db_param_arn() {
   local arn; arn="$(fjson database_url_parameter_arn)"
   echo "${arn%%:parameter*}:parameter$(db_param_name "$1")"
+}
+
+# 앱에 비밀로 주입할 SSM 파라미터(운영자가 미리 만든 SecureString)의 이름과 ARN. 이름 규칙은 foundation의 IAM 정책(.../apps/*)과
+# 모듈의 사전 조건(/apps/<id>/secrets/<환경 변수 이름>)과 맞아야 한다
+secret_param_name() {  # secret_param_name <id> <NAME>
+  local base; base="$(fjson database_url_parameter_arn)"
+  base="${base#*:parameter}"     # /<프로젝트>/database-url
+  echo "${base%/database-url}/apps/$1/secrets/$2"
+}
+
+secret_param_arn() {  # secret_param_arn <id> <NAME>
+  local arn; arn="$(fjson database_url_parameter_arn)"
+  echo "${arn%%:parameter*}:parameter$(secret_param_name "$1" "$2")"
+}
+
+# up --secret 이름들을 확인하고 모듈에 넘길 JSON 객체({"이름": "ARN"})를 출력한다. 없으면 {}
+# 평문 파라미터를 비밀로 주입하지 않도록 SecureString인지 확인한다(값은 읽지 않고 --query로 Type만 본다)
+secret_arns_json() {  # secret_arns_json <id> [이름...]
+  local id="$1" n type pairs=()
+  shift
+  for n in "$@"; do
+    [[ "$n" =~ ^[A-Z_][A-Z0-9_]{0,63}$ ]] || die "--secret 이름은 대문자·숫자·밑줄(64자 이하)이어야 합니다: $n"
+    [ "$n" != "DATABASE_URL" ] || die "DATABASE_URL은 --secret으로 넘길 수 없습니다(앱 전용 DB는 use_database로 주입합니다)"
+    type="$(awsn ssm get-parameter --region "$(region)" --name "$(secret_param_name "$id" "$n")" --query 'Parameter.Type' --output text 2>/dev/null)" \
+      || die "SSM 파라미터가 없습니다: $(secret_param_name "$id" "$n") (SecureString으로 먼저 만드세요)"
+    [ "$type" = "SecureString" ] || die "SSM 파라미터가 SecureString이 아닙니다($type): $(secret_param_name "$id" "$n")"
+    pairs+=("$n=$(secret_param_arn "$id" "$n")")
+  done
+  "$(pick_python)" - "${pairs[@]+"${pairs[@]}"}" <<'PYEOF'
+import json, sys
+print(json.dumps(dict(a.split("=", 1) for a in sys.argv[1:])))
+PYEOF
 }
 
 # mysql 클라이언트 이미지를 foundation ECR에 한 번만 올린다
@@ -1138,7 +1171,7 @@ cmd_apply() {
 }
 
 cmd_up() {
-  local id="" name="" image="" port="auto" app="" grace="" shared_db=0
+  local id="" name="" image="" port="auto" app="" grace="" shared_db=0 secret_names=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
@@ -1148,6 +1181,7 @@ cmd_up() {
       --app) app="$2"; shift 2 ;;
       --arch) ARCH="$2"; shift 2 ;;
       --grace) grace="$2"; shift 2 ;;
+      --secret) secret_names+=("$2"); shift 2 ;;
       --shared-db) shared_db=1; shift ;;
       --skip-nat-check) SKIP_NAT_CHECK=1; shift ;;
       --yes) ASSUME_YES=1; shift ;;
@@ -1173,6 +1207,8 @@ cmd_up() {
   log "배포 $id 준비 (리전 $rgn)"
 
   export_foundation
+  # 비밀로 주입할 SSM 파라미터는 NAT 점검(최대 90초)보다 먼저 확인한다. 없거나 SecureString이 아니면 폴더를 만들기 전에 멈춘다
+  local secret_json; secret_json="$(secret_arns_json "$id" "${secret_names[@]+"${secret_names[@]}"}")" || exit 1
   nat_preflight
   # 계획만 만들 때는 이미지가 아직 없어도 된다(승인 뒤에 빌드·푸시한다). 적용 직전(apply_saved)에 반드시 확인한다
   [ "${PLAN_ONLY:-0}" = "1" ] || check_image_exists "$image"
@@ -1222,6 +1258,7 @@ cmd_up() {
   "listener_port": $port,
   "database_url_parameter_arn": "$param_arn",
   "health_check_grace_seconds": ${grace:-90},
+  "secret_parameter_arns": $secret_json,
   "foundation": $(cat "$FOUNDATION_JSON")
 }}
 EOF

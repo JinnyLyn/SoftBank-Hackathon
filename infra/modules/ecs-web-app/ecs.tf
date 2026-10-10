@@ -47,6 +47,18 @@ resource "aws_ecs_task_definition" "app" {
       condition     = var.database_url_parameter_arn == "" || endswith(var.database_url_parameter_arn, "/apps/${var.deploy_id}/database-url")
       error_message = "database_url_parameter_arn은 이 배포(${var.deploy_id})의 /apps/${var.deploy_id}/database-url 이어야 합니다. 다른 앱이나 관리자 접속 정보는 쓸 수 없습니다."
     }
+
+    # 비밀 파라미터도 같은 이유로 이 배포의 것이어야 한다(실행 역할이 /apps/ 아래 전체를 읽을 수 있어 AWS가 막아 주지 않는다)
+    precondition {
+      condition     = alltrue([for k, v in var.secret_parameter_arns : endswith(v, "/apps/${var.deploy_id}/secrets/${k}")])
+      error_message = "secret_parameter_arns의 각 값은 이 배포(${var.deploy_id})의 /apps/${var.deploy_id}/secrets/<환경 변수 이름> 이어야 합니다. 다른 앱의 파라미터는 쓸 수 없습니다."
+    }
+
+    # 같은 이름이 평문과 비밀에 함께 있으면 어느 쪽이 쓰일지 모호하다
+    precondition {
+      condition     = length(setintersection(toset(keys(var.secret_parameter_arns)), toset(keys(var.environment)))) == 0
+      error_message = "같은 이름을 environment와 secret_parameter_arns에 함께 넣을 수 없습니다."
+    }
   }
 }
 
