@@ -206,7 +206,20 @@ class UsageAndCacheTests(unittest.TestCase):
 
     def test_malformed_answers_are_not_cached(self):
         # PR #29 리뷰: 검증 전에 저장해 잘못된 답을 계속 재사용할 수 있었음
-        for bad in (None, {"answers": "x", "notes": []}, {"answers": [{"field": "container_port"}], "notes": []}):
+        good = answer("container_port", "5050", "config.py", 2)
+        note = {"level": "info", "title": "t", "detail": "d", "file": "config.py", "line": 2}
+        for bad in (
+            None,
+            {"answers": "x", "notes": []},
+            {"answers": [{"field": "container_port"}], "notes": []},
+            # PR #29 재리뷰: 키는 있지만 타입·enum 이 스키마와 다른 답
+            {"answers": [{**good, "line": "2"}], "notes": []},
+            {"answers": [{**good, "field": "password"}], "notes": []},
+            {"answers": [{k: v for k, v in good.items() if k != "reason"}], "notes": []},
+            {"answers": [good], "notes": [{**note, "level": "critical"}]},
+            {"answers": [good], "notes": [{k: v for k, v in note.items() if k != "file"}]},
+            {"answers": [good]},
+        ):
             with self.subTest(bad=bad):
                 self.fill(FakeClient(bad))  # None 이면 'not json'
                 retry = FakeClient({"answers": [], "notes": []})

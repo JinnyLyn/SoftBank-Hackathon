@@ -286,13 +286,29 @@ def _settings(client) -> str:
     return json.dumps(s, sort_keys=True)
 
 
+def _is_int(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def _well_formed(data: dict) -> bool:
-    """출력 스키마의 모양을 갖췄는지: answers·notes 가 목록이고 각 항목에 필수 필드가 있음"""
-    answers, notes = data.get("answers"), data.get("notes", [])
+    """OUTPUT_SCHEMA 를 그대로 지켰는지: 필수 필드·타입·enum, 정의 밖 필드 없음.
+    지키지 않은 답은 캐시하지 않아 다음 분석에서 다시 물음 (PR #29 리뷰: 키만 보고 "line": "2" 같은 답을 캐시했음)"""
+    if set(data) != {"answers", "notes"}:
+        return False
+    answers, notes = data["answers"], data["notes"]
     if not isinstance(answers, list) or not isinstance(notes, list):
         return False
-    need = ("field", "value", "file", "line")
-    return all(isinstance(a, dict) and all(k in a for k in need) for a in answers) and all(isinstance(n, dict) for n in notes)
+    for a in answers:
+        if not (isinstance(a, dict) and set(a) == {"field", "value", "file", "line", "reason"}
+                and a["field"] in FILLABLE and all(isinstance(a[k], str) for k in ("value", "file", "reason"))
+                and _is_int(a["line"])):
+            return False
+    for n in notes:
+        if not (isinstance(n, dict) and set(n) == {"level", "title", "detail", "file", "line"}
+                and n["level"] in ("info", "warn") and all(isinstance(n[k], str) for k in ("title", "detail", "file"))
+                and _is_int(n["line"])):
+            return False
+    return True
 
 
 def _ask(client, model: str, prompt: str):
