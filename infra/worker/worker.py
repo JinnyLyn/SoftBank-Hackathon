@@ -1079,7 +1079,7 @@ def execute_local_job(api, cfg, job):
                 log(f"deploying 보고 실패(배포는 이어갑니다): {e}")
 
         log(f"적용(로컬 Docker): {deploy_id}")
-        local_docker.apply(lc, deploy_id, rendered, host_port=params["host_port"], health_path=health, init_command=init,
+        local_docker.apply(lc, deploy_id, rendered, host_port=params["host_port"], health_path=health, bind=params["bind"], init_command=init,
                            use_database=params["use_database"], on_deploying=on_deploying)
         if not state["deploying"]:
             report(api, dep, "deploying", "apply_done", "컨테이너를 시작했습니다")

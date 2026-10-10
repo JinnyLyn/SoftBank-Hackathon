@@ -275,6 +275,32 @@ class ZipTests(unittest.TestCase):
         base = local_docker.extract_zip(z, self.tmp / "out")
         self.assertTrue((base / "Dockerfile").is_file())
 
+    def test_zip_permissions_restore_only_execute_bits(self):
+        modes = {"entrypoint.sh": 0o755, "owner-only.sh": 0o700, "privileged.sh": 0o7777, "data.txt": 0o666}
+        archive = self.tmp / "modes.zip"
+        with zipfile.ZipFile(archive, "w") as z:
+            for name, mode in modes.items():
+                info = zipfile.ZipInfo("repo/" + name)
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | mode) << 16
+                z.writestr(info, "#!/bin/sh\nexit 0\n")
+        baseline = self.tmp / "baseline"
+        baseline.write_text("x", encoding="utf-8")
+        base_mode = stat.S_IMODE(baseline.stat().st_mode)
+        real_chmod = os.chmod
+        with mock.patch.object(local_docker.os, "chmod", wraps=real_chmod) as chmod:
+            root = local_docker.extract_zip(archive, self.tmp / "out")
+        for name, mode in modes.items():
+            with self.subTest(name=name):
+                path = root / name
+                expected = base_mode | (mode & 0o111)
+                self.assertEqual(path.read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+                if mode & 0o111:
+                    chmod.assert_any_call(str(path), expected)
+                if os.name != "nt":  # Windows chmod는 POSIX 실행 비트를 보존하지 않는다
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected)
+        self.assertEqual(chmod.call_count, 3)
+
     def test_dangerous_archives_are_rejected(self):
         evil = {"parent": {"../evil.txt": "x"}, "absolute": {"/etc/x": "x"}, "drive": {"C:/x": "x"}, "backslash": {"a\\..\\..\\b": "x"}}
         for name, files in evil.items():
@@ -308,6 +334,15 @@ class ZipTests(unittest.TestCase):
         p.write_bytes(b"not a zip")
         with self.assertRaises(local_docker.LocalError):
             local_docker.extract_zip(p, self.tmp / "o")
+
+
+class HealthAddressTests(unittest.TestCase):
+    def test_probe_uses_bind_address_and_wildcard_uses_loopback(self):
+        for bind, host in (("127.0.0.1", "127.0.0.1"), ("127.0.0.2", "127.0.0.2"),
+                           ("192.168.1.10", "192.168.1.10"), ("0.0.0.0", "127.0.0.1")):
+            with self.subTest(bind=bind), mock.patch.object(local_docker, "probe", return_value=200) as probe:
+                local_docker.wait_healthy(local_docker.LocalConfig(bind=bind), "ab12cd34", 18123, "/health")
+                probe.assert_called_once_with(f"http://{host}:18123/health")
 
 
 class DockerBase(unittest.TestCase):
@@ -773,6 +808,22 @@ class LocalExecutorTests(WorkerBase):
         self.assertLess(order.index("build"), order.index("up"))
         self.assertLess(order.index("up"), order.index("run"))
         self.assertTrue(json.loads((self.tmp / "build.json").read_text(encoding="utf-8"))["dockerfile_exists"])
+
+    def test_health_uses_approved_bind_and_report_uses_approved_public_host(self):
+        job = self.job()
+        variables = job["variables"]
+        variables["local"].update(bind="127.0.0.2", public_host="demo.local")
+        variables["compose_yaml"] = local_docker.render_compose(local_docker.params_from_variables(variables))
+        job["terraform_plan_sha256"] = local_docker.compose_digest(variables["compose_yaml"])
+        self.cfg.local.bind = "192.168.1.10"  # 승인 뒤 실행기 설정이 바뀌어도 승인값을 쓴다
+        self.cfg.local.public_host = "changed.local"
+        with mock.patch.object(local_docker, "probe", return_value=200) as probe:
+            worker.execute_job(self.api, self.cfg, job)
+        probe.assert_called_once_with(f"http://127.0.0.2:{self.health.port}/health")
+        self.assertEqual(self.statuses(), [("deploying", "apply_done"), ("healthy", "healthy")])
+        self.assertEqual(self.events()[-1]["url"], f"http://demo.local:{self.health.port}")
+        compose = (self.cfg.local.root / variables["deploy_id"] / "docker-compose.yml").read_text(encoding="utf-8")
+        self.assertIn(f'"127.0.0.2:{self.health.port}:8000"', compose)
 
     def test_downloaded_source_is_used_and_its_temp_dir_removed(self):
         self.backend.sources[test_worker.PROJECT["id"]] = self.zip.read_bytes()
