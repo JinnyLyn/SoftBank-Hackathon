@@ -14,6 +14,7 @@
 | wisetg | `wisetg` |
 
 - 자기 개인 브랜치를 계속 사용한다. 기능별 브랜치를 추가로 만들거나 다른 팀원 브랜치에 직접 커밋·푸시하지 않는다.
+- 리뷰 담당 JinnyLyn은 작은 수정에 한해 GitHub 웹에서 팀원 PR을 편집한 뒤 최종 변경을 검토·승인할 수 있다. 로컬 훅의 타인 브랜치 제한은 유지하며 별도 브랜치 전환·훅 우회 절차를 요구하지 않는다. 서버 규칙의 현재 값은 `docs/GITHUB_SETUP.md`를 따른다.
 - `main`은 통합 기준이다. 직접 커밋·푸시하지 않고 PR로 합친다.
 - PR 기본 리뷰·머지 담당은 `JinnyLyn`이다. 다른 팀원 PR은 JinnyLyn의 승인을 받는다.
 - **JinnyLyn 본인 PR은 팀원 승인 없이 직접 머지할 수 있다.** PR을 만들고 검증 결과·diff를 확인한 뒤 PR 화면의 우회를 사용한다. main 직접 커밋·푸시는 여전히 금지다.
@@ -88,13 +89,14 @@ PR 승인·머지는 제품의 실제 AWS 배포 승인이 아니다. 실제 배
 | 설치 상태 | `python scripts/setup_git.py --check` | 개인 브랜치·훅 설치 버전 |
 | 샘플 백엔드 (PR #4 통합 후) | `bash scripts/ci/run_sample_stack.sh` | 실제 Docker·MySQL·API·화면, DB 중지 감지, CI 전용 볼륨 정리 |
 | 플랫폼 프런트 (PR #7 통합 후) | `npm ci --prefix front`와 `npm run build --prefix front` | 타입·빌드. CI는 MOCK/실제 API 설정을 각각 빌드하며 실제 연동 성공으로 보지 않음 |
-| 플랫폼 백엔드 | 아직 골격뿐. 구현 시 CI 실행·통합 계약도 추가 | 미구현을 전체 앱 성공으로 처리하지 않음 |
+| 플랫폼 백엔드 (PR #10) | manifest의 Python으로 `python -m pip install -r back/requirements.txt`, `python -m pip check`, `python -m compileall -q back/app`, `python scripts/ci/test_platform_back.py` | 앱 기동·OpenAPI·DB 미설정 오류·인증·입력 검증. 실제 DB·프런트·LLM·배포는 미검증 |
 | Terraform (PR #6 통합 후) | `docs/CI.md`의 fmt·backend 비활성 init·validate·셸 문법 명령 | 실제 AWS plan/apply와 전체 회귀 suite는 별도 증빙 |
 
 - CI에 없는 검사를 통과했다고 쓰지 않는다. 미실행 항목은 이유를 적는다.
 - `Application CI`는 main 대상 PR과 main push에 실행된다. 마지막 `Available app checks`의 요약에서 실제 검사 범위와 통합 미완료 항목을 확인한다. 녹색 결과를 전체 플랫폼·AWS 배포 성공으로 표현하지 않는다.
 - API·DB 연결은 mock 자동 대체가 발생하지 않았는지 확인한다.
 - 공유 계약을 바꾸면 호출하는 파트도 확인하고 문서를 같은 PR에서 갱신한다.
+- 초기 단계에는 자기 파트의 실행·테스트 계약부터 유지한다. 아직 없는 다른 파트의 전체 통합을 개별 PR의 전제조건으로 삼지 않는다. 기능 담당자는 동작 테스트를, CI 담당자는 실행 환경과 공통 판정을 맡으며, 파트 연결 시 관련 담당자가 통합 검사를 추가한다.
 - 비밀값·plan·state·업로드 원본을 PR에 첨부하지 않는다. 재현 절차와 마스킹된 결과를 남긴다.
 
 ## 6. 브랜치 보호가 맡는 일
