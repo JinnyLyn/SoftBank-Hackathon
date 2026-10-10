@@ -197,12 +197,17 @@ def part_a(d):
     case_module(d, "정상: 이미지 다이제스트", "통과", lambda p: p.update(image=ECR + "@sha256:" + "a" * 64))
     case_module(d, "정상: 오토스케일링 min1~max3", "통과", am=lambda a: a.update(max_tasks=3))
     case_module(d, "정상: 헬스체크 유예 30초", "통과", lambda p: p.update(health_check_grace_seconds=30))
+    # 비용 상한은 코드에 박지 않고 사용자가 정한 월 예산이 정한다(비용 계산 코드가 판정). 태스크 수·크기 상한이 없어야 한다
+    for size in ["large", "xlarge"]:
+        case_module(d, f"정상: task_size={size}", "통과", am=lambda a, size=size: a.update(task_size=size))
+    case_module(d, "정상: 상한 없음 min3~max3", "통과", am=lambda a: a.update(min_tasks=3, max_tasks=3))
+    case_module(d, "정상: 상한 없음 min2~max14", "통과", am=lambda a: a.update(min_tasks=2, max_tasks=14))
     for n, k, v in [("container_port=0", "container_port", 0), ("container_port=70000", "container_port", 70000),
                     ("container_port=80.5", "container_port", 80.5), ("health_check_path='health'", "health_check_path", "health"),
-                    ("health_check_path='/a b'", "health_check_path", "/a b"), ("task_size='large'", "task_size", "large")]:
+                    ("health_check_path='/a b'", "health_check_path", "/a b"), ("task_size='huge'", "task_size", "huge"),
+                    ("min_tasks=0", "min_tasks", 0), ("max_tasks=0", "max_tasks", 0), ("min_tasks=1.5", "min_tasks", 1.5),
+                    ("max_tasks=2.5", "max_tasks", 2.5)]:
         case_module(d, n, "차단", am=lambda a, k=k, v=v: a.update({k: v}), why=k)
-    case_module(d, "min_tasks=3", "차단", am=lambda a: a.update(min_tasks=3, max_tasks=3))
-    case_module(d, "max_tasks=5", "차단", am=lambda a: a.update(max_tasks=5))
     case_module(d, "min_tasks=2,max_tasks=1", "차단", am=lambda a: a.update(min_tasks=2, max_tasks=1))
     for k in ["DATABASE_URL", "DB_PASSWORD", "API_KEY", "lower"]:
         case_module(d, f"environment에 {k}", "차단", am=lambda a, k=k: a["environment"].update({k: "x"}))
@@ -342,6 +347,9 @@ def part_c(d, with_aws):
     inv("db_backup_retention_days=0", R, "-var=db_backup_retention_days=0")
     inv("db_backup_retention_days=36", R, "-var=db_backup_retention_days=36")
     inv("ecr_keep_images=5", R, "-var=ecr_keep_images=5")
+    inv("budget_monthly_usd=-1", R, "-var=budget_monthly_usd=-1")
+    inv("budget_alert_emails 형식 오류", R, '-var=budget_alert_emails=["nope"]')
+    inv("budget_alert_emails 11개", R, "-var=budget_alert_emails=[" + ",".join(f'"a{i}@example.com"' for i in range(11)) + "]")
 
     if not with_aws:
         print("\n=== C. foundation 계획 내용 === (AWS 자격증명이 없거나 --skip-aws라서 건너뜀)")
@@ -384,6 +392,20 @@ def part_c(d, with_aws):
     is_("기본: ECR 보관 정책은 앱 이미지 200개, tools- 이미지는 별도 규칙(우선순위가 더 앞)",
         r1.get("tagPrefixList") == ["tools-"] and pol["rules"][0]["rulePriority"] < pol["rules"][1]["rulePriority"]
         and r2["countNumber"] == 200 and r2["tagStatus"] == "any", str(pol)[:160])
+
+    # AWS Budgets 알림: 기본은 만들지 않고, 금액과 이메일을 둘 다 주면 알림 3개(80%·100% 실제, 100% 예측)를 만든다. 차단 장치가 아니라 알림이다
+    is_("기본: AWS Budgets 알림이 없다", n(base, "aws_budgets_budget.") == 0)
+    bud, out = pj("-var=enable_nat_instance=true", "-var=budget_monthly_usd=500", '-var=budget_alert_emails=["ops@example.com"]')
+    if bud is None:
+        say("env", "C 예산 알림 계획 만들기", out[:200].replace("\n", " "))
+    else:
+        b = planned(bud, "aws_budgets_budget.monthly")
+        is_("예산 알림: 금액과 이메일을 주면 월 500 USD 예산 1개", len(b) == 1 and b[0]["limit_amount"] == "500.00" and b[0]["time_unit"] == "MONTHLY", str(b)[:160])
+        kinds = sorted((x["notification_type"], x["threshold"]) for x in b[0]["notification"]) if b else []
+        is_("예산 알림: 실제 80%·100%, 예측 100% 세 건", kinds == [("ACTUAL", 80), ("ACTUAL", 100), ("FORECASTED", 100)], str(kinds))
+    only_amount, out = pj("-var=enable_nat_instance=true", "-var=budget_monthly_usd=500")
+    if only_amount is not None:
+        is_("예산 알림: 이메일 없이 금액만 주면 만들지 않는다", n(only_amount, "aws_budgets_budget.") == 0)
 
     ha, out = pj("-var=enable_nat_instance=true", "-var=nat_high_availability=false")
     if ha:
