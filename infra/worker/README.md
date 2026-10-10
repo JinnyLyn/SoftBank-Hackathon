@@ -34,9 +34,33 @@ python infra/worker/worker.py --once             # 한 번만 점검
 | `DEPLOY_SH` / `--deploy-sh` | `infra/scripts/deploy.sh` |
 | `TARGET_ARCH` / `--arch` | 이 PC의 docker 기준(`deploy.sh detect-arch`) |
 | `BASH_EXE` | Windows에서 Git Bash를 못 찾을 때 경로 지정 |
+| `MAX_SOURCE_BYTES` | `536870912`(512 MiB). API에서 내려받는 소스 ZIP의 크기 한도. 백엔드 업로드 한도(기본 200 MiB)보다 크게 둔다 |
 
 필요한 것: `bash`(Windows는 Git Bash), `terraform`, `aws` CLI, `docker`. foundation이 먼저 apply돼 있어야 한다.
-**worker는 백엔드와 같은 PC에서 돌린다.** 소스 ZIP 경로(`source_path`)와 Terraform 작업 폴더(`infra/deployments/`)가 그 PC에 있다.
+
+### 백엔드와 같은 PC일 필요는 없다 (소스 ZIP)
+
+소스 ZIP은 두 방식 중 쓸 수 있는 것으로 받는다. 어느 쪽이든 **승인된 계획의 `source_sha256`과 같을 때만** 빌드한다.
+
+| 방식 | 언제 | 동작 |
+|---|---|---|
+| 호스트 경로 | 백엔드와 worker가 같은 PC(개발 모드). claim의 `source_path`가 이 PC에 있고 SHA-256이 같다 | 그 파일을 그대로 쓴다(내려받지 않는다) |
+| API 다운로드 | 백엔드가 다른 호스트나 S3를 쓴다(서버 모드). `source_path`가 `null`이거나 이 PC에 없다 | claim의 `source_download_path`(`GET /api/worker/projects/{id}/source`)로 받아 임시 폴더에 두고, 빌드 뒤 **항상 지운다** |
+
+다운로드 규칙(백엔드가 약속한 계약은 [back/API.md](../../back/API.md)):
+- 경로는 **이 작업의 프로젝트 소스 경로와 정확히 같을 때만** 쓴다. 다른 프로젝트·절대 주소·`..`가 든 경로는 `invalid_job`으로 실패하고 요청하지 않는다.
+- `X-Worker-Token`은 `/api/worker/*` 경로에만 붙고, **리다이렉트는 따르지 않는다**(토큰이 다른 주소로 새지 않게).
+- 크기 한도(`MAX_SOURCE_BYTES`)와 전체 제한 시간(15분)이 있다. 제한 시간은 **재시도를 모두 합쳐 하나**다. 연결은 살아 있지만 아주 느리게 보내는 응답도 이 시간을 넘으면 중단한다(읽기를 데이터가 오는 대로 돌려주는 `read1`로 하고 매번 검사하므로, 초과는 한 번의 소켓 대기(30초) 이내다). 길이를 미리 알리지 않는 응답도 읽는 도중 한도를 넘으면 멈추고, `Content-Length`보다 짧게 끊긴 응답은 연결 오류로 본다.
+- 연결 실패·5xx·끊긴 응답은 최대 3번 시도한다. 4xx(401·404·409 등)와 크기 초과는 다시 시도해도 같아서 바로 실패한다.
+- 서버 모드에서는 `PLATFORM_API_URL`이 https여야 한다. https가 아닌 비루프백 주소면 시작할 때 경고한다(토큰과 소스가 평문으로 오간다).
+
+### 그래도 같은 PC에 남는 것
+
+- **Terraform 작업 폴더(`infra/deployments/<id>/`)는 worker의 로컬이다.** plan 파일, 입력 파일(`*.auto.tfvars.json`), state 설정, 이력이 그 안에 있고 `deploy.sh apply`는 그 폴더에서만 저장 plan을 적용한다. 그래서 **계획을 만든 worker가 같은 폴더로 승인된 작업을 실행해야 한다**(worker 하나, 폴더 유지). 폴더가 없어지면 `plan_mismatch`로 실패한다.
+- 백엔드가 제공하는 plan 다운로드(`GET /api/worker/plans/{id}/terraform-plan`)는 **쓰지 않는다.** plan 파일만 받아서는 입력·state 설정이 없어 적용할 수 없고, 로컬 plan은 이미 승인된 SHA-256과 대조하기 때문이다.
+- `terraform`, `docker`, AWS 자격 증명이 필요한 실행 환경은 그대로다. 이 worker를 서버(ECS 등)에서 돌리려면 그 환경이 따로 필요하다.
+
+백엔드의 `WORKER_ARTIFACT_DOWNLOADS_ENABLED=true`는 **이 worker 버전이 실제로 돌고 있다는 것을 확인한 뒤에** 켠다(백엔드는 worker 버전을 검증하지 않는다).
 
 ## planner: 계획 만들기
 
@@ -118,7 +142,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 `POST /api/worker/deployments/claim`으로 작업을 가져오면(백엔드가 `provisioning`으로 바꿔 둔다) 다음을 한다.
 
 1. 저장된 plan 파일의 SHA-256이 승인된 값(`terraform_plan_sha256`)과 같은지 확인한다. 다르면 **아무것도 하지 않고** `failed`로 보고한다.
-   이어서 **소스 ZIP의 SHA-256이 승인된 계획의 `source_sha256`과 같은지** 확인한다(plan 해시는 인프라 계획만 덮으므로, 승인 뒤에 소스가 바뀌면 검토하지 않은 코드가 배포된다). 다르거나 파일이 없으면 `source_mismatch`로 `failed` 보고하고 빌드하지 않는다.
+   이어서 **소스 ZIP의 SHA-256이 승인된 계획의 `source_sha256`과 같은지** 확인한다(plan 해시는 인프라 계획만 덮으므로, 승인 뒤에 소스가 바뀌면 검토하지 않은 코드가 배포된다). 소스는 같은 PC의 경로 또는 API 다운로드로 받는다(위 "백엔드와 같은 PC일 필요는 없다"). 지문이 다르거나 파일이 없으면 `source_mismatch`, 내려받지 못하면 `source_download_failed`, 다운로드 경로가 이 작업의 것이 아니면 `invalid_job`으로 `failed` 보고하고 빌드하지 않는다.
 2. `deploy.sh build`로 ZIP에서 이미지를 빌드해 ECR에 올린다(계획에 적힌 이미지 주소와 같아야 한다). **계획에 기록한 `cpu_architecture`를 `--arch`로 넘겨** 계획과 같은 아키텍처로 빌드한다.
 3. `deploy.sh apply`로 저장된 계획 그대로 적용한다. 헬스체크 대기에 들어가면 `deploying`을 보고한다.
 4. 성공하면 접속 주소와 함께 `healthy`, 실패하면 `deploy.sh diagnose` 결과와 로그 끝부분을 담아 `failed`로 보고한다.
@@ -156,7 +180,8 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 - 승인된 저장 plan만 적용한다. 승인 뒤에 새 plan을 만들어 적용하지 않는다.
 - 비밀(토큰, API 키, DB 비밀번호)은 로그와 이벤트에 남기지 않는다. 토큰은 환경 변수로만 받고 하위 프로세스(Terraform·Docker)에는 넘기지 않는다.
-- worker 전용 경로(`/api/worker/*`)에만 `X-Worker-Token`을 붙인다.
+- worker 전용 경로(`/api/worker/*`)에만 `X-Worker-Token`을 붙인다. 소스 다운로드는 리다이렉트를 따르지 않는다.
+- 내려받은 사용자 소스는 임시 폴더에만 두고 빌드가 끝나면(실패해도) 지운다.
 - LLM을 호출하지 않는다.
 
 ## 한계 (정직하게)
@@ -170,6 +195,6 @@ python infra/worker/worker.py --once             # 한 번만 점검
 ## 시험
 
 ```bash
-python infra/worker/test_worker.py      # 106개(약 2.5분). 실제 AWS·Docker 없이 돈다
+python infra/worker/test_worker.py      # 161개(약 3분). 실제 AWS·Docker 없이 돈다. Windows 한글 콘솔(cp949)이면 python -X utf8 로 돌린다
 python infra/scripts/test_infra.py      # deploy.sh와 Terraform 모듈 시험
 ```

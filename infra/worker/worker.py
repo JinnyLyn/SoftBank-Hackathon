@@ -14,6 +14,8 @@
 지키는 규칙(AGENTS.md)
   - 승인된 저장 plan만 적용한다. 적용 직전에 plan 파일의 SHA-256이 승인된 값과 같은지 확인한다.
   - Docker 빌드는 승인된 작업에서만 한다(planner는 이미지를 만들지 않는다).
+  - 소스 ZIP은 백엔드가 준 호스트 경로(같은 PC) 또는 API 다운로드(백엔드가 다른 호스트·S3를 쓸 때)로 받고,
+    어느 쪽이든 승인된 계획의 SHA-256과 같을 때만 빌드한다. 다운로드는 리다이렉트를 따르지 않고 크기·시간 한도를 둔다.
   - 비밀(API 키·토큰·DB 비밀번호)은 로그·이벤트에 남기지 않는다. WORKER_API_TOKEN은 환경 변수로만 받는다.
   - 실패는 자동 롤백하지 않고 그대로 보고한다(확정 정책). 원인은 diagnose 결과를 이벤트에 담는다.
     제품 롤백은 새 plan·diff의 사용자 승인이 필요하며, 이 worker의 롤백 연동은 아직 미구현이다(README 참조).
@@ -22,6 +24,7 @@
 """
 import argparse
 import hashlib
+import http.client
 import json
 import math
 import os
@@ -50,6 +53,9 @@ ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 SECRET_KEY_RE = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY)")
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+PROJECT_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+DOWNLOAD_RETRIES = 3        # 소스 내려받기 시도 횟수. 연결 실패·5xx·중간에 끊긴 응답만 다시 시도한다
+DOWNLOAD_CHUNK = 1 << 20    # 한 번에 읽는 바이트 수
 # 연결 확인 입력. back/app/schemas.py의 ConnectionRoleCallbackIn 규칙과 같다(external_id는 main.py의 pc-<hex 32자>). \Z로 끝의 개행을 거부한다
 AWS_ARN_NAME = r"[A-Za-z0-9+=,.@_-]+"
 ROLE_ARN_RE = re.compile(rf"^arn:(aws|aws-us-gov|aws-cn):iam::(\d{{12}}):role(?:/{AWS_ARN_NAME})+\Z")
@@ -116,6 +122,8 @@ class Config:
     plan_timeout: int = 900
     build_timeout: int = 1200
     apply_timeout: int = 1500
+    max_source_bytes: int = 512 * 1024 * 1024   # API에서 내려받는 소스 ZIP의 크기 한도(백엔드 업로드 한도 기본 200 MiB보다 넉넉히)
+    download_timeout: int = 900                 # 소스 ZIP 한 번을 내려받는 전체 제한 시간(초)
 
 
 def log(msg):
@@ -164,6 +172,56 @@ class Api:
 
     def post_bytes(self, path, data):
         return self._call("POST", path, raw=data)[1]
+
+    def download(self, path, dest, max_bytes, deadline):
+        """worker 전용 경로의 파일을 dest로 받아 (크기, SHA-256)을 돌려준다. 실패는 ApiError(상태 0은 연결 문제).
+
+        리다이렉트는 따르지 않는다(따라가면 X-Worker-Token이 다른 주소로 넘어갈 수 있다). 크기 한도와 전체 제한 시간을 두고,
+        Content-Length보다 짧게 끊긴 응답은 연결 오류로 본다(조용히 짧은 파일을 받지 않는다). 로컬 파일 쓰기 오류는 OSError 그대로 낸다."""
+        headers = {"Accept": "application/octet-stream"}
+        if path.startswith("/api/worker/"):
+            headers["X-Worker-Token"] = self.token   # worker 전용 경로에만 붙인다
+        req = urllib.request.Request(self.base + path, method="GET", headers=headers)
+        started = time.monotonic()
+        try:
+            resp = urllib.request.build_opener(_NoRedirect).open(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read().decode("utf-8", "replace")) from None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise ApiError(0, f"백엔드에 연결하지 못했습니다: {e}") from None
+        digest, size = hashlib.sha256(), 0
+        with resp, open(dest, "wb") as out:
+            length = resp.headers.get("Content-Length")
+            length = int(length) if length is not None and length.isdigit() else None
+            if length is not None and length > max_bytes:
+                raise ApiError(413, f"파일이 크기 한도({max_bytes}바이트)를 넘습니다")
+            while True:
+                # 읽기 전에 검사한다: 느리게 이어지는 응답은 소켓 무활동 제한에 걸리지 않으므로 전체 제한 시간은 여기서만 지킨다
+                if time.monotonic() - started > deadline:
+                    raise ApiError(0, f"내려받는 시간이 제한({deadline:g}초)을 넘었습니다")
+                try:
+                    # read(n)은 n바이트를 다 채울 때까지 막혀서 아주 느린 응답이 제한 시간을 무력화한다. read1은 데이터가 오는 대로 돌려주므로
+                    # 한 번의 대기가 소켓 무활동 제한(timeout)을 넘지 않고, 위 검사가 매번 돈다
+                    chunk = resp.read1(DOWNLOAD_CHUNK)
+                except (TimeoutError, OSError, http.client.HTTPException) as e:
+                    raise ApiError(0, f"내려받는 중 연결이 끊겼습니다: {type(e).__name__}") from None
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise ApiError(413, f"파일이 크기 한도({max_bytes}바이트)를 넘습니다")
+                digest.update(chunk)
+                out.write(chunk)
+        if length is not None and size != length:
+            raise ApiError(0, f"응답이 중간에 끊겼습니다({size}/{length}바이트)")
+        return size, digest.hexdigest()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """리다이렉트를 따르지 않는다. 3xx는 HTTPError가 되어 호출한 쪽에서 실패로 다룬다."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
 # --- 하위 프로세스 ---------------------------------------------------------------------------------
@@ -714,6 +772,60 @@ def fail_job(api, deployment_id, event_type, message, details=None):
     report(api, deployment_id, "failed", event_type, message, level="error", details=details)
 
 
+SOURCE_MISMATCH = ("source_mismatch",
+                   "승인된 계획의 소스(ZIP)와 지금 소스가 다릅니다(파일이 없거나 SHA-256이 다릅니다). 빌드하지 않았습니다")
+
+
+def fetch_source(api, cfg, job, expected):
+    """승인된 소스(ZIP)를 빌드할 수 있는 이 PC의 파일로 만든다. (경로, 임시 폴더, 오류)를 돌려준다.
+
+    오류는 (event_type, 메시지) 또는 None이고, 오류일 때 임시 폴더는 이미 지워져 있다. 임시 폴더가 있으면 호출한 쪽이 빌드 뒤에 지운다.
+      1) 백엔드가 준 호스트 경로(`source_path`)가 이 PC에 있고 승인된 SHA-256과 같으면 그 파일을 쓴다(백엔드와 같은 PC인 개발 모드).
+      2) 아니면 `source_download_path`로 API에서 내려받는다(백엔드가 다른 호스트나 S3를 쓰는 서버 모드). 받은 파일도 같은 SHA-256 검사를 거친다.
+    다운로드 경로는 이 작업의 프로젝트와 정확히 일치할 때만 쓴다(다른 프로젝트의 소스나 임의 주소를 받지 않게)."""
+    local = job.get("source_path")
+    if isinstance(local, str) and local and Path(local).is_file() and sha256_file(local) == expected:
+        return local, None, None
+    path = job.get("source_download_path")
+    if path is None:
+        return None, None, SOURCE_MISMATCH   # 호스트 경로도 다운로드 경로도 쓸 수 없다(옛 백엔드이거나 파일이 바뀌었다)
+    pid = job.get("project_id")
+    if not isinstance(pid, str) or not PROJECT_ID_RE.match(pid) or path != f"/api/worker/projects/{pid}/source":
+        return None, None, ("invalid_job", "작업의 source_download_path가 이 작업의 프로젝트 소스 경로와 다릅니다")
+    tmp = Path(tempfile.mkdtemp(prefix="paved-src-"))
+    dest = tmp / "source.zip"
+    ok = False
+    started = time.monotonic()
+    try:
+        for attempt in range(DOWNLOAD_RETRIES):
+            # 제한 시간은 재시도를 모두 합쳐서 하나다(시도마다 새로 주면 최악의 경우 시도 횟수만큼 늘어나 worker가 오래 멈춘다)
+            remaining = cfg.download_timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                return None, None, ("source_download_failed",
+                                    f"소스(ZIP)를 내려받는 시간이 제한({cfg.download_timeout}초)을 넘었습니다. 빌드하지 않았습니다")
+            try:
+                size, digest = api.download(path, dest, cfg.max_source_bytes, remaining)
+                break
+            except ApiError as e:
+                transient = e.status == 0 or e.status >= 500
+                if not transient or attempt == DOWNLOAD_RETRIES - 1:
+                    why = "연결 문제" if e.status == 0 else f"HTTP {e.status}"
+                    return None, None, ("source_download_failed",
+                                        f"소스(ZIP)를 백엔드에서 내려받지 못했습니다({why}): {redact(e.body)[:200]}. 빌드하지 않았습니다")
+                log(f"소스 내려받기 일시 오류({attempt + 1}/{DOWNLOAD_RETRIES}회), 다시 시도합니다: {redact(e.body)[:120]}")
+                time.sleep(REPORT_RETRY_DELAY)
+        if digest != expected:
+            return None, None, SOURCE_MISMATCH   # 받은 파일이 승인된 소스가 아니다
+        log(f"소스(ZIP)를 API에서 내려받았습니다: {size}바이트, SHA-256 일치")
+        ok = True
+        return str(dest), tmp, None
+    except OSError as e:
+        return None, None, ("source_download_failed", f"내려받은 소스를 이 PC에 저장하지 못했습니다({type(e).__name__}). 빌드하지 않았습니다")
+    finally:
+        if not ok:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def execute_job(api, cfg, job):
     """claim한 작업 하나를 실행한다. 어떤 경우에도 결과를 failed 또는 healthy 로 보고한다(처리 도중 멈춘 채 두지 않는다)."""
     dep = job["deployment_id"]
@@ -721,6 +833,7 @@ def execute_job(api, cfg, job):
     deploy_id = v.get("deploy_id", "")
     image = v.get("image", "")
     dockerfile = v.get("dockerfile", "Dockerfile")
+    src_tmp = None   # API에서 내려받은 소스의 임시 폴더. 어떤 경우에도 끝날 때 지운다(사용자 소스가 남지 않게)
     try:
         if not DEPLOY_ID_RE.match(deploy_id):
             return fail_job(api, dep, "invalid_job", f"작업의 deploy_id가 올바르지 않습니다: {deploy_id!r}")
@@ -735,12 +848,13 @@ def execute_job(api, cfg, job):
         # 승인한 소스와 지금 소스가 같은지 확인한다. plan 해시는 인프라 계획만 덮으므로, 승인 뒤에 소스 파일이 바뀌면
         # 사용자가 검토하지 않은 코드가 배포된다(AGENTS.md 4장: 승인 이후 내용이 바뀌면 승인을 폐기한다)
         src_expected = v.get("source_sha256", "")
-        src_path = job.get("source_path", "")
         job_sha = job.get("source_sha256")
-        if (not isinstance(src_expected, str) or not SHA256_RE.match(src_expected) or (job_sha and job_sha != src_expected)
-                or not src_path or not Path(src_path).is_file() or sha256_file(src_path) != src_expected):
-            return fail_job(api, dep, "source_mismatch",
-                            "승인된 계획의 소스(ZIP)와 지금 소스가 다릅니다(파일이 없거나 SHA-256이 다릅니다). 빌드하지 않았습니다")
+        if not isinstance(src_expected, str) or not SHA256_RE.match(src_expected) or (job_sha and job_sha != src_expected):
+            return fail_job(api, dep, *SOURCE_MISMATCH)
+        # 같은 PC의 파일이면 그대로, 아니면 API에서 내려받아 어느 쪽이든 승인된 SHA-256과 같을 때만 쓴다
+        src_path, src_tmp, err = fetch_source(api, cfg, job, src_expected)
+        if err:
+            return fail_job(api, dep, *err)
         arch = v.get("cpu_architecture")
         if arch not in ("X86_64", "ARM64"):
             return fail_job(api, dep, "invalid_job", f"작업의 cpu_architecture가 올바르지 않습니다: {arch!r}")
@@ -796,6 +910,9 @@ def execute_job(api, cfg, job):
             fail_job(api, dep, "worker_error", f"worker 오류: {type(e).__name__}: {redact(str(e))[:300]}")
         except ApiError as e2:
             log(f"백엔드 보고 실패: {e2}")
+    finally:
+        if src_tmp is not None:
+            shutil.rmtree(src_tmp, ignore_errors=True)
 
 
 # --- connector -------------------------------------------------------------------------------------
@@ -1032,6 +1149,13 @@ def tick(api, cfg, state, prices=None, arch="X86_64"):
     return bool(job)
 
 
+def warn_if_insecure(api_url):
+    """루프백이 아닌 주소에 https가 아니면 알린다. worker 토큰과 소스 ZIP이 암호화되지 않고 오간다(서버 모드는 https를 쓴다)."""
+    u = urllib.parse.urlsplit(api_url)
+    if u.scheme != "https" and (u.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+        log("경고: 백엔드 주소가 https가 아닙니다. worker 토큰과 소스(ZIP)가 암호화되지 않고 전송됩니다. 서버의 백엔드는 https 주소를 쓰세요")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--api-url", default=os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8000"))
@@ -1048,6 +1172,13 @@ def main(argv=None):
         return 2
     cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll,
                  quota_check=not a.skip_quota_check)
+    raw_max = os.environ.get("MAX_SOURCE_BYTES", "")
+    if raw_max:
+        if not raw_max.isdigit() or int(raw_max) < 1:
+            print("오류: MAX_SOURCE_BYTES는 1 이상의 정수(바이트)여야 합니다", file=sys.stderr)
+            return 2
+        cfg.max_source_bytes = int(raw_max)
+    warn_if_insecure(cfg.api_url)
     arch = a.arch
     if not arch:
         rc, out, _ = run_capture(deploy(cfg, "detect-arch"), 30, env=child_env(cfg))

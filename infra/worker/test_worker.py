@@ -44,6 +44,13 @@ case "$cmd" in
     mkdir -p "$FAKE_DEPLOYMENTS/$id"; echo "plan-bytes-$id" > "$FAKE_DEPLOYMENTS/$id/tfplan" ;;
   build)
     echo "빌드 로그" >&2
+    # 빌드가 실제로 받은 소스의 경로와 SHA-256(없으면 MISSING)을 남긴다. 내려받은 파일이 승인된 소스인지 시험이 확인한다
+    if [ -n "${FAKE_BUILD_SRC_LOG:-}" ]; then
+      src=""; while [ $# -gt 0 ]; do case "$1" in --source) src="$2"; shift 2;; *) shift;; esac; done
+      { echo "$src"
+        if [ -f "$src" ]; then (sha256sum "$src" 2>/dev/null || shasum -a 256 "$src") | cut -d' ' -f1; else echo MISSING; fi
+      } > "$FAKE_BUILD_SRC_LOG"
+    fi
     [ "${FAKE_BUILD_RC:-0}" = "0" ] || { echo "빌드 실패 password=hunter2" >&2; exit "$FAKE_BUILD_RC"; }
     echo "${FAKE_BUILD_IMAGE}" ;;
   apply)
@@ -117,6 +124,13 @@ class FakeBackend:
         self.conn_post_code = 200     # complete·fail 보고에 돌려줄 코드
         self.conn_post_failures = 0   # 앞으로 몇 번의 연결 보고를 503으로 거절할지
         self.order = []               # worker 경로 호출 순서: "claim", "event", "pending", "conn"
+        self.sources = {}             # project_id → 소스 ZIP 바이트(GET /api/worker/projects/{id}/source). 없으면 404
+        self.source_failures = []     # 앞으로의 소스 요청에 돌려줄 HTTP 코드(먼저 넣은 것부터). 비어 있으면 정상 응답
+        self.source_redirect = None   # 지정하면 소스 요청을 이 주소로 302 리다이렉트한다
+        self.source_truncate = 0      # 앞으로 몇 번의 소스 응답을 "Content-Length만큼 보내지 않고 연결을 닫는" 방식으로 처리할지
+        self.source_no_length = False   # True면 Content-Length 없이 보내고 연결을 닫아 끝을 알린다(길이를 미리 알 수 없는 응답)
+        self.source_trickle = 0         # 0보다 크면 소스를 한 바이트씩 이 간격(초)으로 보낸다(연결은 살아 있고 느리게 진행되는 응답)
+        self.source_gets = 0          # 소스 요청을 받은 횟수
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -160,6 +174,43 @@ class FakeBackend:
                 if p.endswith("/analyses/latest"):
                     a = outer.analyses.get(p.split("/")[3])
                     return self._send(200, a) if a else self._send(404, {"error": "분석 결과가 없습니다."})
+                m = re.match(r"^/api/worker/projects/([^/]+)/source$", p)
+                if m:
+                    outer.source_gets += 1
+                    if self.headers.get("X-Worker-Token") != TOKEN:
+                        return self._send(401, {"error": "인증 실패"})
+                    if outer.source_redirect:
+                        self.send_response(302)
+                        self.send_header("Location", outer.source_redirect)
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    if outer.source_failures:
+                        return self._send(outer.source_failures.pop(0), {"error": "일시 오류"})
+                    data = outer.sources.get(m.group(1))
+                    if data is None:
+                        return self._send(404, {"error": "소스를 찾을 수 없습니다."})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    if not outer.source_no_length:
+                        self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    if outer.source_truncate > 0:
+                        outer.source_truncate -= 1
+                        self.wfile.write(data[: len(data) // 2])
+                        self.close_connection = True   # 약속한 길이를 채우지 못하고 끊는다
+                        return
+                    if outer.source_trickle > 0:
+                        try:
+                            for i in range(len(data)):
+                                self.wfile.write(data[i:i + 1])
+                                self.wfile.flush()
+                                time.sleep(outer.source_trickle)
+                        except OSError:
+                            pass   # 받는 쪽이 먼저 끊었다
+                        return
+                    self.wfile.write(data)
+                    return
                 return self._send(404, {"error": "없음"})
 
             def do_POST(self):
@@ -231,7 +282,8 @@ class Base(unittest.TestCase):
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
         for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL",
-                  "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC"):
+                  "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC",
+                  "FAKE_BUILD_SRC_LOG"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
         os.environ["FAKE_HEARTBEAT"] = worker.posix(self.tmp / "heartbeat")
@@ -1180,6 +1232,197 @@ class ExecutorTests(Base):
                 self.assertEqual(self.statuses(), ["failed"])
                 self.assertEqual(self.backend.events[0][1]["event_type"], "source_mismatch")
         self.assertEqual(self.calls(), [])
+
+    # --- 소스(ZIP) 확보: 같은 PC의 경로 또는 API 다운로드(백엔드가 다른 호스트·S3를 쓰는 서버 모드) ---
+    DL_PATH = f"/api/worker/projects/{PROJECT['id']}/source"
+
+    def make_download_job(self, **kw):
+        """서버 모드의 작업: 호스트 경로는 없고(S3) 다운로드 경로만 있으며, 이 PC에는 소스 파일이 없다."""
+        job = self.make_job(**kw)
+        job["source_path"] = None
+        job["source_download_path"] = self.DL_PATH
+        (self.tmp / "src.zip").unlink()
+        self.backend.sources[PROJECT["id"]] = SRC_BYTES
+        return job
+
+    def isolate_tempdir(self):
+        """내려받은 소스의 임시 폴더가 남는지 보려고 시스템 임시 폴더를 이 시험 전용으로 바꾼다."""
+        d = self.tmp / "systmp"
+        d.mkdir(exist_ok=True)
+        p = mock.patch.object(tempfile, "tempdir", str(d))
+        p.start()
+        self.addCleanup(p.stop)
+        return d
+
+    def watch_build_source(self):
+        f = self.tmp / "build_src.txt"
+        os.environ["FAKE_BUILD_SRC_LOG"] = worker.posix(f)
+        return f
+
+    def assert_failed_before_build(self, event_type):
+        self.assertEqual(self.statuses(), ["failed"])
+        self.assertEqual(self.backend.events[0][1]["event_type"], event_type)
+        self.assertEqual(self.calls(), [])   # 빌드도 적용도 하지 않는다
+
+    def test_source_is_downloaded_with_token_and_verified_when_there_is_no_host_path(self):
+        tmpdir = self.isolate_tempdir()
+        seen = self.watch_build_source()
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+        src_path, src_sha = seen.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(src_sha, SRC_SHA)   # 빌드가 받은 파일은 승인된 소스와 같다
+        self.assertNotIn(str(self.tmp / "src.zip"), src_path)
+        gets = [h for h in self.backend.headers_seen if h[0].endswith("/source")]
+        self.assertEqual(gets, [(self.DL_PATH, TOKEN)])   # worker 전용 경로에 토큰이 붙는다
+        self.assertEqual(list(tmpdir.iterdir()), [])      # 내려받은 사용자 소스가 임시 폴더에 남지 않는다
+
+    def test_matching_host_path_is_used_without_downloading(self):
+        job = self.make_job()
+        job["source_download_path"] = self.DL_PATH
+        self.backend.sources[PROJECT["id"]] = SRC_BYTES
+        worker.execute_job(self.api, self.cfg, job)
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+        self.assertEqual(self.backend.source_gets, 0)
+
+    def test_host_path_that_is_not_on_this_pc_falls_back_to_download(self):
+        job = self.make_download_job()
+        job["source_path"] = "/srv/api-host/uploads/not-on-this-pc.zip"   # 백엔드 호스트의 경로. 이 PC에는 없다
+        worker.execute_job(self.api, self.cfg, job)
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+        self.assertEqual(self.backend.source_gets, 1)
+
+    def test_downloaded_source_with_wrong_digest_is_rejected_before_build(self):
+        tmpdir = self.isolate_tempdir()
+        job = self.make_download_job()
+        self.backend.sources[PROJECT["id"]] = b"someone replaced the zip after approval"
+        worker.execute_job(self.api, self.cfg, job)
+        self.assert_failed_before_build("source_mismatch")
+        self.assertEqual(list(tmpdir.iterdir()), [])
+
+    def test_download_http_error_fails_without_retry_when_it_cannot_get_better(self):
+        for code in (401, 403, 404, 409):
+            with self.subTest(code=code):
+                self.backend.events.clear()
+                self.backend.source_gets = 0
+                self.backend.source_failures = [code]
+                worker.execute_job(self.api, self.cfg, self.make_download_job())
+                self.assert_failed_before_build("source_download_failed")
+                self.assertEqual(self.backend.source_gets, 1)   # 4xx는 다시 시도해도 같다
+
+    def test_wrong_worker_token_is_not_retried(self):
+        job = self.make_download_job()
+        worker.execute_job(worker.Api(self.backend.url, "wrong-token", timeout=10), self.cfg, job)
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(self.backend.source_gets, 1)
+
+    def test_transient_server_errors_are_retried_then_succeed(self):
+        self.backend.source_failures = [503, 503]
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+        self.assertEqual(self.backend.source_gets, 3)
+
+    def test_persistent_server_errors_stop_after_the_retry_limit(self):
+        self.backend.source_failures = [503] * 10
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(self.backend.source_gets, worker.DOWNLOAD_RETRIES)
+
+    def test_truncated_response_is_retried_and_never_used(self):
+        tmpdir = self.isolate_tempdir()
+        seen = self.watch_build_source()
+        self.backend.source_truncate = 1   # 첫 응답은 약속한 길이보다 짧게 끊긴다
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+        self.assertEqual(self.backend.source_gets, 2)
+        self.assertEqual(seen.read_text(encoding="utf-8").splitlines()[1], SRC_SHA)
+        self.assertEqual(list(tmpdir.iterdir()), [])
+
+    def test_response_that_is_always_truncated_fails_cleanly(self):
+        tmpdir = self.isolate_tempdir()
+        self.backend.source_truncate = 99
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(self.backend.source_gets, worker.DOWNLOAD_RETRIES)
+        self.assertEqual(list(tmpdir.iterdir()), [])
+
+    def test_redirect_is_not_followed_so_the_token_cannot_leak(self):
+        other = FakeBackend()
+        self.addCleanup(other.close)
+        self.backend.source_redirect = other.url + "/steal"
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(other.headers_seen, [])   # 리다이렉트 대상에는 요청도 토큰도 가지 않았다
+
+    def test_oversized_source_is_rejected(self):
+        tmpdir = self.isolate_tempdir()
+        self.cfg.max_source_bytes = len(SRC_BYTES) - 1
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(self.backend.source_gets, 1)   # 크기 초과는 다시 시도해도 같다
+        self.assertEqual(list(tmpdir.iterdir()), [])
+
+    def test_oversized_source_without_content_length_is_stopped_while_reading(self):
+        # 길이를 미리 알리지 않는 응답은 헤더로 거를 수 없으니 읽는 도중 한도를 넘으면 멈춘다(Api.download 직접 호출)
+        dest = self.tmp / "dl.bin"
+        self.backend.source_no_length = True
+        self.backend.sources["p-big"] = b"x" * (3 << 20)
+        with self.assertRaises(worker.ApiError) as cm:
+            self.api.download("/api/worker/projects/p-big/source", dest, 1 << 20, 30)
+        self.assertEqual(cm.exception.status, 413)
+        self.assertLessEqual(dest.stat().st_size, 1 << 20)   # 한도를 넘는 만큼은 디스크에 쓰지 않았다
+
+    def test_slow_trickling_response_is_cut_off_at_the_deadline_and_not_retried_past_it(self):
+        # 연결은 살아 있고 느리게 진행되는 응답(소켓 무활동 시간 제한은 걸리지 않는다). 13바이트를 0.5초 간격으로 보내면 끝까지 받는 데 6.5초가 걸린다.
+        # 한 번의 읽기가 1 MiB를 채울 때까지 막히면 전체 제한 시간(1초)을 지키지 못한다(Codex 리뷰 P2). 재시도도 같은 제한 안에서만 한다
+        self.backend.source_trickle = 0.5
+        self.cfg.download_timeout = 1
+        started = time.monotonic()
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assertLess(time.monotonic() - started, 4.0)
+        self.assert_failed_before_build("source_download_failed")
+        self.assertEqual(self.backend.source_gets, 1)   # 제한 시간을 다 쓴 뒤에는 다시 시도하지 않는다
+
+    def test_api_download_enforces_its_deadline_on_a_slow_response(self):
+        self.backend.source_trickle = 0.5
+        self.backend.sources["p-slow"] = SRC_BYTES
+        started = time.monotonic()
+        with self.assertRaises(worker.ApiError) as cm:
+            self.api.download("/api/worker/projects/p-slow/source", self.tmp / "dl.bin", 1 << 20, 1)
+        self.assertEqual(cm.exception.status, 0)
+        self.assertLess(time.monotonic() - started, 4.0)
+
+    def test_source_without_content_length_is_accepted_when_within_the_limit(self):
+        self.backend.source_no_length = True
+        worker.execute_job(self.api, self.cfg, self.make_download_job())
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+
+    def test_download_path_must_be_exactly_this_jobs_project_source(self):
+        other_project = "22222222-2222-2222-2222-222222222222"
+        self.backend.sources[other_project] = SRC_BYTES
+        for bad in (f"/api/worker/projects/{other_project}/source", "http://evil.example/source",
+                    "/api/worker/projects/../../x/source", f"{self.DL_PATH}?x=1", 123, ""):
+            with self.subTest(bad=bad):
+                self.backend.events.clear()
+                job = self.make_download_job()
+                job["source_download_path"] = bad
+                worker.execute_job(self.api, self.cfg, job)
+                self.assert_failed_before_build("invalid_job")
+        self.assertEqual(self.backend.source_gets, 0)   # 어떤 주소로도 요청하지 않았다
+
+    def test_download_only_sends_the_token_to_worker_paths(self):
+        with self.assertRaises(worker.ApiError):
+            self.api.download("/api/projects/x/source", self.tmp / "dl.bin", 100, 5)
+        self.assertEqual(self.backend.headers_seen[-1], ("/api/projects/x/source", None))
+
+    def test_http_api_url_warns_unless_loopback(self):
+        with mock.patch.object(worker, "log") as log:
+            worker.warn_if_insecure("http://api.example.com")
+            self.assertEqual(log.call_count, 1)
+            self.assertIn("https", log.call_args[0][0])
+        for ok in ("http://127.0.0.1:8000", "http://localhost:8000", "https://api.example.com"):
+            with self.subTest(url=ok), mock.patch.object(worker, "log") as log:
+                worker.warn_if_insecure(ok)
+                log.assert_not_called()
 
     def test_planned_architecture_is_passed_to_build(self):
         worker.execute_job(self.api, self.cfg, self.make_job(arch="ARM64"))
