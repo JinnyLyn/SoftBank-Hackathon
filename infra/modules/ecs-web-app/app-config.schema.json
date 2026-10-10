@@ -46,6 +46,12 @@
         }
       },
       "additionalProperties": { "type": "string" }
+    },
+    "init_command": {
+      "description": "앱 이미지로 apply 뒤에 1회 실행할 초기화 명령(예: [\"python\", \"-m\", \"backend.app.initialize_database\"]). 여러 번 실행돼도 안전해야 한다(CREATE TABLE IF NOT EXISTS). Terraform 변수가 아니라 deploy.sh가 쓴다. 생략할 수 있다",
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "minLength": 1, "maxLength": 200 }
     }
   }
 }

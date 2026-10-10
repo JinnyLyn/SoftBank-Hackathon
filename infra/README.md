@@ -89,7 +89,8 @@ terraform -chdir=infra/foundation output -json deploy_inputs > infra/deployments
 | 변수 | 기본값 | 용도 |
 |---|---|---|
 | `certificate_arn` | 없음(HTTP만) | ACM 인증서. 지정하면 443 리스너, 80→443 리다이렉트, 배포별 리스너가 HTTPS가 된다. **실제 서비스는 반드시 지정한다** |
-| `enable_nat_instance` | `false` | `true`면 앱을 프라이빗 서브넷 + NAT 인스턴스로 실행한다 |
+| `enable_nat_instance` | `true` | `true`면 앱을 프라이빗 서브넷 + NAT 인스턴스로 실행한다 |
+| `enable_db_lambda` | `true` | 앱별 DB 준비·확인을 VPC 안의 Lambda로 한다(몇 초). `false`면 Lambda를 만들지 않고 Fargate 작업(약 70초 더)으로 대신한다 |
 | `nat_instance_type` | `t4g.small` | Graviton이어야 하고 small 이상만 허용한다(아래 NAT 참고) |
 | `nat_high_availability` | `true` | `false`면 NAT 1대로 전체가 쓴다(비용 절감, 그 AZ가 멈추면 외부 통신 전체가 끊긴다) |
 | `nat_ami_id` | 비움(최신 AMI) | NAT AMI를 고정한다 |
@@ -135,11 +136,14 @@ aws logs tail <log_group_name> --since 10m    # 실패 분석 LLM 입력
 
 ## 배포 스크립트
 
-위 "배포 1건" 절차를 `scripts/deploy.sh`로 묶었다. `bash`, `terraform`, `aws` CLI, `python`이 필요하고, 앱별 DB를 처음 만들 때는 `docker`가 한 번 필요하다. 리전은 `AWS_REGION`(없으면 `aws configure` 값)을 쓴다.
+위 "배포 1건" 절차를 `scripts/deploy.sh`로 묶었다. `bash`, `terraform`, `aws` CLI, `python`이 필요하고, `build`와 (Lambda가 없는 foundation에서) 앱별 DB 첫 생성에는 `docker`가 필요하다. 리전은 `AWS_REGION`(없으면 `aws configure` 값)을 쓴다.
 
 ```bash
 export AWS_REGION=sa-east-1
-bash infra/scripts/deploy.sh up       --id a1b2c3d4 --image <ecr_url>:a1b2c3d4-r1 --app app.json --plan-only   # 포트는 자동 할당
+bash infra/scripts/deploy.sh make-id  "프로젝트 이름"        # 이름(한글 포함)에서 배포 ID를 만든다. 같은 이름은 같은 ID
+bash infra/scripts/deploy.sh image-ref a1b2c3d4          # plan에 쓸 이미지 주소(ECR 주소:태그)를 미리 정한다
+bash infra/scripts/deploy.sh up       --id a1b2c3d4 --image <ecr_url>:a1b2c3d4-r1 --app app.json --plan-only   # 포트는 자동 할당. --id 대신 --name "프로젝트 이름" 도 된다
+bash infra/scripts/deploy.sh build    --id a1b2c3d4 --source app.zip --dockerfile Dockerfile --tag a1b2c3d4-r1 [--arch ARM64]   # 승인 뒤: 이미지 빌드·푸시
 bash infra/scripts/deploy.sh apply    a1b2c3d4     # 위에서 만든 승인된 저장 계획만 적용한다
 bash infra/scripts/deploy.sh update   a1b2c3d4 --image <ecr_url>:a1b2c3d4-r2 [--app app.json] --plan-only
 bash infra/scripts/deploy.sh rollback a1b2c3d4 --plan-only   # 직전 정상 이미지로 되돌린다
@@ -150,7 +154,7 @@ bash infra/scripts/deploy.sh destroy  a1b2c3d4     # 앱 삭제. 앱 전용 DB�
 bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 지운다(되돌릴 수 없다)
 ```
 
-`up` 옵션: `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch ARM64`, `--yes`, `--plan-only`.
+`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`. `build --arch`도 같은 값을 받아 계획과 같은 아키텍처로 빌드한다), `--yes`, `--plan-only`.
 
 - `app.json`은 `app.auto.tfvars.json`의 `app` 값만 담는다(예: `{"container_port": 8000, "health_check_path": "/health", "use_database": true, ...}`).
 - `--plan-only`는 계획을 `plan.json`으로 저장하고 멈춘다. 승인 후 `apply`가 **저장된 계획만** 실행한다. 승인 뒤에 새 계획을 만들지 않는다. `--plan-only` 없이 실행하면 계획을 보여 주고 `yes`를 입력받는다.
@@ -168,23 +172,34 @@ bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 
 - **입력 되돌리기**: `update`와 `rollback`은 시작할 때 입력 파일(`*.auto.tfvars.json`)을 마지막으로 `apply`한 값으로 되돌린 뒤 변경을 적용한다. `--plan-only`로 계획만 만들고 버린 변경(이미지, 앱 설정, 롤백 스냅샷, 앱 전용 DB 전환)이 다음 계획에 섞이지 않게 하려는 것이다. 새 `update`·`rollback`을 하면 앞서 저장한 계획(`tfplan`)은 버려진다. 한 번도 `apply`하지 않은 배포(`up --plan-only` 직후)는 그대로 둔다.
 - **계획과 입력의 일치**: 계획(`plan`)을 만들 때 입력 파일을 `plan.app.json`·`plan.platform.json`으로 고정한다. `apply`는 현재 입력이 이 고정본과 같을 때만 저장 계획을 적용하고, 다르면 적용하지 않고 계획을 다시 만들라고 안내한다. 정상 이력(`history/`)과 `applied.*`도 현재 입력 파일이 아니라 이 고정본으로 남기므로, 승인받은 계획과 다른 설정이 롤백 기준으로 저장되지 않는다. 새 계획을 만들기 시작하면 이전 계획과 고정본을 먼저 지우므로, 새 `plan`이 실패해도 입력과 어긋난 옛 계획이 남지 않는다. 이전 버전이 만든 계획(고정본 없음)은 적용하지 않고 다시 만들게 한다.
 - **foundation 값 갱신**: `update`와 `rollback`은 plan 전에 foundation 출력을 다시 읽어 입력의 `foundation` 값을 갱신한다. `up` 때 복사한 값을 계속 쓰면 foundation을 다시 apply한 뒤(HTTPS 추가, ALB·보안 그룹 재생성) 사라진 리소스를 가리킨다.
-- **이미지 확인**: `up`·`update`·`rollback`은 plan 전에 이미지가 ECR에 실제로 있는지 확인한다. 태그를 잘못 썼거나 롤백 대상이 보관 개수 제한으로 지워졌으면 태스크가 이미지를 받지 못해 서킷 브레이커까지 8분 넘게 기다리게 되므로, 그 전에 중단한다(롤백이면 `--to`로 다른 이미지를 지정).
+- **이미지 확인**: 이미지가 ECR에 실제로 있는지 확인한다. 태그를 잘못 썼거나 롤백 대상이 보관 개수 제한으로 지워졌으면 태스크가 이미지를 받지 못해 서킷 브레이커까지 8분 넘게 기다리게 되므로 그 전에 중단한다(롤백이면 `--to`로 다른 이미지를 지정). `update`·`rollback`은 `--plan-only` 여도 plan 전에 확인한다. **`up --plan-only`만 건너뛴다**(승인 뒤에 빌드하는 흐름이라 계획 단계에는 이미지가 아직 없다). 모든 `apply`는 **적용 직전에 반드시 다시 확인**한다.
 - **ID 검증과 폴더**: 모든 명령이 배포 ID 형식(소문자·숫자 4~8자)을 먼저 검사한다. `up`이 `apply` 시작 전에 실패하거나 취소되면 만들다 만 폴더를 지운다(`apply`가 시작된 뒤에는 state가 생길 수 있어 지우지 않는다). `destroy`가 끝난 폴더에는 `destroyed` 표식이 붙고, 같은 ID로 다시 `up`하면 `deployments/_destroyed/`로 옮겨진다. 앱 전용 DB를 `drop-db` 하지 않았다면 같은 ID로 다시 만들 때 그 DB를 다시 쓴다(접속 비밀번호는 새로 만든다).
 - `diagnose`는 ECS 배포 상태와 실패 사유, 대상 헬스 사유, 서비스 이벤트, 중단된 태스크 사유, 최근 로그를 JSON으로 낸다. 접속 URL의 계정·비밀번호, AWS 키, `password`·`token`·`secret` 값은 가린다. 정규식 기반이라 모든 형태의 비밀을 보장하지는 않는다.
 - **NAT 점검**: NAT를 쓰는 foundation이면 `up` 전에 NAT 인스턴스의 부팅 로그로 초기화 성공을 확인한다. 로그가 없으면 90초 기다린 뒤 실패로 본다(1시간 넘게 실행된 인스턴스는 로그가 밀려났을 수 있어 경고만 한다).
+
+### 소스에서 이미지 만들기와 앱 초기화
+
+- **`build`**: ZIP이나 폴더에서 이미지를 빌드해 foundation ECR에 올리고 이미지 주소를 표준 출력으로 낸다(진행 로그는 표준 오류). `--dockerfile`은 소스 안의 상대 경로이고 `..`·절대 경로는 거부한다. `--tag`를 주면 그 태그를 쓴다. `image-ref`로 정한 주소의 태그와 같게 쓰면 **계획(승인 전)과 빌드(승인 후)를 나눌 수 있다**. 빌드는 이 PC의 docker 아키텍처로 한다. ECR 로그인은 임시 docker 설정 폴더로 하고 종료·신호 때도 지운다. 호스트의 AWS 키와 docker 소켓은 빌드에 넘기지 않는다.
+- **ZIP 풀기**: 경로 이탈(`../`, 절대 경로), 심볼릭 링크, 암호 ZIP, 파일 20000개 초과, 풀린 총 크기 1 GiB 초과(`ZIP_MAX_BYTES`), 압축률 200배 초과 파일(압축 폭탄)을 거부한다. 풀리는 실제 바이트를 세므로 헤더가 거짓이어도 한도를 지킨다. 압축 안에 최상위 폴더가 하나뿐이면(GitHub 아카이브) 그 폴더를 기준으로 삼는다.
+- **앱 초기화 작업(`init_command`)**: 앱 설정(`app.json`)에 `"init_command": ["python", "-m", "backend.app.initialize_database"]`처럼 주면 `apply` 뒤에 앱 이미지로 **한 번** 실행한다(테이블 생성·마이그레이션). 앱과 같은 작업 정의에 명령만 바꿔 실행하므로 같은 이미지·DATABASE_URL·네트워크를 쓴다. 이 단계가 없으면 `/health`가 DB 연결만 확인하는 앱은 테이블이 없어도 헬스체크를 통과해서, 배포는 성공인데 가입·로그인이 500 오류인 상태가 된다(`sample-back`에서 확인).
+  - 명령은 **여러 번 실행돼도 안전해야 한다**(`CREATE TABLE IF NOT EXISTS`). 같은 이미지·같은 명령으로 직전에 성공했으면(`init.done` 지문) 다시 돌리지 않는다. 설정만 바꾸는 `update`나 같은 이미지 재배포에서 약 55초를 아끼고 비멱등 명령의 중복 실행을 막는다. 새 앱 전용 DB를 만들면 기록을 지운다.
+  - 실패하면 종료 코드·사유·로그를 보여 주고 헬스체크와 정상 이력 없이 실패로 기록한다. 제한 시간(`INIT_TIMEOUT`, 기본 300초)을 넘기면 작업을 멈추고(`stop-task`) 시간 초과로 실패 처리한다.
+  - `init_command`는 앱 코드와 같은 신뢰 수준(앱의 DB 계정, 앱의 작업 역할)으로 돈다.
 
 ### 앱별 DB
 
 기본으로 앱이 DB를 쓰면(`use_database: true`) 배포마다 **전용 DB `app_<id>`와 그 DB에만 권한이 있는 계정**을 만든다. 모든 앱이 DB 관리자 계정으로 같은 DB를 쓰면 앱 하나가 뚫렸을 때 다른 앱의 데이터까지 읽고 지울 수 있기 때문이다.
 
 - 계획 단계(`--plan-only`)에서는 접속 정보 ARN만 쓰고 아무것도 만들지 않는다. **승인 후 `apply`에서** SSM 파라미터(`/<프로젝트>/apps/<id>/database-url`)와 DB·계정을 만든다.
-- DB는 프라이빗 서브넷에 있어서 VPC 안에서 `mysql` 클라이언트를 한 번 실행하는 Fargate 작업으로 만든다. 그 클라이언트 이미지는 처음에 한 번 ECR에 올린다(`docker` 필요).
+- DB는 프라이빗 서브넷에 있어서 VPC 안에서 만든다. foundation에 **DB 준비 Lambda**(`enable_db_lambda`, 기본 켬)가 있으면 그것을 호출한다(`foundation/lambda/db_provisioner/`, 순수 파이썬 PyMySQL 포함). 실측으로 DB 격리 확인이 약 5초다. Lambda가 없으면(옛 foundation, `enable_db_lambda=false`) `mysql` 클라이언트를 한 번 실행하는 Fargate 작업으로 만든다(약 70초 더 걸리고, 클라이언트 이미지를 처음에 한 번 ECR에 올려야 해서 `docker`가 필요). `PAVED_DB_VIA_FARGATE=1`이면 Lambda가 있어도 Fargate 경로를 쓴다.
+  - Lambda는 SSM에서 관리자 비밀번호와 앱 접속 정보를 읽는다. NAT 인스턴스를 켠 구성은 NAT를 거치고, 끈 구성은 SSM VPC 엔드포인트(월 약 $8~9)를 함께 만든다. 이 Lambda 역할도 DB 작업용 실행 역할처럼 관리자 비밀번호를 읽을 수 있는 대상이다.
+  - 한계: Lambda의 DB 연결은 TLS로 암호화하지만 서버 인증서를 검증하지 않는다(순수 파이썬 패키징 때문에 `cryptography`를 넣지 않고 TLS를 택했다). RDS CA 번들을 함께 넣어 검증하는 것이 다음 개선이다.
 - `destroy`는 앱만 지우고 **앱 전용 DB와 접속 정보는 보존한다**(데이터 보호). 지우려면 `drop-db` 또는 `destroy --drop-db`.
 - `db-check`는 앱 전용 계정으로 접속해 자기 DB는 되고, 공유 DB(`app`)와 시스템 테이블은 막혀 있고, `SHOW DATABASES`에 다른 앱의 DB가 보이지 않는지 확인한다.
 - **권한 분리**: 앱 태스크가 쓰는 공유 실행 역할은 DB 관리자 비밀번호를 읽을 수 없다. 관리자 비밀번호는 앱별 DB를 만드는 1회성 작업의 전용 실행 역할(`<project>-db-provisioner-execution`)만 읽는다. 또 배포 모듈은 `database_url_parameter_arn`이 **이 배포의** `/apps/<id>/database-url`일 때만 통과시킨다(다른 앱이나 관리자 접속 정보를 가리키면 plan에서 막힌다). 한계: 앱들이 실행 역할 하나를 같이 쓰므로 IAM 수준에서 앱별로 격리된 것은 아니다. 격리는 모듈의 사전 조건과 DB 계정 권한이 맡는다(배포마다 역할을 만들면 IAM 전파 지연이 배포 시간을 늘리고 역할 수 할당량에 걸린다).
 - `--shared-db`를 주면 공유 DB를 관리자 계정으로 쓴다(이전 방식). 공유 DB의 테이블 충돌 문제가 그대로 있다. 이 선택은 배포에 기록되어(`db-shared`) 나중에 `update`가 몰래 앱 전용 DB로 바꾸지 않는다.
 - **DB 없이 만든 배포를 `update`로 `use_database: true`로 바꾸면** 앱 전용 DB로 전환한다(승인 후 `apply`에서 DB와 접속 정보를 만든다). 전환하지 않으면 모듈이 foundation의 공유 URL(DB 관리자 계정)로 대체해서, 앱 전용 DB가 기본이라는 약속과 달리 조용히 모든 DB에 대한 관리자 권한이 붙는다.
-- 테이블 생성 주체(앱이 시작할 때 만드는지, 별도 마이그레이션인지)는 아직 팀이 정하지 않았다(`docs/OPEN_QUESTIONS.md`). 앱 전용 DB는 빈 상태로 만들어지므로 지금은 앱이 스스로 만드는 방식(`sample-back`)과 맞는다.
+- 테이블 생성은 앱 설정의 `init_command`(위 "앱 초기화 작업")로 한다. `sample-back`은 앱 시작과 분리된 `initialize_database` 모듈이 있어 이 방식과 맞는다. 팀의 최종 결정은 아직이다(`docs/OPEN_QUESTIONS.md`).
 
 ### 원격 state
 
@@ -224,7 +239,7 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - **보안 그룹 소유권**: 앱 배포 모듈이 foundation이 만든 ALB 보안 그룹과 DB 보안 그룹에 앱별 규칙(ALB 아웃바운드, DB 3306 인바운드)을 추가·삭제한다. AGENTS.md 6장의 "앱 배포에서 foundation 리소스를 변경하지 않는다"와 부딪히는 지점이라 보안 그룹 소유권 합의가 필요하다(인프라 계약의 미결 항목). 앱 하나당 규칙은 보안 그룹별 1개이고 기본 할당량(60)이 포트 49개를 넘으므로 지금은 한도에 걸리지 않는다.
 - 대상 그룹의 등록 해제 지연은 30초(`deregistration_delay_seconds`)다. 교체되는 태스크가 처리 중인 요청을 끝낼 시간이고, 업로드처럼 오래 걸리는 요청이 있으면 늘린다(ALB 기본은 300초).
 - **RDS 보호**: 자동 백업 7일(기본), 삭제할 때 최종 스냅샷(기본), 삭제 보호(기본). 다중 AZ는 `db_multi_az`로 켠다. 교육용·무료 계정은 백업 보관 기간이나 다중 AZ를 제한할 수 있어서 그때는 변수로 낮춘다.
-- `enable_nat_instance = false`(기본)면 앱 태스크가 퍼블릭 서브넷에서 퍼블릭 IP로 실행된다. 앱 전용 보안 그룹이 ALB가 보내는 포트만 허용한다.
+- `enable_nat_instance = false`면 앱 태스크가 퍼블릭 서브넷에서 퍼블릭 IP로 실행된다(시험용, 기본은 true). 앱 전용 보안 그룹이 ALB가 보내는 포트만 허용한다.
 - `enable_nat_instance = true`면 NAT Gateway 대신 EC2 NAT 인스턴스(`nat_instance_type`, 기본 `t4g.small`, Amazon Linux 2023 arm64)와 Elastic IP를 만든다. 고가용성(기본)이면 AZ마다 1대씩이고 프라이빗 라우트 테이블도 AZ별로 나뉘어 AZ 하나가 멈춰도 다른 AZ의 외부 통신(ECR pull·로그 전송·SSM 조회)을 유지한다. `nat_high_availability=false`면 1대를 모두가 쓴다.
 - NAT 인스턴스는 메모리 512MB인 `t4g.nano`로는 부팅할 때 `dnf install iptables-services`가 메모리 부족으로 종료되어 NAT가 동작하지 않았다(상태 검사는 정상으로 나온다). 그래서 기본 타입이 `t4g.small`이고 nano·micro는 변수 검증이 막는다. 타입만 바꾸면 초기화 스크립트가 다시 실행되지 않으므로 인스턴스를 교체(`-replace`)해야 한다.
 - NAT AMI는 만든 뒤 바뀌어도 인스턴스를 교체하지 않는다(`ignore_changes = [ami]`). Amazon Linux 2023 최신 AMI 파라미터가 자주 갱신되는데(190번 넘게), 무시하지 않으면 `plan`이 NAT 교체를 제안하고 교체 중 외부 통신이 끊긴다. 최신 AMI로 바꿀 때는 `terraform apply -replace='aws_instance.nat[0]'`처럼 하나씩 교체한다. 재현 가능한 배포를 원하면 `nat_ami_id`로 고정한다.
@@ -239,14 +254,26 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - A. 배포 모듈 입력 검증: 잘못된 값이 Terraform 단계에서 막히는지, 정상 값이 통과하는지
 - B. 배포 모듈 계획 내용: 앱 전용 보안 그룹, 서킷 브레이커, HTTPS 리스너, 앱별 DB 접속 정보
 - C. foundation 변수 검증과 계획 내용(NAT 수, AZ 수, AMI 고정, HTTPS, RDS 옵션). 계획 내용은 AWS 조회가 필요하다
-- D. `deploy.sh` 함수: `deploy_id` 규칙, 앱 전용 DB 이름·ARN, 비밀 마스킹, DB 작업 정의(로그 그룹·ARN·이미지가 입력과 같은지, 평문 비밀번호가 없는지), state 설정, NAT 부팅 로그 판정
+- D. `deploy.sh` 함수: `deploy_id` 규칙, 앱 전용 DB 이름·ARN, 비밀 마스킹, DB 작업 정의(로그 그룹·ARN·이미지가 입력과 같은지, 평문 비밀번호가 없는지), state 설정, NAT 부팅 로그 판정, 계획·입력 고정과 적용 차단, 이름→배포 ID, 아키텍처 감지, 앱 초기화(건너뛰기·시간 초과·실패 처리), ZIP 풀기 한도, build 임시 폴더 정리, DB 작업의 Lambda/Fargate 선택, 이미지 확인 시점
 - E. 정적 검사: `terraform fmt`, `validate`, `bash -n`
 
 판정은 Terraform이 실제로 내는 메시지로만 한다. 시험 환경이 고장난 것(초기화 실패 등)은 "차단 성공"이 아니라 **"시험환경오류"로 따로 센다**. 이 구분이 없으면 환경 오류가 전부 성공으로 읽힌다. 시험이 실제 실행과 같은 조건(Git Bash의 `/c/...` 경로)에서 도는지도 중요해서, 아래 AWS 시험에서 이 차이로 놓친 버그가 둘 있었다(고쳐서 시험에 반영했다).
 
+### worker 시험
+
+`python infra/worker/test_worker.py`. 시험용 HTTP 서버(`back/API.md`를 흉내)와 가짜 `deploy.sh`로 돌며 실제 AWS·Docker는 쓰지 않는다. 자세한 내용은 [worker/README.md](worker/README.md).
+
 ### AWS 시험
 
 기준: 2026-10-09, 리전 `sa-east-1`(상파울루), HashiCorp Terraform 1.16.5, AWS provider 6.x, 로컬 Docker Desktop. 실제 적용은 담당자의 실행 요청 범위에서 했고, 매 `apply` 전에 계획을 확인했다.
+
+**2026-10-10 추가로 확인한 것**(같은 계정·리전, `sample-back`을 앱으로 사용, 백엔드는 가짜)
+
+- `build`로 ZIP에서 이미지를 빌드·푸시(약 20초, 캐시 사용). `up --plan-only`로 이미지가 없는 상태에서 계획을 만들고(약 25~35초) 승인 후 `apply`.
+- **앱 초기화 작업**으로 테이블이 만들어져 `/api/ideas`가 DB 집계를 정상 응답(초기화가 없으면 `/health`만 통과). 같은 앱을 NAT를 켠 foundation(프라이빗 서브넷)에서도 배포해 동작을 확인했다.
+- **시간**(RDS가 이미 있는 foundation에서 앱 1개): Fargate로 DB를 준비하던 때 `apply` 약 3분 6초(DB 준비 1분 41초, Terraform 19초, 초기화 56초, 헬스체크 6초). **Lambda로 DB를 준비하면 빌드 포함 124초**(빌드 20초 + 적용 104초). foundation 신규 생성(RDS 포함)은 약 7분(RDS 6분 17초). 초기화 작업(Fargate 기동)이 남은 시간의 가장 큰 덩어리다.
+- **실패**(헬스체크 경로 오류): 시작 후 2분 24초에 4xx로 실패를 확정하고 사유를 기록했다. 그 사이 ALB는 대상이 전부 비정상이면 요청을 모든 대상에 보내서(fail-open) 앱 접속은 유지됐고, ECS가 헬스체크 실패 태스크를 교체하는 것이 실제 영향이었다. **롤백**은 1분 21초에 정상 복구(초기화 작업 55초 포함. 이 초기화는 이후 지문 확인으로 건너뛴다).
+- DB 격리 확인(`db-check`)이 Lambda 경로에서 통과(자기 DB만 허용, 다른 DB와 시스템 테이블 거부, 다른 앱 DB가 보이지 않음).
 
 **확인한 것**
 

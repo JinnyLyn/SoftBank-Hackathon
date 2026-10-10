@@ -25,3 +25,7 @@ output "image" {
 output "task_security_group_id" {
   value = module.app.task_security_group_id
 }
+
+output "task_definition_arn" {
+  value = module.app.task_definition_arn
+}

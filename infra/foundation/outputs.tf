@@ -17,12 +17,14 @@ output "deploy_inputs" {
     db_host                           = aws_db_instance.this.address
     db_port                           = aws_db_instance.this.port
     db_provisioner_execution_role_arn = aws_iam_role.db_provisioner_execution.arn
+    db_provisioner_lambda_name        = try(aws_lambda_function.db_provisioner[0].function_name, "")
     db_provisioner_log_group          = aws_cloudwatch_log_group.db_provisioner.name
     db_provisioner_security_group     = aws_security_group.db_provisioner.id
     db_security_group_id              = aws_security_group.db.id
     ecr_repository_url                = aws_ecr_repository.apps.repository_url
     execution_role_arn                = aws_iam_role.task_execution.arn
     listener_protocol                 = local.https_enabled ? "HTTPS" : "HTTP"
+    nat_instance_count                = local.nat_count
     task_subnet_ids                   = local.task_subnet_ids
     vpc_id                            = aws_vpc.this.id
   }
