@@ -32,7 +32,7 @@ API 문서는 FastAPI가 제공하는 `http://127.0.0.1:8000/docs`와 `/openapi.
 
 ### 서버 실행 환경 (AWS)
 
-API 서버와 배포 worker가 서로 다른 컨테이너/호스트에서 실행될 때 로컬 파일 경로는 공유되지 않습니다. 서버 배포에서는 ZIP과 Terraform plan을 API가 비공개 S3 버킷에 저장하고, worker는 worker 인증이 적용된 API 다운로드 경로로 파일을 받아야 합니다. `ARTIFACT_S3_BUCKET`이 비어 있으면 기존 로컬 개발 저장 방식이 사용됩니다.
+API 서버와 배포 worker가 서로 다른 컨테이너/호스트에서 실행될 때 로컬 파일 경로는 공유되지 않습니다. 서버 배포에서는 ZIP과 Terraform plan을 API가 비공개 S3 버킷에 저장하고, worker는 worker 인증이 적용된 API 다운로드 경로로 파일을 받아야 합니다. `ARTIFACT_S3_BUCKET`이 비어 있으면 기존 로컬 개발 저장 방식이 사용됩니다. 버킷만 설정하고 worker 호환성 설정을 켜지 않으면 업로드와 배포 claim은 안전하게 503으로 거부되어, 기존 worker가 S3 URI를 로컬 경로로 오해하지 않습니다.
 
 서버 설정:
 
@@ -42,11 +42,12 @@ API 서버와 배포 worker가 서로 다른 컨테이너/호스트에서 실행
 - `ARTIFACT_S3_PREFIX`: 버킷 안의 전용 경로 접두사(기본값 `paved-clouds`).
 - `ARTIFACT_S3_SSE`: 서버 측 암호화 방식. 기본 `AES256`; KMS를 쓰면 `aws:kms`로 설정합니다.
 - `ARTIFACT_S3_KMS_KEY_ID`: 선택 항목. KMS 키를 지정하면 API 역할에 해당 키의 encrypt/decrypt/data-key 권한도 부여해야 합니다.
+- `WORKER_ARTIFACT_DOWNLOADS_ENABLED`: 기본 `false`. `infra/worker`가 claim 응답의 다운로드 경로를 실제 사용하고 SHA-256을 검증하도록 배포된 뒤에만 `true`로 설정합니다. 백엔드 설정만으로 worker 호환 여부가 자동 확인되지는 않습니다.
 - API 실행 역할: 해당 prefix 아래에서 `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` 권한이 필요합니다. SDK 기본 자격 증명 체인을 사용하므로 서버 환경 변수에 IAM access key를 넣지 말고 ECS task role/EC2 instance role을 연결합니다.
 - `WORKER_API_TOKEN`: 백엔드와 worker에 동일하게 안전하게 주입합니다. worker는 공개 HTTPS API의 소스/plan 다운로드 경로에 `X-Worker-Token`을 포함해야 합니다.
 - `PUBLIC_API_BASE_URL`: worker와 브라우저가 접근할 실제 HTTPS 주소를 설정합니다. Compose의 `127.0.0.1:8000` 바인딩은 개발 전용입니다.
 
-`POST /api/worker/deployments/claim` 응답에는 `source_download_path`와 `terraform_plan_download_path`가 포함됩니다. worker는 이 경로를 API base URL에 붙여 각각 ZIP과 승인된 binary plan을 내려받아야 합니다. 따라서 **현재 `infra/worker`가 `source_path`·`terraform_plan_path`의 로컬 파일 공유를 전제로 한다면 S3 서버 모드 전환 전에 worker도 API 다운로드 방식으로 변경해야 합니다.** 이 변경 요청에서는 사용자가 지정한 범위에 따라 `back/`만 수정했습니다.
+`POST /api/worker/deployments/claim` 응답에는 `source_download_path`와 `terraform_plan_download_path`가 포함됩니다. worker는 이 경로를 API base URL에 붙여 각각 ZIP과 승인된 binary plan을 내려받아야 합니다. 따라서 **현재 `infra/worker`가 `source_path`·`terraform_plan_path`의 로컬 파일 공유를 전제로 한다면 S3 서버 모드 전환 전에 worker도 API 다운로드 방식으로 변경해야 합니다.** 이번 수정은 이를 대신하지 않으며, 안전 설정은 worker 연동 전 S3 업로드와 배포 claim을 막습니다.
 
 S3 설정을 켜면 claim 응답에서 호스트 경로 필드(`source_path`, `terraform_plan_path`)를 `null`로 반환합니다. 이 값으로 실행하지 말고 다운로드 경로를 사용하세요. `GET /api/worker/plans/{plan_id}/terraform-plan`은 해당 plan을 쓰는 배포가 `provisioning` 또는 `deploying` 상태일 때만 허용하고 응답에 SHA-256을 제공합니다. worker는 다운로드한 plan의 해시도 대조해야 합니다.
 

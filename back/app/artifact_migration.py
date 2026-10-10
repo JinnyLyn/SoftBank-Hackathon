@@ -7,7 +7,12 @@ import hmac
 from pathlib import Path
 from uuid import uuid4
 
-from app.artifacts import artifact_sha256, delete_artifact, upload_file_to_s3
+from app.artifacts import (
+    artifact_sha256,
+    delete_artifact,
+    require_worker_artifact_support,
+    upload_file_to_s3,
+)
 from app.database import connect
 from app.settings import plan_artifact_directory, upload_directory
 
@@ -68,8 +73,11 @@ def migrate_local_artifacts(*, apply: bool = False) -> dict[str, int]:
         "local_pending": len(entries),
         "migrated": 0,
     }
+    if not entries:
+        return summary
     if not apply:
         return summary
+    require_worker_artifact_support()
 
     for table, column, identifier, old_reference, _, key, content_type, _ in entries:
         local_path = Path(str(old_reference)).expanduser().resolve()

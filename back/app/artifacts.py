@@ -13,7 +13,23 @@ from fastapi import HTTPException, status
 
 
 def s3_enabled() -> bool:
+    return s3_configured() and worker_artifact_downloads_enabled()
+
+
+def s3_configured() -> bool:
     return bool(os.getenv("ARTIFACT_S3_BUCKET", "").strip())
+
+
+def worker_artifact_downloads_enabled() -> bool:
+    return os.getenv("WORKER_ARTIFACT_DOWNLOADS_ENABLED", "false").strip().lower() in {"1", "true", "yes"}
+
+
+def require_worker_artifact_support() -> None:
+    if s3_configured() and not worker_artifact_downloads_enabled():
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "worker의 API artifact 다운로드 연동이 확인되기 전에는 S3 저장을 사용할 수 없습니다.",
+        )
 
 
 def persist_file(path: Path, key: str, content_type: str) -> tuple[Path | None, str]:
@@ -21,6 +37,7 @@ def persist_file(path: Path, key: str, content_type: str) -> tuple[Path | None, 
     bucket = os.getenv("ARTIFACT_S3_BUCKET", "").strip()
     if not bucket:
         return path, str(path)
+    require_worker_artifact_support()
     reference = upload_file_to_s3(path, key, content_type)
     try:
         path.unlink(missing_ok=True)
@@ -35,6 +52,7 @@ def upload_file_to_s3(path: Path, key: str, content_type: str) -> str:
     bucket = os.getenv("ARTIFACT_S3_BUCKET", "").strip()
     if not bucket:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ARTIFACT_S3_BUCKET 설정이 필요합니다.")
+    require_worker_artifact_support()
     object_key = _object_key(key)
     encryption = os.getenv("ARTIFACT_S3_SSE", "AES256").strip()
     if encryption not in {"AES256", "aws:kms"}:

@@ -20,7 +20,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from app.artifacts import artifact_exists, artifact_sha256, delete_artifact, iter_artifact, s3_enabled
+from app.artifacts import (
+    artifact_exists,
+    artifact_sha256,
+    delete_artifact,
+    iter_artifact,
+    require_worker_artifact_support,
+    s3_enabled,
+)
 from app.database import check_database, connect
 from app.schemas import (
     AnalysisIn,
@@ -907,6 +914,7 @@ def project_deployment_status(project_id: UUID) -> FrontDeployStatus:
 @app.post("/api/worker/deployments/claim", status_code=status.HTTP_200_OK, tags=["worker"])
 def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_worker(x_worker_token)
+    require_worker_artifact_support()
     with connect() as connection, connection.cursor() as cursor:
         while True:
             # Discover without taking child-row locks; every lifecycle writer

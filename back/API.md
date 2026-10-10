@@ -229,7 +229,7 @@ worker 이벤트의 `message`와 `details`는 DB 저장 전에 비밀값을 마�
 
 현재 API는 Terraform, Docker 또는 AWS 명령을 직접 실행하지 않습니다. 실제 worker 구현과 AWS 배포 검증은 별도 작업입니다.
 
-`ARTIFACT_S3_BUCKET`을 설정하면 ZIP과 plan artifact를 비공개 S3에 저장합니다. API 서버 역할에 설정된 bucket/prefix의 `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` 권한이 필요하며, AWS SDK 기본 자격 증명 체인을 사용합니다. bucket은 공개하지 말고, worker에는 S3 권한 대신 이 인증된 다운로드 API를 사용하게 합니다. 미설정 시 개발 호환을 위해 API 로컬 디스크를 사용합니다. 기존 로컬 artifact 이관은 `python -m app.cli migrate-artifacts`로 사전 점검하고, 결과 확인 후 `--apply`로 수행합니다. 이 명령은 허용 디렉터리 경계와 DB의 SHA-256 일치를 확인하며, 로컬 원본은 삭제하지 않습니다.
+`ARTIFACT_S3_BUCKET`을 설정하면 ZIP과 plan artifact를 비공개 S3에 저장합니다. 단, `WORKER_ARTIFACT_DOWNLOADS_ENABLED=true`가 아니면 S3 업로드·기존 artifact 이관·배포 claim이 503으로 차단됩니다. 기존 worker가 S3 URI를 로컬 경로로 처리하는 사고를 막기 위한 gate이며, worker 다운로드 연동을 실제 배포한 뒤에만 설정을 켜야 합니다. 백엔드가 worker 버전을 자동 검증하는 것은 아닙니다. API 서버 역할에 설정된 bucket/prefix의 `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` 권한이 필요하며, AWS SDK 기본 자격 증명 체인을 사용합니다. bucket은 공개하지 말고, worker에는 S3 권한 대신 이 인증된 다운로드 API를 사용하게 합니다. `ARTIFACT_S3_BUCKET` 미설정 시 개발 호환을 위해 API 로컬 디스크를 사용합니다. 기존 로컬 artifact 이관은 `python -m app.cli migrate-artifacts`로 사전 점검하고, worker 연동 이후 결과 확인 후 `--apply`로 수행합니다. 이 명령은 허용 디렉터리 경계와 DB의 SHA-256 일치를 확인하며, 로컬 원본은 삭제하지 않습니다.
 
 대기열에서 가져온 작업의 Terraform plan 파일이 없거나 해시가 맞지 않으면 해당 배포를 `failed`로 바꾸고 오류 이벤트를 남긴 뒤, 다음 대기 작업을 계속 찾습니다. 하나의 손상된 작업이 나머지 작업을 막지 않도록 처리합니다.
 
