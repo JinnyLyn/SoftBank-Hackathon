@@ -200,16 +200,65 @@ nat_preflight() {
 }
 
 # --- 포트 자동 할당 ------------------------------------------------------------------------------
-# 공유 ALB에서 이미 쓰는 리스너 포트를 조회해서 허용 범위의 가장 작은 빈 포트를 고른다.
-# 동시에 두 배포를 만들면 같은 포트를 고를 수 있다. 그때는 늦게 apply한 쪽이 실패한다.
-pick_port() {
-  local rgn alb from to used p PY
+# 공유 ALB의 리스너 포트는 두 곳에서 쓰이는 것으로 본다.
+#   (1) AWS에 이미 적용된 리스너
+#   (2) 이 PC에서 계획만 만들고 아직 apply하지 않은 배포(승인 대기 계획 포함)
+# (2)를 빼면 승인 전에 순서대로 계획한 두 프로젝트가 같은 포트(8001)를 골라서, 첫 계획을 적용한 뒤 두 번째 계획이
+# 같은 ALB 포트에 다른 대상 그룹의 리스너를 만들다 DuplicateListener로 실패한다.
+# (2)는 배포 폴더가 있는 동안 예약이다. 폴더가 지워지거나(계획 폐기, 만들다 만 폴더 정리) destroy 표식이 생기면 풀린다.
+# 승인된 계획의 포트는 계획에 고정돼 있어서, 바꾸려면 새 계획과 새 승인이 필요하다.
+local_reserved_ports() {  # local_reserved_ports <제외할 배포 ID>
+  "$(pick_python)" - "$ROOT/deployments" "${1:-}" <<'PYEOF'
+import json, os, sys
+root, skip = sys.argv[1], sys.argv[2]
+ports = set()
+try:
+    names = os.listdir(root)
+except OSError:
+    names = []
+for n in names:
+    d = os.path.join(root, n)
+    # _template, _destroyed 같은 보관 폴더와 숨김 폴더(.port.lock)는 배포가 아니다. 삭제된 배포(destroyed 표식)는 포트를 놓는다
+    if n == skip or n.startswith(("_", ".")) or not os.path.isdir(d) or os.path.exists(os.path.join(d, "destroyed")):
+        continue
+    try:
+        with open(os.path.join(d, "platform.auto.tfvars.json"), encoding="utf-8") as f:
+            p = json.load(f)["platform"]["listener_port"]
+        if isinstance(p, int) and not isinstance(p, bool):
+            ports.add(p)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:   # 포트를 고른 직후(입력 파일을 쓰기 전)의 예약
+        with open(os.path.join(d, "port.reserved"), encoding="utf-8") as f:
+            ports.add(int(f.read().strip()))
+    except (OSError, ValueError):
+        pass
+print(*sorted(ports))
+PYEOF
+}
+
+# mkdir은 원자적이라 잠금으로 쓴다. 두 up이 동시에 같은 포트를 고르지 않게 "고르기 + 예약 기록"을 한 번에 한다.
+# 기다리는 시간(초)은 PORT_LOCK_WAIT(기본 30). 이 잠금이 남아 있으면(up이 강제 종료됨) deployments/.port.lock 폴더를 지운다
+port_lock() {
+  local lock="$ROOT/deployments/.port.lock" i=0
+  mkdir -p "$ROOT/deployments"
+  until mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -le "${PORT_LOCK_WAIT:-30}" ] || die "포트 예약 잠금을 얻지 못했습니다: $lock (다른 up이 끝나길 기다리거나, 강제 종료로 남은 잠금이면 폴더를 지우세요)"
+    sleep 1
+  done
+}
+port_unlock() { rmdir "$ROOT/deployments/.port.lock" 2>/dev/null || true; }
+
+pick_port() {  # pick_port [제외할 배포 ID]: 허용 범위에서 AWS 리스너와 로컬 예약 포트를 뺀 가장 작은 빈 포트
+  local rgn alb from to used reserved PY
   rgn="$(region)"; alb="$(fjson alb_arn)"; PY="$(pick_python)"
   from="$(fjson allowed_listener_ports from)"; to="$(fjson allowed_listener_ports to)"
   # 조회가 실패하면 중단한다. 빈 값으로 넘어가면 이미 쓰는 8001을 다시 골라 apply에서야 포트 중복으로 실패한다
   used="$(aws elbv2 describe-listeners --region "$rgn" --load-balancer-arn "$alb" --query 'Listeners[].Port' --output text)" \
     || die "ALB 리스너 목록을 조회하지 못했습니다. 자격증명과 권한을 확인하거나 --port 로 포트를 직접 지정하세요"
-  "$PY" - "$from" "$to" "$used" <<'PYEOF'
+  reserved="$(local_reserved_ports "${1:-}")" || die "배포 폴더의 포트 예약을 읽지 못했습니다"
+  "$PY" - "$from" "$to" "$used $reserved" <<'PYEOF'
 import sys
 lo, hi = int(sys.argv[1]), int(sys.argv[2])
 used = {int(x) for x in sys.argv[3].split()}
@@ -219,6 +268,16 @@ for p in range(lo, hi + 1):
 else:
     sys.exit(1)
 PYEOF
+}
+
+# 빈 포트를 고르고 곧바로 이 배포 폴더에 예약으로 기록한다(잠금 안에서). 포트를 출력한다
+reserve_port() {  # reserve_port <배포 ID> <배포 폴더>
+  local id="$1" d="$2" p
+  port_lock
+  if ! p="$(pick_port "$id")"; then port_unlock; return 1; fi
+  printf '%s\n' "$p" > "$d/port.reserved"
+  port_unlock
+  echo "$p"
 }
 
 # --- state 위치 ----------------------------------------------------------------------------------
@@ -1115,9 +1174,21 @@ cmd_up() {
   # 계획만 만들 때는 이미지가 아직 없어도 된다(승인 뒤에 빌드·푸시한다). 적용 직전(apply_saved)에 반드시 확인한다
   [ "${PLAN_ONLY:-0}" = "1" ] || check_image_exists "$image"
 
+  # 배포 폴더를 먼저 만든다. 고른 포트를 이 폴더에 예약으로 남겨서, 승인 전에 계획만 만든 다른 배포가 같은 포트를 고르지 않게 한다.
+  # 여기부터 apply 시작 전까지 실패하거나 취소하면 만들다 만 폴더를 지운다(cleanup_failed_up). 폴더가 지워지면 예약도 풀린다
+  UP_DIR="$d"; UP_PHASE=prep
+  trap cleanup_failed_up EXIT
+  mkdir -p "$d"
   if [ "$port" = "auto" ]; then
-    port="$(pick_port)" || die "허용 범위에 빈 포트가 없습니다"
+    port="$(reserve_port "$id" "$d")" || die "허용 범위에 빈 포트가 없습니다"
     log "리스너 포트 자동 할당: $port"
+  else
+    # 지정한 포트를 다른 배포의 미적용 계획이 이미 예약했으면 apply에서야 DuplicateListener로 실패한다. 계획 단계에서 막는다
+    local reserved_ports; reserved_ports="$(local_reserved_ports "$id")" || die "배포 폴더의 포트 예약을 읽지 못했습니다"
+    case " $reserved_ports " in
+      *" $port "*) die "포트 $port 는 이 PC의 다른 배포(미적용 계획 포함)가 이미 예약했습니다. 다른 포트를 지정하거나 --port auto 를 쓰세요" ;;
+    esac
+    printf '%s\n' "$port" > "$d/port.reserved"
   fi
 
   # 앱이 DB를 쓰면 기본으로 앱 전용 DB를 쓴다. --shared-db 이면 공유 DB(관리자 계정)를 쓴다
@@ -1134,10 +1205,6 @@ cmd_up() {
   export TF_PLUGIN_CACHE_DIR="${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
   mkdir -p "$TF_PLUGIN_CACHE_DIR"
 
-  # 여기부터 apply 시작 전까지 실패하거나 취소하면 만들다 만 폴더를 지운다(cleanup_failed_up)
-  UP_DIR="$d"; UP_PHASE=prep
-  trap cleanup_failed_up EXIT
-  mkdir -p "$d"
   tar -C "$TEMPLATE" --exclude=.terraform -cf - . | tar -C "$d" -xf -
   [ -z "$param_arn" ] || printf '%s\n' "$(db_name_of "$id")" > "$d/db-isolated"
   # --shared-db를 고른 배포는 나중에 update로 앱 전용 DB로 몰래 바뀌지 않게 기억해 둔다

@@ -1098,11 +1098,92 @@ def part_d():
     rc, out, err = sh('aws() { echo "An error occurred (AccessDeniedException)" >&2; return 254; }; check_image_exists "%s"' % img)
     say("ok" if rc != 0 and "확인하지 못했습니다" in err else "fail", "D ECR 이미지 확인: 권한 오류는 '없음'이 아니라 확인 실패로 구분", err[:100])
 
+    # 포트 자동 할당. 시험은 비어 있는 임시 폴더를 ROOT로 써서 이 PC의 실제 배포 폴더(예약)에 영향받지 않게 한다
+    def fresh_root(name):
+        r = WORK / name
+        shutil.rmtree(r, ignore_errors=True)
+        (r / "deployments").mkdir(parents=True)
+        return r
+
+    def with_root(r):
+        return f'ROOT={P(r)}; '
+
+    def deploy_folder(r, dep_id, port=None, reserved=None, destroyed=False):
+        d = r / "deployments" / dep_id
+        d.mkdir(parents=True, exist_ok=True)
+        if port is not None:
+            (d / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"listener_port": port}}), encoding="utf-8")
+        if reserved is not None:
+            (d / "port.reserved").write_text(f"{reserved}\n", encoding="utf-8")
+        if destroyed:
+            (d / "destroyed").write_text("x", encoding="utf-8")
+        return d
+
+    proot = fresh_root("port_root")
     # 포트 자동 할당: 조회가 실패하면 8001로 넘어가지 않고 중단
-    rc, out, err = sh('aws() { return 255; }; pick_port')
+    rc, out, err = sh(with_root(proot) + 'aws() { return 255; }; pick_port')
     say("ok" if rc != 0 and out.strip() == "" and "조회하지 못했습니다" in err else "fail", "D 포트 자동 할당: 리스너 조회 실패를 숨기고 8001을 고르지 않는다", f"rc={rc} out={out.strip()} {err[:60]}")
-    rc, out, err = sh('aws() { echo "80 8001 8002"; }; pick_port')
+    rc, out, err = sh(with_root(proot) + 'aws() { echo "80 8001 8002"; }; pick_port')
     say("ok" if out.strip() == "8003" else "fail", "D 포트 자동 할당: 쓰는 포트를 건너뛰고 가장 작은 빈 포트", out.strip())
+
+    # 회귀: 승인 전에 두 프로젝트를 순서대로 계획하면 둘 다 AWS에 아직 없는 8001을 골라, 첫 계획을 적용한 뒤 두 번째 계획이
+    # 같은 ALB 포트에 다른 대상 그룹의 리스너를 만들다 DuplicateListener로 실패했다. 미적용 계획의 포트를 예약으로 센다
+    da, db = deploy_folder(proot, "abcd0001"), deploy_folder(proot, "abcd0002")
+    rc1, o1, e1 = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0001 {P(da)}')
+    rc2, o2, e2 = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0002 {P(db)}')
+    say("ok" if (rc1, rc2) == (0, 0) and (o1.strip(), o2.strip()) == ("8001", "8002") else "fail",
+        "D 포트 예약: 승인 전에 순서대로 계획한 두 배포가 서로 다른 포트를 받는다(8001, 8002)", f"{o1.strip()} {o2.strip()} {e1[:50]} {e2[:50]}")
+    # 폴더가 지워지면(계획 폐기) 예약이 풀린다
+    shutil.rmtree(da)
+    dc = deploy_folder(proot, "abcd0003")
+    rc, out, err = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0003 {P(dc)}')
+    say("ok" if rc == 0 and out.strip() == "8001" else "fail", "D 포트 예약: 계획을 폐기해 폴더가 지워지면 그 포트를 다시 쓴다", out.strip())
+    # destroy 표식이 생기면 풀린다
+    (db / "destroyed").write_text("x", encoding="utf-8")
+    dd = deploy_folder(proot, "abcd0004")
+    rc, out, err = sh(with_root(proot) + f'aws() {{ echo 80; }}; reserve_port abcd0004 {P(dd)}')
+    say("ok" if rc == 0 and out.strip() == "8002" else "fail", "D 포트 예약: destroy된 배포(destroyed 표식)의 포트는 풀린다", out.strip())
+    # 입력 파일(platform.auto.tfvars.json)로 남은 예약, 자기 자신·보관 폴더(_)는 세지 않는다
+    deploy_folder(proot, "abcd0005", port=8003)
+    deploy_folder(proot, "_destroyed", port=8010)
+    rc, out, err = sh(with_root(proot) + 'local_reserved_ports abcd0004')
+    say("ok" if rc == 0 and out.split() == ["8001", "8003"] else "fail",
+        "D 포트 예약: 입력 파일의 포트는 세고, 자기 자신·_보관 폴더·destroy된 배포는 세지 않는다", out.strip())
+    # AWS 리스너와 로컬 예약을 함께 피한다
+    de = deploy_folder(proot, "abcd0006")
+    rc, out, err = sh(with_root(proot) + f'aws() {{ echo "80 8002"; }}; reserve_port abcd0006 {P(de)}')
+    say("ok" if rc == 0 and out.strip() == "8004" else "fail", "D 포트 예약: AWS에 적용된 리스너(8002)와 로컬 예약(8001, 8003)을 모두 피한다", out.strip())
+    # 잠금이 남아 있으면 기다리다 실패하고, 그때 폴더에 예약을 남기지 않는다
+    (proot / "deployments" / ".port.lock").mkdir()
+    df = deploy_folder(proot, "abcd0007")
+    rc, out, err = sh(with_root(proot) + f'PORT_LOCK_WAIT=1; aws() {{ echo 80; }}; reserve_port abcd0007 {P(df)}')
+    say("ok" if rc != 0 and "잠금" in err and not (df / "port.reserved").exists() else "fail", "D 포트 예약: 잠금을 얻지 못하면 포트를 정하지 않고 실패", f"rc={rc} {err[:70]}")
+    (proot / "deployments" / ".port.lock").rmdir()
+
+    # cmd_up 통합: 계획만 만드는 up을 두 번 순서대로 실행하면 서로 다른 포트가 계획 입력에 고정된다
+    r2 = fresh_root("port_root_up")
+    appf = WORK / "port_app.json"
+    appf.write_text(json.dumps({"container_port": 8000, "health_check_path": "/health", "use_database": False}), encoding="utf-8")
+    stubs = ('need() { :; }; export_foundation() { :; }; nat_preflight() { :; }; aws() { echo 80; }; '
+             'tf() { :; }; state_setup() { :; }; plan_confirm_apply() { :; }; PLAN_ONLY=1; ')
+    up = lambda i, extra="": f'cmd_up --id {i} --image {ECR}:{i}-r1 --app {P(appf)} --arch X86_64 --plan-only {extra}'
+    rc, out, err = sh(with_root(r2) + stubs + up("abcd0011") + "; " + up("abcd0012"))
+    ports = []
+    for i in ("abcd0011", "abcd0012"):
+        try:
+            ports.append(json.loads((r2 / "deployments" / i / "platform.auto.tfvars.json").read_text(encoding="utf-8"))["platform"]["listener_port"])
+        except (OSError, ValueError, KeyError):
+            ports.append(None)
+    say("ok" if rc == 0 and ports == [8001, 8002] else "fail", "D up --plan-only: 승인 전에 계획한 두 배포의 리스너 포트가 서로 다르다(8001, 8002)", f"rc={rc} ports={ports} {err[-90:]}")
+    # 지정한 포트가 다른 배포의 미적용 계획과 겹치면 계획 단계에서 막는다(apply에서야 DuplicateListener로 실패하지 않게)
+    rc, out, err = sh(with_root(r2) + stubs + up("abcd0013", "--port 8001"))
+    say("ok" if rc != 0 and "이미 예약" in err and not (r2 / "deployments" / "abcd0013").exists() else "fail",
+        "D up --port: 다른 배포가 예약한 포트를 지정하면 계획 단계에서 거부하고 폴더를 남기지 않는다", f"rc={rc} {err[-90:]}")
+    # 계획 준비가 실패해 폴더가 정리되면 예약도 풀린다
+    rc, out, err = sh(with_root(r2) + stubs.replace("tf() { :; }", "tf() { return 1; }") + up("abcd0014"))
+    rc2, out2, err2 = sh(with_root(r2) + 'local_reserved_ports abcd0099')
+    say("ok" if rc != 0 and not (r2 / "deployments" / "abcd0014").exists() and out2.split() == ["8001", "8002"] else "fail",
+        "D up 실패: 만들다 만 폴더가 정리되면 그 포트 예약도 풀린다", f"rc={rc} reserved={out2.strip()}")
 
     # S3 state: 버전 확인, 이미 있는 원격 state를 덮어쓰지 않는다
     for ver, want in [("1.9.8", False), ("1.10.0", True), ("1.16.5", True), ("1.10.0-beta1", True)]:
