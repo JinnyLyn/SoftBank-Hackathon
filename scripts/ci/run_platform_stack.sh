@@ -57,3 +57,6 @@ timeout 180 "${compose[@]}" exec -T api python /ci/test_platform_back_rollbacks.
 
 echo '실제 DB/API 비밀 마스킹 계약 검사'
 timeout 120 "${compose[@]}" exec -T api python /ci/test_platform_back_masking.py
+
+echo '실제 DB/API 로컬 Docker 대상 계약 검사 (Docker/AWS 실행 없음)'
+timeout 120 "${compose[@]}" exec -T api python /ci/test_platform_back_local_docker.py
