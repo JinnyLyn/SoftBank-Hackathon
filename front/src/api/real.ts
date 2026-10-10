@@ -25,13 +25,19 @@ import { sourceName, TIER_META, usd } from '../format'
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** 결과가 생길 때까지 주기적으로 확인. 시간이 지나면 이유를 담아 실패 */
-async function poll<T>(fn: () => Promise<T | null>, opts: { intervalMs: number; timeoutMs: number; what: string }) {
+async function poll<T>(
+  fn: () => Promise<T | null>,
+  opts: { intervalMs: number; timeoutMs: number; what: string; hint?: string },
+) {
   const until = Date.now() + opts.timeoutMs
   for (;;) {
     const v = await fn()
     if (v) return v
     if (Date.now() > until)
-      throw new ApiError(408, `${opts.what}가 ${Math.round(opts.timeoutMs / 60000)}분 안에 준비되지 않았습니다. 잠시 뒤 다시 시도해 주세요.`)
+      throw new ApiError(
+        408,
+        `${Math.round(opts.timeoutMs / 60000)}분 동안 기다렸지만 ${opts.what}이(가) 오지 않았습니다. ${opts.hint ?? '잠시 뒤 다시 시도해 주세요.'}`,
+      )
     await wait(opts.intervalMs)
   }
 }
@@ -137,6 +143,7 @@ export async function analyze(source: Source, scale: ScaleInput): Promise<Analys
     intervalMs: 2000,
     timeoutMs: 5 * 60 * 1000,
     what: '분석 결과',
+    hint: '분석 프로그램(ai/runner.py)이 실행 중인지 확인해 주세요.',
   })
   return toAnalysis(out)
 }
@@ -239,7 +246,13 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
         const waiting = list.filter((p) => p.status === 'awaiting_approval' && p.target === 'aws')
         return waiting.length ? waiting : null
       },
-      { intervalMs: 2000, timeoutMs: 5 * 60 * 1000, what: '배포 계획' },
+      {
+        intervalMs: 2000,
+        timeoutMs: 5 * 60 * 1000,
+        what: '배포 계획',
+        // 계획은 AI가 아니라 인프라 worker가 만듦. 분석은 이미 끝난 상태
+        hint: '배포 계획은 인프라 worker(infra/worker)가 만듭니다. worker가 실행 중인지 확인한 뒤 다시 기다려 주세요.',
+      },
     ),
     req<Connection[]>('/connections'),
   ])
