@@ -118,11 +118,15 @@ class PlanOut(APIModel):
     project_id: UUID
     analysis_id: UUID | None
     target: str
+    operation_type: Literal["deploy", "rollback"]
+    rollback_from_deployment_id: UUID | None = None
+    rollback_to_deployment_id: UUID | None = None
     module_id: str
     variables: dict[str, Any]
     summary: str
     cost_estimate: CostEstimate | None
     terraform_plan_sha256: str | None
+    terraform_plan_summary: dict[str, Any] | None = None
     terraform_plan_ready: bool
     fingerprint: str
     status: Literal["awaiting_approval", "approved", "consumed", "superseded"]
@@ -140,9 +144,23 @@ class DeploymentCreateIn(APIModel):
 
 
 class RollbackRequestIn(APIModel):
-    """The displayed healthy deployment the user explicitly approved for rollback."""
+    """The healthy deployment selected before generating a fresh rollback plan."""
 
     expected_target_deployment_id: UUID
+
+
+class RollbackPlanSummaryIn(APIModel):
+    terraform_plan_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    summary: dict[str, Any]
+
+    @field_validator("summary")
+    @classmethod
+    def summary_is_bounded(cls, value: dict[str, Any]) -> dict[str, Any]:
+        import json
+
+        if len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > 128 * 1024:
+            raise ValueError("terraform plan summary must be at most 128 KiB")
+        return value
 
 
 class RollbackCandidateOut(APIModel):

@@ -162,7 +162,7 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 
 롤백 불가 시 `reason`은 `first_deployment`, `no_previous_healthy`, `not_failed` 중 하나입니다. `first_deployment`와 `no_previous_healthy`에서는 AI 분석·수정 → 새 plan/비용/terraform plan 확인 → 사용자 승인 → `POST /api/deployments`로 재배포합니다.
 
-사용자가 롤백을 명시적으로 선택·확인한 경우에만 아래 요청을 보냅니다.
+사용자가 롤백 계획 생성을 명시적으로 선택·확인한 경우에만 아래 요청을 보냅니다. 이 요청은 실행을 승인하지 않으며 새 `awaiting_approval` rollback plan을 반환합니다.
 
 `POST /api/deployments/{deployment_id}/rollback`
 
@@ -172,7 +172,7 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 }
 ```
 
-백엔드는 현재 직전 `healthy` 배포·Terraform plan SHA-256을 재검증하고, 원래 실패 배포를 `failed`로 보존한 채 별도 `operation_type: "rollback"`, `status: "queued"` 실행 이력을 생성합니다. 같은 실패 배포에 진행 중인 롤백이 있으면 409입니다.
+백엔드는 실패 배포가 해당 프로젝트의 최신 배포인지와, 실제 `healthy` 전환 시각이 가장 최근인 이전 정상 버전인지 확인합니다. 후속 배포가 있으면 오래 열린 화면의 롤백 요청은 409으로 거부합니다. worker는 새 rollback plan ID로 Terraform plan을 다시 생성해 `POST /api/worker/rollback-plans/{plan_id}/terraform-plan`에 SHA-256과 함께 저장하고, `POST /api/worker/rollback-plans/{plan_id}/summary`로 diff 요약을 저장합니다. 사용자는 변경된 fingerprint·digest·diff를 확인한 뒤 `POST /api/plans/{plan_id}/approve`로 승인하며, 이후에만 `POST /api/deployments`가 별도 `operation_type: "rollback"` 실행 이력을 생성합니다.
 
 ## AWS 연결 API
 
@@ -189,6 +189,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 아래 경로는 프런트 호출용이 아닙니다. 모든 요청에 `X-Worker-Token: {WORKER_API_TOKEN}`이 필요합니다.
 
 - `POST /api/worker/plans/{plan_id}/terraform-plan`: `Content-Type: application/octet-stream`으로 Terraform binary plan 업로드. 서버가 SHA-256을 확인합니다.
+- `POST /api/worker/rollback-plans/{plan_id}/terraform-plan`: 새 rollback Terraform binary plan을 저장합니다. `X-Terraform-Plan-SHA256` 헤더와 본문 해시가 같아야 하며, 기존 성공 배포의 plan을 재사용할 수 없습니다.
+- `POST /api/worker/rollback-plans/{plan_id}/summary`: 새 rollback plan의 SHA-256과 Terraform diff 요약을 저장합니다. 이 요약과 artifact가 모두 있어야 사용자 승인이 가능합니다.
 - `POST /api/worker/deployments/claim`: 대기 중인 AWS 일반 배포 또는 사용자 승인 롤백 작업 하나를 가져옵니다. 롤백 작업에는 `operation_type: "rollback"`, `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다. 없으면 `{ "job": null }`.
 - `POST /api/worker/deployments/{deployment_id}/events`: 상태와 이벤트를 기록합니다. 일반 배포와 롤백 모두 `queued → provisioning → deploying → healthy` 또는 `failed` 흐름을 사용합니다. 현재 상태와 같은 상태를 보내면 상태와 URL은 그대로 두고 로그 이벤트만 추가합니다. 다른 상태에서 `healthy`로 전이할 때는 HTTP(S) `url`이 필요합니다.
 - `POST /api/worker/connections/{connection_id}/complete`: AWS 계정 확인 결과를 연결 상태에 반영합니다.

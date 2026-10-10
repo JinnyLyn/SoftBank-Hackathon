@@ -140,13 +140,33 @@ def main() -> int:
     require(candidate["rollback_available"] and candidate["reason"] == "available", f"missing rollback candidate: {candidate}")
     require(candidate["target_deployment_id"] == healthy["id"], f"wrong rollback target: {candidate}")
 
-    rollback = request(
-        f"/api/deployments/{later_failed['id']}/rollback", method="POST", expected=202,
+    rollback_plan = request(
+        f"/api/deployments/{later_failed['id']}/rollback", method="POST", expected=201,
         payload={"expected_target_deployment_id": candidate["target_deployment_id"]},
     )
-    require(rollback["operation_type"] == "rollback" and rollback["status"] == "queued", f"bad rollback record: {rollback}")
-    require(rollback["rollback_from_deployment_id"] == later_failed["id"], f"missing rollback source: {rollback}")
-    require(rollback["rollback_to_deployment_id"] == healthy["id"], f"missing rollback target: {rollback}")
+    require(rollback_plan["operation_type"] == "rollback" and rollback_plan["status"] == "awaiting_approval", f"bad rollback plan: {rollback_plan}")
+    require(rollback_plan["rollback_from_deployment_id"] == later_failed["id"], f"missing rollback source: {rollback_plan}")
+    require(rollback_plan["rollback_to_deployment_id"] == healthy["id"], f"missing rollback target: {rollback_plan}")
+    rollback_bytes = b"fresh rollback plan"
+    rollback_digest = hashlib.sha256(rollback_bytes).hexdigest()
+    request(
+        f"/api/worker/rollback-plans/{rollback_plan['id']}/terraform-plan", method="POST", data=rollback_bytes, expected=200,
+        headers={"Content-Type": "application/octet-stream", "X-Worker-Token": WORKER_TOKEN,
+                 "X-Terraform-Plan-SHA256": rollback_digest},
+    )
+    rollback_plan = request(
+        f"/api/worker/rollback-plans/{rollback_plan['id']}/summary", method="POST", expected=200,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+        payload={"terraform_plan_sha256": rollback_digest, "summary": {"resource_changes": 1}},
+    )
+    rollback_plan = request(
+        f"/api/plans/{rollback_plan['id']}/approve", method="POST", expected=200,
+        payload={"expected_fingerprint": rollback_plan["fingerprint"]},
+    )
+    rollback = request(
+        "/api/deployments", method="POST", expected=202,
+        payload={"plan_id": rollback_plan["id"], "expected_fingerprint": rollback_plan["fingerprint"]},
+    )
     claim = request(
         "/api/worker/deployments/claim", method="POST", expected=200,
         headers={"X-Worker-Token": WORKER_TOKEN},
@@ -158,7 +178,7 @@ def main() -> int:
     finish(rollback["id"], "healthy", url="https://example.test/rolled-back")
     original = request(f"/api/deployments/{later_failed['id']}", expected=200)
     require(original["status"] == "failed", f"failed deployment was mutated: {original}")
-    print("PASS: first failure excludes rollback; later failure creates only a user-approved rollback record")
+    print("PASS: first failure excludes rollback; later failure requires a fresh rollback plan, diff approval, and queues a linked rollback")
     return 0
 
 

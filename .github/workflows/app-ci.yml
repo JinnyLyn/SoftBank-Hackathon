@@ -130,6 +130,22 @@ jobs:
     if: needs.inventory.outputs.back == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 8
+    services:
+      mysql:
+        image: mysql:8.4.11
+        env:
+          MYSQL_DATABASE: paved_clouds
+          MYSQL_USER: paved
+          MYSQL_PASSWORD: paved-dev-only
+          MYSQL_ROOT_PASSWORD: root-dev-only
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -u root -proot-dev-only --silent"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+        ports:
+          - 3306:3306
+    env:
+      DATABASE_URL: mysql://paved:paved-dev-only@127.0.0.1:3306/paved_clouds
+      WORKER_API_TOKEN: ci-worker-token
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -144,6 +160,18 @@ jobs:
           python -m compileall -q back/app
       - name: DB·AWS·LLM 없이 앱 기동·HTTP 계약 확인
         run: python scripts/ci/test_platform_back.py
+      - name: MySQL migration과 사용자 승인 롤백 계약 확인
+        run: |
+          (cd back && python -m app.cli migrate)
+          (cd back && python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 --no-access-log) > "$RUNNER_TEMP/platform-back.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true; wait "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:8010/health > /dev/null; then break; fi
+            sleep 0.25
+          done
+          curl --fail --silent http://127.0.0.1:8010/health > /dev/null
+          PLATFORM_BACK_URL=http://127.0.0.1:8010 python scripts/ci/test_platform_back_rollbacks.py
 
   infra:
     name: Infrastructure (static validation)

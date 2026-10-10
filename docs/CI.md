@@ -40,7 +40,7 @@
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
 | `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
-| `Platform backend (startup and API smoke)` | `back/` 구현 존재 | `.python-version`과 requirements 기반 설치, 의존성 호환성·문법, 실제 앱 기동·OpenAPI, `/health` 200, DB 미설정 `/ready` 503, 작업자 인증 없는 요청 401, 잘못된 plan 입력 422 | 실제 DB·migration·CRUD·승인 상태 전환, 프런트 연동, LLM·AWS 실행, Docker 이미지 빌드 |
+| `Platform backend (startup and API smoke)` | `back/` 구현 존재 | `.python-version`과 requirements 기반 설치, 의존성 호환성·문법, DB 없는 앱 기동·OpenAPI 및 오류 계약, MySQL 8.4 migration, 첫 실패 롤백 차단, 새 rollback plan/diff 승인, worker claim 계약 | 프런트 연동, LLM·AWS Terraform/ECS 실행, Docker 이미지 빌드 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
 10/10 확인한 main `432a52e`에는 샘플 프런트와 [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4)의 샘플 백엔드가 있다. 플랫폼 백엔드는 [PR #10](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/10) `147ad5e`, 인프라·플랫폼 프런트는 [#6](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/6)·[#7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7)의 파일 계약에 맞춘 조건부 검사다. 각 PR이 변경된 CI를 반영하면 해당 구현이 있는 검사만 활성화된다. 열린 PR 코드를 CI가 별도로 가져오거나 자동으로 합치지 않는다.

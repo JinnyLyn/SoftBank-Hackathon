@@ -68,7 +68,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `GET` | `/api/deployments?project_id=...` | 배포 이력 목록 |
 | `GET` | `/api/deployments/{id}` | 배포 상태와 이벤트 이력 |
 | `GET` | `/api/deployments/{id}/rollback-candidate` | 실패 배포의 사용자 승인 롤백 가능 여부와 이전 정상 버전 조회 |
-| `POST` | `/api/deployments/{id}/rollback` | 사용자가 확인한 이전 `healthy` 버전으로 롤백 작업 등록 |
+| `POST` | `/api/deployments/{id}/rollback` | 이전 `healthy` 설정을 바탕으로 새 rollback plan 초안 생성 |
 | `GET` | `/api/projects/{id}/status` | 프런트용 최근 배포 상태·로그 조회 |
 | `POST` | `/api/worker/deployments/claim` | 인증된 작업자가 대기 작업을 원자적으로 가져옴 |
 | `POST` | `/api/worker/deployments/{id}/events` | 인증된 작업자의 상태 전이·이벤트 기록 |
@@ -80,7 +80,7 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 작업자 API는 `WORKER_API_TOKEN`이 설정되어야 사용할 수 있으며 `X-Worker-Token` 헤더를 비교합니다. 일반 배포와 롤백 작업 모두 `queued → provisioning → deploying → healthy` 또는 `failed`의 제한된 전이를 따릅니다. 롤백은 실패한 원래 배포를 바꾸지 않고, 별도 `operation_type: rollback` 이력으로 실행합니다. 로그의 흔한 credential 패턴은 저장 전에 마스킹합니다. 호출 측에서도 로그에 비밀을 보내지 않아야 합니다.
 
-첫 AWS 배포가 실패하면 이전 `healthy` 배포가 없으므로 롤백을 제공하지 않습니다. 프런트는 `rollback-candidate` 응답의 `first_deployment` 또는 `no_previous_healthy` 이유를 표시하고, AI 실패 원인 분석·수정안 → 새 계획·비용·plan 확인 → 사용자 승인 → 재배포 흐름으로 진행해야 합니다. 이전 배포가 있는 실패에서는 사용자가 롤백을 선택했을 때만 `rollback` endpoint를 호출합니다. 백엔드는 사용자가 화면에서 확인한 직전 `healthy` 배포 ID와 현재 후보가 일치하는지, 저장 Terraform plan의 SHA-256이 유효한지를 다시 검사합니다. 자동 롤백은 수행하지 않습니다.
+첫 AWS 배포가 실패하면 이전 `healthy` 배포가 없으므로 롤백을 제공하지 않습니다. 프런트는 `rollback-candidate` 응답의 `first_deployment` 또는 `no_previous_healthy` 이유를 표시하고, AI 실패 원인 분석·수정안 → 새 계획·비용·plan 확인 → 사용자 승인 → 재배포 흐름으로 진행해야 합니다. 이후 실패에서 사용자가 롤백을 선택하면 `rollback` endpoint가 새 `awaiting_approval` rollback plan을 만듭니다. worker는 그 설정으로 **새 Terraform plan과 diff 요약**을 생성·저장하고, 사용자는 새 fingerprint·digest·diff를 확인한 뒤 기존 plan 승인 API로 승인합니다. 승인 전 새 rollback plan은 대기열에 등록할 수 없으며, 자동 롤백은 수행하지 않습니다.
 
 연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. 연결 상태는 검증된 AWS 계정 확인 주체가 `POST /api/worker/connections/{id}/complete`로 계정 ID를 보고할 때 `connected`가 됩니다. `WORKER_API_TOKEN` 없이 연결 완료를 호출할 수 없습니다.
 
