@@ -193,10 +193,10 @@ export default function ReviewStep({
 
 function domainSummary(domain: DomainPlan | null) {
   if (!domain || domain.mode === 'none') return '미리보기 주소'
-  return domain.mode === 'auto' ? '자동 주소' : '보유 도메인'
+  return domain.mode === 'auto' ? '자동 주소 (플랫폼)' : '보유 도메인'
 }
 
 function domainDetail(domain: DomainPlan | null) {
   if (!domain || domain.mode === 'none') return 'AWS 기본 주소 (미리보기, 도메인 미연결)'
-  return `${domain.name ?? '배포 뒤 확정'} (${domain.mode === 'auto' ? '자동 주소' : '가지고 있는 도메인 연결'})`
+  return `${domain.name ?? '배포 뒤 확정'} (${domain.mode === 'auto' ? '플랫폼 도메인의 자동 주소' : '가지고 있는 도메인 연결'})`
 }

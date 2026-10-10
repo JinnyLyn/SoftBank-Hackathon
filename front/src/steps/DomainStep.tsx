@@ -13,7 +13,7 @@ const MODES: { key: DomainMode; title: string; desc: string }[] = [
   {
     key: 'auto',
     title: '자동 주소 (추천)',
-    desc: '앱마다 겹치지 않는 https 주소를 바로 만들어 드립니다. 도메인을 사거나 DNS를 설정할 필요가 없습니다.',
+    desc: '플랫폼 도메인 아래에 앱마다 겹치지 않는 https 주소를 바로 만들어 드립니다. 내 도메인은 아니며, 가지고 있는 도메인은 나중에 연결할 수 있습니다.',
   },
   { key: 'own', title: '가지고 있는 도메인', desc: '이미 산 도메인을 연결합니다. 도메인 업체에서 레코드 2개를 추가하면 됩니다.' },
 ]

@@ -6,7 +6,7 @@ const ORDER: Record<DomainMode, { state: DomainStatus['state']; label: string }[
   auto: [
     { state: 'waiting_dns', label: '주소 연결 중' },
     { state: 'issuing_cert', label: 'HTTPS 준비 중' },
-    { state: 'active', label: '연결 완료' },
+    { state: 'active', label: '플랫폼 주소 연결 완료' },
   ],
   own: [
     { state: 'waiting_dns', label: 'DNS 확인 중' },
@@ -40,7 +40,7 @@ export default function DomainProgress({ status, mode }: Props) {
   return (
     <div className="domain-progress">
       <div className="domain-head">
-        <strong>{mode === 'auto' ? '주소' : '도메인'} {status.name}</strong>
+        <strong>{mode === 'auto' ? '플랫폼 주소' : '도메인'} {status.name}</strong>
         {status.state === 'active' && status.url ? (
           <a href={status.url} target="_blank" rel="noreferrer" className="mono">
             {status.url}

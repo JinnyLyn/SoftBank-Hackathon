@@ -341,7 +341,7 @@ export async function saveDomain(_projectId: string, choice: DomainChoice): Prom
   if (choice.mode === 'own') return { mode: 'own', name: choice.name, monthlyUsd: 0, records: appRecords(choice.name) }
   const pick = () => WORDS[Math.floor(Math.random() * WORDS.length)]
   autoName = `${pick()}-${pick()}-${Math.random().toString(16).slice(2, 6)}.apps.paved.example`
-  return { mode: 'auto', name: autoName, monthlyUsd: 0, records: [], note: '자동 주소는 추가 비용이 없습니다. HTTPS 인증서는 플랫폼이 관리합니다.' }
+  return { mode: 'auto', name: autoName, monthlyUsd: 0, records: [], note: '플랫폼 도메인 아래의 자동 주소라 추가 비용이 없습니다. 내 도메인은 아니며 HTTPS 인증서는 플랫폼이 관리합니다.' }
 }
 
 /** 앱 배포가 끝난 뒤 지난 시간(ms)에 따라 도메인 단계를 흉내 */
