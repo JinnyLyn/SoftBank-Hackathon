@@ -1,4 +1,6 @@
 import ProviderMark from '../components/ProviderMark'
+import WorkProgress from '../components/WorkProgress'
+import { STAGE_SIZE } from '../progress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
 import type { Analysis, Choice, Recommendation, TierKey } from '../types'
@@ -14,7 +16,13 @@ const CODE_TEXT: Record<CodeState, string> = {
 
 interface Props {
   analysis: Analysis
-  rec: Recommendation
+  /** 인프라 worker가 만든 구성·비용 계획. 아직 없으면 null (분석 결과는 먼저 보여 줌) */
+  rec: Recommendation | null
+  /** 계획을 기다리다 실패한 이유 */
+  recError: string | null
+  /** 계획을 기다리기 시작한 시각(ms). 진행 표시의 경과 시간 */
+  recStartedAt: number | null
+  onRetryRec: () => void
   choice: Choice | null
   /** 월 예산 한도. 넘는 칸은 고를 수 없음 */
   budget: number
@@ -26,7 +34,96 @@ interface Props {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
-export default function AnalysisStep({ analysis, rec, choice, budget, codeState, codeError, locked, onChoice }: Props) {
+export default function AnalysisStep({ analysis, rec, recError, recStartedAt, onRetryRec, ...plans }: Props) {
+  const blockers = analysis.blockers ?? []
+  return (
+    <div className="stack-lg">
+      {blockers.length > 0 && (
+        <div className="error" role="alert">
+          <strong>이 앱은 지금 배포할 수 없습니다.</strong>
+          <ul className="blockers">
+            {blockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+          <span>코드를 고친 뒤 처음 화면에서 다시 올려 주세요.</span>
+        </div>
+      )}
+      <section>
+        <h3 className="sub-title">코드에서 찾은 것</h3>
+        <dl className="kv">
+          {analysis.stack.map((s, i) => (
+            <div key={s.label} className="reveal" style={{ animationDelay: `${i * 90}ms` }}>
+              <dt>{s.label}</dt>
+              <dd>{s.value}</dd>
+            </div>
+          ))}
+        </dl>
+        <ul className="findings">
+          {analysis.findings.map((f, i) => (
+            <li
+              key={f.title}
+              className={'finding reveal is-' + f.level}
+              style={{ animationDelay: `${(analysis.stack.length + i) * 90}ms` }}
+            >
+              <strong>{f.title}</strong>
+              <span>{f.detail}</span>
+            </li>
+          ))}
+        </ul>
+        <details className="evidence">
+          <summary>판단 근거 {analysis.evidence.length}개</summary>
+          <ul>
+            {analysis.evidence.map((e) => (
+              <li key={e} className="mono">{e}</li>
+            ))}
+          </ul>
+        </details>
+      </section>
+
+      {blockers.length > 0 ? null : rec ? (
+        <Plans rec={rec} {...plans} />
+      ) : (
+        <section>
+          <h3 className="sub-title">어디에, 어떤 크기로</h3>
+          {recError ? (
+            <div className="rec-wait is-error" role="alert">
+              <span>구성·비용 계획을 받지 못했습니다. {recError}</span>
+              <button className="btn btn-ghost btn-sm" onClick={onRetryRec}>
+                다시 기다리기
+              </button>
+            </div>
+          ) : (
+            <WorkProgress
+              title="구성과 비용 계획을 만들고 있습니다"
+              startedAt={recStartedAt ?? Date.now()}
+              stageStartedAt={recStartedAt ?? Date.now()}
+              stages={[
+                { label: '코드 올리기', state: 'done', ...STAGE_SIZE.upload },
+                { label: '코드 분석', state: 'done', ...STAGE_SIZE.analyze },
+                { label: '구성·비용 계획', state: 'current', ...STAGE_SIZE.plan },
+              ]}
+              hints={PLAN_HINTS}
+              note="보통 1~4분 걸립니다. 위의 분석 결과를 먼저 확인해 주세요. 승인하기 전에는 아무것도 만들지 않습니다."
+            />
+          )}
+        </section>
+      )}
+    </div>
+  )
+}
+
+// 계획 단계에서 인프라 worker가 실제로 하는 일
+const PLAN_HINTS = [
+  '사용 규모와 예산에 맞는 구성 크기를 고르고 있습니다',
+  '공용 로드밸런서·DB 같은 기반 인프라 정보를 읽고 있습니다',
+  '구성마다 한 달 비용을 계산하고 있습니다',
+  'Terraform으로 무엇이 새로 생기는지 미리 계산하고 있습니다',
+]
+
+type PlansProps = Omit<Props, 'analysis' | 'rec' | 'recError' | 'recStartedAt' | 'onRetryRec'> & { rec: Recommendation }
+
+function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice }: PlansProps) {
   const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
   const selected = option?.tiers.find((t) => t.key === choice?.tier)
   const isRec = (id: string, t: TierKey) => rec.recommended?.connectionId === id && rec.recommended?.tier === t
@@ -47,35 +144,6 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
   ) as Partial<Record<TierKey, string>>
 
   return (
-    <div className="stack-lg">
-      <section>
-        <h3 className="sub-title">코드에서 찾은 것</h3>
-        <dl className="kv">
-          {analysis.stack.map((s) => (
-            <div key={s.label}>
-              <dt>{s.label}</dt>
-              <dd>{s.value}</dd>
-            </div>
-          ))}
-        </dl>
-        <ul className="findings">
-          {analysis.findings.map((f) => (
-            <li key={f.title} className={'finding is-' + f.level}>
-              <strong>{f.title}</strong>
-              <span>{f.detail}</span>
-            </li>
-          ))}
-        </ul>
-        <details className="evidence">
-          <summary>판단 근거 {analysis.evidence.length}개</summary>
-          <ul>
-            {analysis.evidence.map((e) => (
-              <li key={e} className="mono">{e}</li>
-            ))}
-          </ul>
-        </details>
-      </section>
-
       <section>
         <h3 className="sub-title">어디에, 어떤 크기로</h3>
         <p className={'rec-reason' + (rec.recommended ? '' : ' is-blocked')}>{rec.reason}</p>
@@ -198,6 +266,5 @@ export default function AnalysisStep({ analysis, rec, choice, budget, codeState,
           </div>
         )}
       </section>
-    </div>
   )
 }

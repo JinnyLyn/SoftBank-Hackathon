@@ -3,6 +3,10 @@ import type {
   Choice,
   Connection,
   ConnectionInput,
+  DnsRecord,
+  DomainChoice,
+  DomainPlan,
+  DomainStatus,
   DeployRecord,
   DeployStatus,
   Provider,
@@ -27,6 +31,18 @@ let deployChoice: Choice | null = null
 
 // ---------- 연결 ----------
 
+// 연결이 없어도 배포할 곳: 운영자가 준비한 AWS (관리형 배포)
+const MANAGED_AWS: Connection = {
+  id: 'managed-aws',
+  provider: 'aws',
+  name: '관리형 AWS',
+  status: 'connected',
+  detail: '운영자가 준비한 계정',
+  checkedAt: '2026-10-10 00:00',
+  fields: {},
+}
+const findConnection = (id?: string) => connections.find((c) => c.id === id) ?? MANAGED_AWS
+
 let connections: Connection[] = [
   {
     id: 'c1',
@@ -36,6 +52,8 @@ let connections: Connection[] = [
     detail: '계정 123456789012',
     checkedAt: '2026-10-07 13:40',
     fields: {},
+    accountId: '123456789012',
+    roleArn: 'arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole',
   },
   {
     id: 'c2',
@@ -106,7 +124,15 @@ export async function checkConnection(id: string): Promise<Connection> {
   let next: Connection = { ...c, checkedAt: now() }
   if (c.status === 'pending' && c.provider === 'aws') {
     // mock: 스택을 만들었다고 보고 연결 완료 처리
-    next = { ...next, status: 'connected', detail: '계정 ' + String(100000000000 + Math.floor(Math.random() * 9e11)), setupUrl: undefined }
+    const accountId = String(100000000000 + Math.floor(Math.random() * 9e11))
+    next = {
+      ...next,
+      status: 'connected',
+      detail: '계정 ' + accountId,
+      setupUrl: undefined,
+      accountId,
+      roleArn: `arn:aws:iam::${accountId}:role/PavedCloudsReadOnlyRole`,
+    }
   }
   if (c.status === 'pending' && c.provider === 'onprem' && Date.now() - (installIssuedAt.get(id) ?? Date.now()) > 6000) {
     // mock: 설치 스크립트가 서버 사양을 보고했다고 처리
@@ -130,9 +156,11 @@ export async function deleteConnection(id: string): Promise<void> {
 
 // ---------- 분석, 추천 ----------
 
-export async function analyze(source: Source, _scale: ScaleInput): Promise<Analysis> {
+export async function analyze(source: Source, _scale: ScaleInput, onUploaded?: () => void): Promise<Analysis> {
   failScenario = /fail/i.test(source.kind === 'zip' ? source.file.name : source.url)
-  await wait(source.kind === 'github' ? 2000 : 1400)
+  await wait(source.kind === 'github' ? 1200 : 600)
+  onUploaded?.()
+  await wait(2500)
   return {
     projectId: 'p_' + Math.random().toString(36).slice(2, 8),
     stack: [
@@ -166,6 +194,7 @@ const total = (resources: { monthlyUsd: number }[]) => resources.reduce((s, r) =
 export async function recommend(_projectId: string, scale: ScaleInput): Promise<Recommendation> {
   await wait(700)
   const usable = connections.filter((c) => c.status === 'connected' && isEnabled(c.provider))
+  if (!usable.some((c) => c.provider === 'aws')) usable.unshift(MANAGED_AWS)
   const options = usable.map((c) => ({
     connectionId: c.id,
     provider: c.provider,
@@ -220,7 +249,7 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
     options,
     assumptions: [
       `월 사용자 ${scale.expectedUsers}명, 월 예산 $${budget}, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
-      '클라우드는 서울 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
+      '클라우드는 상파울루(sa-east-1) 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
       '온프레미스는 전기, 회선 비용을 넣지 않음',
     ],
   }
@@ -234,7 +263,7 @@ export async function generate(_projectId: string, choice: Choice): Promise<Terr
 }
 
 function buildBundle(choice: Choice): TerraformBundle {
-  const conn = connections.find((c) => c.id === choice.connectionId)!
+  const conn = findConnection(choice.connectionId)
   const tier = findTier(conn.provider, choice.tier)
   const n = tier.resources.length
   return {
@@ -265,7 +294,7 @@ const HOST_PATCH = {
 
 export async function status(_projectId: string): Promise<DeployStatus> {
   await wait(120)
-  const conn = connections.find((c) => c.id === deployChoice?.connectionId)!
+  const conn = findConnection(deployChoice?.connectionId)
   const tier = findTier(conn.provider, deployChoice!.tier)
   const script = logScript(conn.provider, tier, conn.fields.host)
   const end = script[script.length - 1][0] + 1200
@@ -284,11 +313,46 @@ export async function status(_projectId: string): Promise<DeployStatus> {
       },
     }
   }
+  const appUrl = publicUrl(conn.provider, tier.key, conn.fields.host)
   return {
     state: 'success',
     log: [...log, '{"status":"ok"}', 'health check passed'],
-    url: publicUrl(conn.provider, tier.key, conn.fields.host),
+    url: appUrl,
+    domain: domainProgress(t - end),
   }
+}
+
+// ---------- 도메인 (mock) ----------
+// 실제 주소 발급·DNS·인증서는 백엔드·인프라 작업이 필요함. 여기서는 화면 흐름만 흉내.
+// 자동 주소의 도메인은 예시용 예약 도메인(.example)
+
+const WORDS = ['quiet', 'bright', 'swift', 'calm', 'lucky', 'river', 'otter', 'maple', 'cloud', 'pebble']
+let domainChoice: DomainChoice = { mode: 'auto', name: '' }
+let autoName = ''
+
+const appRecords = (name: string): DnsRecord[] => [
+  { type: 'CNAME', name, value: '배포 뒤 확정 (예: paved-alb-1203.sa-east-1.elb.amazonaws.com)', purpose: '도메인을 앱 주소로 연결' },
+  { type: 'CNAME', name: `_3f9a1c.${name}`, value: '_8d2e0b.acm-validations.aws', purpose: 'HTTPS 인증서 발급 확인용' },
+]
+
+export async function saveDomain(_projectId: string, choice: DomainChoice): Promise<DomainPlan> {
+  await wait(300)
+  domainChoice = choice
+  if (choice.mode === 'own') return { mode: 'own', name: choice.name, monthlyUsd: 0, records: appRecords(choice.name) }
+  const pick = () => WORDS[Math.floor(Math.random() * WORDS.length)]
+  autoName = `${pick()}-${pick()}-${Math.random().toString(16).slice(2, 6)}.apps.paved.example`
+  return { mode: 'auto', name: autoName, monthlyUsd: 0, records: [], note: '플랫폼 도메인 아래의 자동 주소라 추가 비용이 없습니다. 내 도메인은 아니며 HTTPS 인증서는 플랫폼이 관리합니다.' }
+}
+
+/** 앱 배포가 끝난 뒤 지난 시간(ms)에 따라 도메인 단계를 흉내 */
+function domainProgress(since: number): DomainStatus {
+  const name = domainChoice.mode === 'auto' ? autoName : domainChoice.name
+  if (since < 3000)
+    return domainChoice.mode === 'auto'
+      ? { state: 'waiting_dns', name, message: '주소를 앱에 연결하고 있습니다.' }
+      : { state: 'waiting_dns', name, message: '도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.', records: appRecords(name) }
+  if (since < 5000) return { state: 'issuing_cert', name, message: 'HTTPS를 준비하고 있습니다.' }
+  return { state: 'active', name, url: `https://${name}` }
 }
 
 export async function history(): Promise<DeployRecord[]> {
@@ -297,7 +361,7 @@ export async function history(): Promise<DeployRecord[]> {
 }
 
 const HISTORY: DeployRecord[] = [
-    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.ap-northeast-2.elb.amazonaws.com', createdAt: '2026-10-07 14:12' },
+    { id: 'd6', app: 'club-attendance', version: 'v3', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'success', url: 'https://club-attendance-alb.sa-east-1.elb.amazonaws.com', createdAt: '2026-10-07 14:12' },
     { id: 'd5', app: 'club-attendance', version: 'v2', tier: '권장', provider: 'aws', target: '개인 AWS', monthlyUsd: 50.45, status: 'failed', note: '헬스체크 실패 → 포트 수정 후 v3', createdAt: '2026-10-07 13:58' },
     { id: 'd4', app: 'club-attendance', version: 'v1', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', createdAt: '2026-10-05 18:03' },
     { id: 'd3', app: 'todo-api', version: 'v2', tier: '작게 시작', provider: 'onprem', target: '동아리방 서버', monthlyUsd: 0, status: 'success', url: 'http://192.168.0.24:8080', createdAt: '2026-10-04 11:30' },

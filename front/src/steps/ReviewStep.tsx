@@ -2,19 +2,29 @@ import { useState } from 'react'
 import CodeView from '../components/CodeView'
 import ProviderMark from '../components/ProviderMark'
 import { PROVIDERS } from '../providers'
-import type { Provider, TerraformBundle, Tier } from '../types'
-import { costText, countText, tierTotal } from '../format'
+import type { DomainPlan, Provider, TerraformBundle, Tier } from '../types'
+import { costText, countText, tierTotal, usd } from '../format'
 
 interface Props {
   bundle: TerraformBundle
   tier: Tier
   target: { name: string; provider: Provider }
+  /** 도메인 계획. null 이거나 mode none 이면 미리보기 주소 */
+  domain: DomainPlan | null
   confirmed: boolean
   locked: boolean
   onConfirm: (v: boolean) => void
 }
 
-export default function ReviewStep({ bundle, tier, target, confirmed, locked, onConfirm }: Props) {
+export default function ReviewStep({
+  bundle,
+  tier,
+  target,
+  domain,
+  confirmed,
+  locked,
+  onConfirm,
+}: Props) {
   const [tab, setTab] = useState('plan')
   const file = bundle.files.find((f) => f.name === tab)
   const { plan } = bundle
@@ -74,10 +84,43 @@ export default function ReviewStep({ bundle, tier, target, confirmed, locked, on
           <strong>{tier.label}</strong>
         </div>
         <div>
-          <span>월 예상</span>
+          <span>앱 월 예상</span>
           <strong>{costText(cost)}</strong>
         </div>
+        <div>
+          <span>도메인</span>
+          <strong>{domainSummary(domain)}</strong>
+        </div>
       </div>
+
+      <table className="table cost-breakdown">
+        <thead>
+          <tr>
+            <th>항목</th>
+            <th>내용</th>
+            <th className="num">매달</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>앱 ({tier.label})</td>
+            <td className="muted">{target.name}</td>
+            <td className="num">{costText(cost)}</td>
+          </tr>
+          <tr>
+            <td>주소</td>
+            <td className="muted mono">{domainDetail(domain)}</td>
+            <td className="num">{domain && domain.monthlyUsd > 0 ? usd(domain.monthlyUsd) : '-'}</td>
+          </tr>
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colSpan={2}>합계</td>
+            <td className="num">{usd(cost + (domain?.monthlyUsd ?? 0))}</td>
+          </tr>
+        </tfoot>
+      </table>
+      {domain?.note && <p className="hint">{domain.note}</p>}
 
       {bundle.planInfo && (
         <dl className="plan-info">
@@ -143,6 +186,17 @@ export default function ReviewStep({ bundle, tier, target, confirmed, locked, on
           </small>
         </span>
       </label>
+
     </div>
   )
+}
+
+function domainSummary(domain: DomainPlan | null) {
+  if (!domain || domain.mode === 'none') return '미리보기 주소'
+  return domain.mode === 'auto' ? '자동 주소 (플랫폼)' : '보유 도메인'
+}
+
+function domainDetail(domain: DomainPlan | null) {
+  if (!domain || domain.mode === 'none') return 'AWS 기본 주소 (미리보기, 도메인 미연결)'
+  return `${domain.name ?? '배포 뒤 확정'} (${domain.mode === 'auto' ? '플랫폼 도메인의 자동 주소' : '가지고 있는 도메인 연결'})`
 }

@@ -35,14 +35,7 @@ export default function App() {
       <main className="container">
         {/* 탭을 옮겨도 진행 중인 배포 상태가 날아가지 않게 숨기기만 함 */}
         <div hidden={page !== 'new'}>
-          <NewDeploy
-            connections={connections ?? []}
-            connectionsError={connError}
-            onReloadConnections={loadConnections}
-            onConnectionsChange={setConnections}
-            onShowHistory={() => setPage('history')}
-            onShowConnections={() => setPage('targets')}
-          />
+          <NewDeploy onShowHistory={() => setPage('history')} />
         </div>
         {page === 'history' && <History />}
         {page === 'targets' && (

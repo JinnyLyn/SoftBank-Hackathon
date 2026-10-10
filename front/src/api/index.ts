@@ -4,7 +4,8 @@ import * as backend from './real'
 export { sourceName } from '../format'
 export { ApiError } from './http'
 
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false'
+// 기본은 실제 백엔드. 백엔드 없이 화면만 볼 때 VITE_USE_MOCK=true
+const USE_MOCK = import.meta.env.VITE_USE_MOCK === 'true'
 
 /** 화면에 MOCK 표시를 띄울지. 모의 결과를 실제 배포로 오해하지 않게 */
 export const IS_MOCK = USE_MOCK
@@ -23,6 +24,7 @@ type Api = Pick<
   | 'applyFix'
   | 'status'
   | 'history'
+  | 'saveDomain'
 >
 
 export const api: Api = USE_MOCK ? mock : backend
