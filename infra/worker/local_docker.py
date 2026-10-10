@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 HERE = Path(__file__).resolve().parent
 INFRA = HERE.parent
@@ -457,14 +457,17 @@ def extract_zip(src, dst):
 
 def build_image(lc, zip_path, dockerfile, image):
     """승인된 소스 ZIP에서 이미지를 만든다(이 PC의 Docker에만 남고 어디에도 올리지 않는다). 압축을 푼 임시 폴더는 항상 지운다."""
-    if not isinstance(dockerfile, str) or not dockerfile or dockerfile.startswith("/") or ".." in dockerfile or len(dockerfile) > 200:
+    if (not isinstance(dockerfile, str) or not dockerfile or len(dockerfile) > 200
+            or PureWindowsPath(dockerfile).anchor or ".." in dockerfile):
         raise LocalError("invalid_job", f"dockerfile 경로가 올바르지 않습니다: {dockerfile!r}")
     if not IMAGE_RE.match(image or ""):
         raise LocalError("invalid_job", f"이미지 이름이 올바르지 않습니다: {image!r}")
     work = Path(tempfile.mkdtemp(prefix="pc-local-build-"))
     try:
-        ctx = extract_zip(zip_path, work / "src")
-        df = ctx / dockerfile
+        ctx = extract_zip(zip_path, work / "src").resolve()
+        df = (ctx / dockerfile.replace("\\", "/")).resolve()
+        if not df.is_relative_to(ctx):
+            raise LocalError("invalid_job", f"dockerfile 경로가 소스 폴더 밖을 가리킵니다: {dockerfile!r}")
         if not df.is_file():
             raise LocalError("build_failed", f"Dockerfile을 찾지 못했습니다: {dockerfile}")
         env = docker_env()

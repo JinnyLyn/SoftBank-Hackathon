@@ -443,6 +443,48 @@ class ApplyTests(DockerBase):
         self.assertEqual(cm.exception.event_type, "build_failed")
         self.assertEqual(self.calls(), [])   # Dockerfile이 없으면 docker를 부르지 않는다
 
+    def test_build_rejects_windows_and_posix_host_paths_before_extraction(self):
+        paths = (r"C:\host\Dockerfile", "C:/host/Dockerfile", "C:Dockerfile",
+                 r"\\server\share\Dockerfile", r"\host\Dockerfile", "/host/Dockerfile",
+                 "../Dockerfile", r"app\..\Dockerfile", "app/../Dockerfile")
+        with mock.patch.object(local_docker, "extract_zip") as extract:
+            for dockerfile in paths:
+                with self.subTest(dockerfile=dockerfile):
+                    with self.assertRaises(local_docker.LocalError) as cm:
+                        local_docker.build_image(self.lc, self.tmp / "src.zip", dockerfile, self.plan["variables"]["image"])
+                    self.assertEqual(cm.exception.event_type, "invalid_job")
+            extract.assert_not_called()
+        self.assertEqual(self.calls(), [])
+
+    def test_build_checks_resolved_dockerfile_stays_inside_context(self):
+        ctx = self.tmp / "context"
+        ctx.mkdir()
+        (ctx / "Dockerfile").write_text("FROM scratch", encoding="utf-8")
+        outside = self.tmp / "context-other" / "Dockerfile"
+        original_resolve = Path.resolve
+
+        def resolve(path, *args, **kwargs):
+            # 플랫폼별 symlink 생성 권한 없이 경로 해석 결과가 외부인 경우를 검증한다.
+            return outside if path == ctx / "Dockerfile" else original_resolve(path, *args, **kwargs)
+
+        with (
+            mock.patch.object(local_docker, "extract_zip", return_value=ctx),
+            mock.patch.object(Path, "resolve", resolve),
+            self.assertRaises(local_docker.LocalError) as cm,
+        ):
+            local_docker.build_image(self.lc, self.tmp / "src.zip", "Dockerfile", self.plan["variables"]["image"])
+        self.assertEqual(cm.exception.event_type, "invalid_job")
+        self.assertEqual(self.calls(), [])
+
+    def test_build_normalizes_safe_nested_dockerfile_paths(self):
+        zp = make_zip(self.tmp / "src.zip", {"repo/app/Dockerfile": "FROM scratch"})
+        for dockerfile in ("app/./Dockerfile", r"app\Dockerfile"):
+            with self.subTest(dockerfile=dockerfile):
+                local_docker.build_image(self.lc, zp, dockerfile, self.plan["variables"]["image"])
+                build = [args for args in self.calls() if args[0] == "build"][-1]
+                ctx = Path(build[-1])
+                self.assertEqual(Path(build[build.index("-f") + 1]), ctx / "app" / "Dockerfile")
+
     def test_apply_success_writes_compose_and_private_secrets(self):
         seen = []
         self.apply(on_deploying=lambda: seen.append(self.subcommands()[:]))

@@ -175,13 +175,13 @@ export default function ReviewStep({
         />
         <span>
           {isServer
-            ? `${target.name}에 띄울 컨테이너 ${countText(plan.add)}개를 확인했습니다.`
+            ? `${target.name}에 띄울 컨테이너 ${countText(plan.add)}개와 실행 설정(설정된 초기화 명령 포함)을 확인했습니다.`
             : plan.add === null
               ? `배포 계획과 월 예상 비용 ${costText(cost)}을 확인했습니다.`
               : `만들어질 리소스 ${plan.add}개와 월 예상 비용 ${costText(cost)}을 확인했습니다.`}
           <small>
             {isServer
-              ? `승인하면 ${target.name}의 Docker에서 이미지를 빌드하고 docker compose up 을 실행합니다.`
+              ? `승인하면 ${target.name}의 Docker에서 이미지를 빌드하고 docker compose up 및 설정된 초기화 명령을 실행합니다.`
               : `승인하면 ${target.name}에 실제로 리소스가 생기고 비용이 나가기 시작합니다.`}
           </small>
         </span>

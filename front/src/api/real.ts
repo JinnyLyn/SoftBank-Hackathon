@@ -241,13 +241,16 @@ function toTier(p: PlanOut, key: TierKey): Tier {
   }
 }
 
-/** 온프레미스(로컬 Docker) 계획: 검토·승인 대상은 compose 파일. 그 SHA-256이 백엔드의 승인 식별자(fingerprint)에 들어 있음 */
+/** 온프레미스(로컬 Docker) 계획: 검토·승인 대상은 compose 파일과 실행 변수. compose의 SHA-256이 백엔드의 승인 식별자(fingerprint)에 들어 있음 */
 function toComposeBundle(p: PlanOut): TerraformBundle {
   const v = p.variables
   const containers = Array.isArray(v.resources) ? v.resources.length : null
   return {
     tool: 'compose',
-    files: [{ name: 'docker-compose.yml', content: str(v.compose_yaml) }],
+    files: [
+      { name: 'docker-compose.yml', content: str(v.compose_yaml) },
+      { name: 'local-plan.variables.json', content: JSON.stringify(v, null, 2) },
+    ],
     plan: {
       add: containers,
       change: containers === null ? null : 0,

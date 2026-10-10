@@ -65,7 +65,7 @@ python3 scripts/ci/check_pr_report.py --body-file /path/to/pr-body.md
 | `CI coverage` | 항상 | 파일 계약·검사 판정·실패 진단의 회귀 테스트 | 플랫폼 동작 |
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
-| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
+| `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, `node scripts/ci/test_platform_front.mjs`의 승인 파일 어댑터 회귀(HTTP 대역), TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
 | `Platform backend (API smoke and MySQL contracts)` | `back/` 구현 존재 | `.python-version`·requirements 기반 설치, 문법·DB 없는 smoke, 마스킹 회귀, 백엔드 Docker 빌드, 격리 MySQL 8.4 migration·재실행, 첫 실패 롤백 차단, 새 plan/diff 승인·claim, 오래된 승인·동시 등록 차단, 실제 API의 비밀 저장 거부·로그 마스킹 | 프런트 연동, LLM·AWS Terraform/ECS 실행, 업로드 앱 이미지 빌드 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
