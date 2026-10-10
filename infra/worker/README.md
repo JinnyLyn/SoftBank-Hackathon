@@ -94,18 +94,22 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 ### Fargate vCPU 할당량
 
-예산만으로 `max_tasks`를 정하면 계정의 Fargate 할당량보다 큰 최대 구성이 나올 수 있다. AWS 문서의 기본 할당량("Fargate On-Demand vCPU resource count")은 **리전당 6 vCPU**라서, 예를 들어 월 $1000의 최대 안(medium 14개 = 14 vCPU)은 승인해도 최대 용량까지 늘지 못한다. 그래서 planner는 `foundation-info` 다음에 `fetch_fargate_capacity`로 한도를 읽고, 모든 안의 부하 최대 vCPU가 **남은 vCPU = 할당량 - 사용 중** 안에 들게 `max_tasks`를 줄인다(`cost.recommend(..., max_vcpu=)`).
+예산만으로 `max_tasks`를 정하면 계정의 Fargate 할당량보다 큰 최대 구성이 나올 수 있다. AWS 문서의 기본 할당량("Fargate On-Demand vCPU resource count")은 **리전당 6 vCPU**라서, 예를 들어 월 $1000의 최대 안(medium 14개 = 14 vCPU)은 승인해도 최대 용량까지 늘지 못한다. 그래서 planner는 `foundation-info` 다음에 `fetch_fargate_capacity`로 한도를 읽고, 모든 안의 부하 최대 vCPU가 **남은 vCPU = 할당량 - 사용 중 - 예약** 안에 들게 `max_tasks`를 줄인다(`cost.recommend(..., max_vcpu=)`).
+
+- **예약**: 승인 대기(`awaiting_approval`)·승인된(`approved`) 다른 프로젝트의 계획은 아직 배포되지 않아 CloudWatch 사용량에 없지만, 승인되면 최대 vCPU를 쓴다. 그래서 새 계획을 만들 때마다 백엔드의 모든 프로젝트 계획에서 이 상태의 계획이 쓸 최대 vCPU(`variables.cost.peak_vcpu`, 이 값이 없는 옛 계획은 `variables.app`의 `task_size` × `max_tasks`)를 합쳐 남은 vCPU에서 뺀다(`reserved_vcpu`). 같은 점검에서 먼저 만든 계획도 백엔드에 이미 등록돼 있어 다음 계획에 반영되므로, 할당량 6 vCPU를 두 신규 프로젝트가 각각 6씩 받아 합계 12 vCPU의 계획이 되지 않는다.
+- 배포된(`consumed`) 계획은 예약하지 않는다. 이미 사용량에 잡히고, 삭제·실패한 배포의 예약이 영원히 남아 새 계획을 잘못 거절하는 것을 막기 위해서다.
+- **기다림**: 다른 계획의 예약 때문에 계획을 못 만들지만 예약이 없었다면 만들 수 있었으면, 실패로 세지 않고 `retry_after`(120초)마다 다시 시도한다(`CapacityWait`, 로그에 "계획 대기"). 그 계획이 승인·배포·대체되면 예약이 풀려 계획된다. 예약과 무관하게 할당량이 모자라면 이전처럼 실패로 센다(3회 후 중단).
 
 - 할당량: `aws service-quotas get-service-quota --service-code fargate --quota-code L-3032A538`. 적용된 값이 없는 계정은 `get-aws-default-service-quota`로 기본값을 읽는다.
 - 할당량은 계정마다 다르다. 기본은 6이지만 증설된 계정이 있다(개발 계정에서는 512 vCPU로 조회됐다). 코드는 값을 박지 않고 항상 읽는다.
 - 사용 중인 vCPU: CloudWatch `AWS/Usage`의 `ResourceCount`(차원 `Service=Fargate`, `Type=Resource`, `Resource=vCPU`, `Class=Standard/OnDemand`, 단위 vCPU)의 최근 30분 최댓값. 할당량 응답에 `UsageMetric`이 있으면 그 네임스페이스·차원을 우선한다. 데이터가 없으면 0으로 본다. 이 계정·리전의 모든 Fargate 작업(다른 앱 포함)이 포함된다.
 - 줄어든 안은 `options[].quota_limited=true`이고 이유 문구에 "Fargate 할당량(남은 N vCPU)"이 들어간다. 최소 구성도 못 담는 안은 빠지고, 가장 작은 안(0.25 vCPU)도 못 담으면 계획을 만들지 않고 이유와 함께 종료한다.
 - **읽지 못하면 멈춘다.** 한도를 모른 채 추천하지 않고 `PlanError`로 종료한다(`fetch_foundation`과 같은 원칙). 배포 계정에 `servicequotas:GetServiceQuota`, `servicequotas:GetAWSDefaultServiceQuota`, `cloudwatch:GetMetricStatistics` 권한이 필요하다. 권한이 없는 계정에서는 `--skip-quota-check`로 worker를 실행하면 조회를 건너뛰며(계획 요약에 "할당량 확인을 건너뜀"이 남는다) 이때는 할당량보다 큰 구성이 추천될 수 있다.
-- 한계: 현재 사용 중인 vCPU만 뺀다. 다른 앱이 부하로 최대까지 늘어날 때 쓸 몫은 따로 잡아 두지 않으므로, 여러 앱의 최대치를 합치면 할당량을 넘을 수 있다. 롤링 배포 중 옛·새 태스크가 함께 떠 있는 순간의 vCPU도 반영하지 않는다. 지표는 몇 분 늦게 올라온다.
+- 한계: **이미 배포된 앱이 오토스케일링으로 최대까지 늘어날 때 쓸 몫은 잡지 않는다.** 배포된 앱은 현재 사용 중인 vCPU만 반영되므로, 평소 적게 쓰는 여러 앱이 동시에 최대로 늘면 할당량을 넘을 수 있다(예약은 승인 대기·승인된 계획에만 한다). approved 계획이 이미 태스크를 띄운 뒤에는 그 몫이 사용량과 예약에 함께 잡혀 보수적이다. 롤링 배포 중 옛·새 태스크가 함께 떠 있는 순간의 vCPU도 반영하지 않고, 지표는 몇 분 늦게 올라온다. 두 worker가 동시에 계획하는 경우의 경합도 막지 않는다(worker는 한 대를 전제로 한다). 승인·apply 직전의 용량 재검증은 하지 않는다.
 
 ### 계획 변수 (프런트가 읽는 키)
 
-`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`(`app_monthly`, `shared_monthly`, `peak_monthly`, `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
+`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`(`app_monthly`, `shared_monthly`, `peak_monthly`, `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `reserved_vcpu`(승인 대기·승인된 다른 계획의 예약), `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
 현재는 **권장 단계 하나만** 계획으로 등록하고, 나머지 안은 `options`로 비교 정보만 알린다. 단계마다 Terraform 저장 계획이 따로 필요한데 한 배포 폴더에는 계획 하나만 둘 수 있어서, 단계 비교용 여러 계획은 아직 만들지 않았다(프런트 `README`의 "추천 비교표"는 계획이 하나면 그 하나만 보여 준다). 사용자가 다른 안을 고르는 흐름(선택한 안을 worker에 전달해 그 안으로 다시 계획)은 백엔드·프런트와 계약을 맞춰야 한다(`docs/OPEN_QUESTIONS.md`).
 
 ## executor: 승인된 작업 실행

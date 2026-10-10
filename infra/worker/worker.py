@@ -91,6 +91,10 @@ class PlanError(Exception):
     """계획을 만들 수 없는 프로젝트(분석 결과 부족, 예산 초과 등)."""
 
 
+class CapacityWait(PlanError):
+    """다른 계획이 예약한 Fargate vCPU 때문에 지금은 계획을 만들 수 없다. 그 계획이 처리되면 만들 수 있어서 실패로 세지 않고 기다린다."""
+
+
 class ApiError(Exception):
     def __init__(self, status, body):
         super().__init__(f"HTTP {status}: {body[:200]}")
@@ -454,6 +458,47 @@ def fetch_fargate_capacity(cfg, env):
     return {"quota_vcpu": float(value), "used_vcpu": used, "available_vcpu": max(float(value) - used, 0.0)}
 
 
+# 아직 배포되지 않아 CloudWatch 사용량에는 없지만 승인되면 최대 vCPU를 쓰는 계획. 이 상태의 계획이 쓸 몫은 새 계획에서 미리 뺀다.
+# 배포된 계획(consumed)은 뺀다: 이미 사용량에 잡히고, 삭제·실패한 배포의 예약이 영원히 남아 새 계획을 잘못 거절하는 것을 막으려고
+RESERVING_PLAN_STATUSES = ("awaiting_approval", "approved")
+
+
+def plan_peak_vcpu(plan):
+    """등록된 계획이 부하가 최대일 때 쓰는 vCPU. variables.cost.peak_vcpu를 읽고, 없으면(이 값이 생기기 전의 계획) 앱 설정(task_size × max_tasks)으로
+    계산한다. 읽을 수 없으면 None."""
+    v = plan.get("variables") if isinstance(plan, dict) else None
+    v = v if isinstance(v, dict) else {}
+    c = v.get("cost") if isinstance(v.get("cost"), dict) else {}
+    peak = c.get("peak_vcpu")
+    if isinstance(peak, (int, float)) and not isinstance(peak, bool) and math.isfinite(peak) and peak >= 0:
+        return float(peak)
+    app = v.get("app") if isinstance(v.get("app"), dict) else {}
+    size, n = app.get("task_size"), app.get("max_tasks")
+    if size in cost.SIZES and isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+        return cost.SIZES[size][0] * n
+    return None
+
+
+def reserved_vcpu(api, project_id):
+    """다른 프로젝트의 승인 대기·승인된 계획이 승인되면 쓸 최대 vCPU의 합. 같은 순회에서 먼저 만든 계획도 백엔드에 이미 등록돼 있어 여기에 잡힌다.
+    같은 몫을 두 계획에 나눠 주지 않으려고 새 계획의 남은 vCPU에서 이 값을 뺀다. 읽지 못하면 ApiError를 그대로 올린다(예약을 모른 채 계획하지 않는다).
+    한계: approved 계획이 이미 태스크를 띄운 뒤에도 사용량과 예약에 함께 잡혀 그 몫만큼 보수적이다."""
+    total = 0.0
+    for other in list_projects(api):
+        pid = other.get("id")
+        if pid == project_id:
+            continue   # 이 프로젝트는 활성 계획이 없을 때만 계획한다(plan_pending)
+        for plan in api.get(f"/api/projects/{pid}/plans") or []:
+            if plan.get("status") not in RESERVING_PLAN_STATUSES:
+                continue
+            peak = plan_peak_vcpu(plan)
+            if peak is None:
+                log(f"계획 {plan.get('id')}: 최대 vCPU를 읽지 못해 예약에 넣지 않습니다(variables.cost.peak_vcpu 또는 variables.app 확인)")
+                continue
+            total += peak
+    return total
+
+
 def upload_plan(api, plan_id, plan_file):
     """plan 파일을 백엔드에 올린다. 연결 실패·5xx는 몇 번 다시 시도한다."""
     for attempt in range(REPORT_RETRIES):
@@ -513,8 +558,17 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     env = child_env(cfg)
     foundation = fetch_foundation(cfg, env)   # 비용을 확정하기 전에 최신 foundation 구성을 읽는다
     capacity = fetch_fargate_capacity(cfg, env) if cfg.quota_check else None   # 최대 구성이 Fargate vCPU 할당량을 넘지 않게 한도를 읽는다
+    reserved = 0.0
+    if capacity:
+        # 승인 대기·승인된 다른 계획은 아직 사용량에 없지만 승인되면 최대 vCPU를 쓴다. 같은 남은 몫을 두 계획에 나눠 주지 않으려고 미리 뺀다
+        reserved = capacity["reserved_vcpu"] = reserved_vcpu(api, project["id"])
+        capacity["available_vcpu"] = max(capacity["quota_vcpu"] - capacity["used_vcpu"] - reserved, 0.0)
     rec = cost.recommend(users, pattern, budget, prices, arch, foundation, capacity["available_vcpu"] if capacity else None)
     if rec["recommended"] is None:
+        # 다른 계획의 예약이 없었다면 만들 수 있었을 때는 영구 실패가 아니라 기다린다(그 계획이 승인·대체되면 예약이 풀린다)
+        if reserved > 0 and cost.recommend(users, pattern, budget, prices, arch, foundation,
+                                           max(capacity["quota_vcpu"] - capacity["used_vcpu"], 0.0))["recommended"] is not None:
+            raise CapacityWait(f"{rec['reason']} 승인 대기·승인된 다른 계획이 {reserved:g} vCPU를 예약 중이라 그 계획이 처리되면 다시 계획합니다")
         raise PlanError(rec["reason"])
     tier = rec["recommended"]
     est = rec["estimates"][tier]
@@ -561,7 +615,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         "resources": est["resources"],
         "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "peak_monthly": est["peak_monthly"],
                  "peak_vcpu": est["peak_vcpu"], "budget_usd": budget, "excluded": est["excluded"]},
-        # Fargate On-Demand vCPU 할당량 조회 결과(quota_vcpu, used_vcpu, available_vcpu). 조회를 건너뛰었으면 None
+        # Fargate On-Demand vCPU 할당량 조회 결과(quota_vcpu, used_vcpu, reserved_vcpu, available_vcpu). 조회를 건너뛰었으면 None
         "fargate_vcpu": capacity,
         # 최저·평균·최대 금액 순의 비교 안. 승인 화면이 세 안을 나란히 보여주는 데 쓴다(선택한 안은 recommended=True)
         "options": rec["options"],
@@ -573,7 +627,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
         f"부하가 최대일 때(태스크 {app['max_tasks']}개) 월 ${est['peak_monthly']:.2f}"
         + (f", 월 예산 ${budget:.2f} 이내" if budget is not None else ", 월 예산 입력 없음"),
-        (f"Fargate vCPU 할당량: 한도 {capacity['quota_vcpu']:g}, 사용 중 {capacity['used_vcpu']:g}, 남은 {capacity['available_vcpu']:g}. "
+        (f"Fargate vCPU 할당량: 한도 {capacity['quota_vcpu']:g}, 사용 중 {capacity['used_vcpu']:g}, "
+         f"승인 대기·승인된 다른 계획이 예약 {capacity['reserved_vcpu']:g}, 남은 {capacity['available_vcpu']:g}. "
          f"부하가 최대일 때 이 앱은 {est['peak_vcpu']:g} vCPU" if capacity else
          f"Fargate vCPU 할당량 확인을 건너뜀(--skip-quota-check): 부하가 최대일 때 이 앱은 {est['peak_vcpu']:g} vCPU이며 할당량 안인지 확인하지 않았다"),
         f"안 비교(평소·최대 월 비용): {comparison}",
@@ -880,6 +935,7 @@ def verify_connections(api, cfg, state):
 @dataclass
 class State:
     failures: dict = field(default_factory=dict)   # 프로젝트 id → (실패 횟수, 마지막 시각)
+    waiting: dict = field(default_factory=dict)    # 프로젝트 id → 다른 계획이 예약한 vCPU 때문에 기다리기 시작한 시각. 실패 횟수에 세지 않고 retry_after마다 다시 시도한다
     done: dict = field(default_factory=dict)       # 프로젝트 id → 활성 계획이 있는 것을 마지막으로 확인한 시각(time.time())
     repair: set = field(default_factory=set)       # plan 파일 업로드가 남은 프로젝트(점검마다 다시 올린다)
     recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
@@ -917,6 +973,8 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
         tries, last = state.failures.get(pid, (0, 0.0))
         if pid not in state.repair and (tries >= state.max_tries or (tries and time.time() - last < state.retry_after)):
             continue
+        if pid in state.waiting and pid not in state.repair and time.time() - state.waiting[pid] < state.retry_after:
+            continue   # 다른 계획이 예약한 vCPU를 기다리는 중이다(계획이 처리되면 풀린다)
         plans = api.get(f"/api/projects/{pid}/plans") or []
         if repair_plan_uploads(api, cfg, plans):
             state.repair.add(pid)
@@ -936,8 +994,13 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
         try:
             plan = plan_project(api, cfg, project, analysis, prices, arch)
             state.done[pid] = time.time()
+            state.waiting.pop(pid, None)
             if plan.get("_upload_pending"):
                 state.repair.add(pid)
+        except CapacityWait as e:
+            if pid not in state.waiting:   # 같은 사유로 기다리는 동안은 매번 로그를 남기지 않는다
+                log(f"계획 대기(프로젝트 {pid}): {redact(str(e))[:300]}")
+            state.waiting[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(잘못된 분석 결과 등)가 worker 전체를 멈추지 않게 한다
             state.failures[pid] = (tries + 1, time.time())
             expected = isinstance(e, (PlanError, ApiError, subprocess.TimeoutExpired, OSError))

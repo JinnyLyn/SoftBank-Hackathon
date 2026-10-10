@@ -674,14 +674,14 @@ class PlannerTests(Base):
         self.quota_plan()
         body = self.backend.created_plans[0]
         v = body["variables"]
-        self.assertEqual(v["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 2.0, "available_vcpu": 4.0})
+        self.assertEqual(v["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 2.0, "reserved_vcpu": 0.0, "available_vcpu": 4.0})
         self.assertEqual((v["tier"], v["app"]["task_size"], v["app"]["min_tasks"], v["app"]["max_tasks"]), ("roomy", "medium", 2, 4))
         self.assertEqual(v["cost"]["peak_vcpu"], 4.0)
         top = v["options"][-1]
         self.assertEqual((top["max_tasks"], top["peak_vcpu"], top["quota_limited"]), (4, 4.0, True))
         self.assertTrue(all(o["peak_vcpu"] <= 4 for o in v["options"]))
         self.assertIn("할당량(남은 4 vCPU)", v["reason"])
-        self.assertIn("Fargate vCPU 할당량: 한도 6, 사용 중 2, 남은 4", body["summary"])
+        self.assertIn("Fargate vCPU 할당량: 한도 6, 사용 중 2, 승인 대기·승인된 다른 계획이 예약 0, 남은 4", body["summary"])
         # 할당량 조회 → 사용량 조회 순서이고, 문서에서 확인한 이름·차원·리전을 쓴다
         quota, usage = [c for c in self.aws_calls() if c.startswith(("service-quotas", "cloudwatch"))]
         self.assertIn("service-quotas get-service-quota --service-code fargate --quota-code L-3032A538", quota)
@@ -693,7 +693,8 @@ class PlannerTests(Base):
     def test_usage_is_the_maximum_over_the_window_and_zero_without_datapoints(self):
         os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="none")   # 지표가 비어 있다 = 그 시간 동안 실행 중인 작업이 없었다
         self.quota_plan()
-        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 0.0, "available_vcpu": 6.0})
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"],
+                         {"quota_vcpu": 6.0, "used_vcpu": 0.0, "reserved_vcpu": 0.0, "available_vcpu": 6.0})
 
     def test_usage_dimensions_fall_back_to_the_documented_ones_without_usage_metric(self):
         os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="1", FAKE_QUOTA_NOMETRIC="1")
@@ -732,6 +733,107 @@ class PlannerTests(Base):
                 self.assertIn("--skip-quota-check", msg)
                 self.assertEqual(self.backend.created_plans, [])
                 self.assertFalse(any(c.startswith("up ") for c in self.calls()))   # 한도를 모른 채로 계획을 만들지 않는다
+
+    # --- 승인 대기·승인된 계획의 vCPU 예약 ---------------------------------------------------------------
+    P2_ID = "22222222-2222-2222-2222-222222222222"
+
+    def two_projects(self, budget="1000.0000"):
+        """예산이 큰 신규 프로젝트 둘(분석 결과에는 scale이 없다). 할당량 한 몫을 둘이 나눠 가져야 하는 상황을 만든다."""
+        res = json.loads(json.dumps(GOOD_RESULT))
+        del res["scale"]
+        projects = []
+        for pid, name in ((PROJECT["id"], "A"), (self.P2_ID, "B")):
+            projects.append({**PROJECT, "id": pid, "name": name, "expected_users": "~10,000", "traffic_pattern": "steady", "monthly_budget_usd": budget})
+            self.backend.analyses[pid] = {"id": "aa-" + name, "project_id": pid, "result": res}
+        self.backend.projects = projects
+        return projects
+
+    def test_plans_created_in_the_same_pass_do_not_share_the_same_vcpu(self):
+        # 할당량 6 vCPU. 첫 프로젝트가 예산 안에서 가능한 최대(6 vCPU)를 받으면 두 번째는 같은 몫을 또 받지 못한다
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="0")
+        p1, p2 = self.two_projects()
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)   # 합계 12 vCPU의 계획 두 개가 승인되지 않는다
+        first = self.backend.created_plans[0]["variables"]
+        self.assertEqual((first["cost"]["peak_vcpu"], first["fargate_vcpu"]["reserved_vcpu"]), (6.0, 0.0))
+        self.assertIn(p2["id"], state.waiting)
+        self.assertNotIn(p2["id"], state.failures)   # 용량이 풀리면 만들 수 있어서 실패로 세지 않는다
+        # 몇 번을 다시 점검해도 실패 횟수가 쌓여 영구 중단되지 않는다(max_tries 3회를 넘겨도 계속 기다린다)
+        for _ in range(state.max_tries + 2):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertNotIn(p2["id"], state.failures)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        # 첫 계획이 배포돼 consumed가 되면 예약은 풀리고 실제 사용량(2 vCPU)만 남는다 → 두 번째 프로젝트가 나머지 4 vCPU 안에서 계획된다
+        self.backend.plans[p1["id"]][0]["status"] = "consumed"
+        os.environ["FAKE_QUOTA_USED"] = "2"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2)
+        second = self.backend.created_plans[1]["variables"]
+        self.assertEqual(second["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 2.0, "reserved_vcpu": 0.0, "available_vcpu": 4.0})
+        self.assertLessEqual(second["cost"]["peak_vcpu"], 4)
+        self.assertNotIn(p2["id"], state.waiting)
+
+    def test_a_pending_plan_reserves_its_peak_vcpu_for_the_next_plan(self):
+        # 할당량 8, 첫 프로젝트 예산이 작아 2 vCPU만 쓰는 계획 → 두 번째는 남은 6 vCPU를 받는다(예약이 전체를 막지 않는다)
+        os.environ.update(FAKE_QUOTA_VALUE="8", FAKE_QUOTA_USED="0")
+        p1, p2 = self.two_projects()
+        p1["monthly_budget_usd"] = "200.0000"   # 최대 안: medium 2개(약 $199.73) = 2 vCPU
+        worker.plan_pending(self.api, self.cfg, worker.State(retry_after=0.0, recheck_after=0.0))
+        self.assertEqual(len(self.backend.created_plans), 2)
+        first, second = (p["variables"] for p in self.backend.created_plans)
+        self.assertEqual(first["cost"]["peak_vcpu"], 2.0)
+        self.assertEqual(second["fargate_vcpu"], {"quota_vcpu": 8.0, "used_vcpu": 0.0, "reserved_vcpu": 2.0, "available_vcpu": 6.0})
+        self.assertLessEqual(second["cost"]["peak_vcpu"], 6)
+        self.assertIn("예약 2, 남은 6", self.backend.created_plans[1]["summary"])
+
+    def test_waiting_projects_are_not_retried_until_retry_after(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="0")
+        _, p2 = self.two_projects()
+        state = worker.State(retry_after=3600.0, recheck_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertIn(p2["id"], state.waiting)
+        before = len(self.aws_calls())
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.aws_calls()), before)   # 기다리는 프로젝트는 간격 안에서는 AWS를 다시 부르지 않는다
+
+    def test_shortage_without_any_reservation_is_still_a_counted_failure(self):
+        os.environ.update(FAKE_QUOTA_VALUE="0.1", FAKE_QUOTA_USED="0")   # 가장 작은 구성(0.25 vCPU)도 못 담는 계정
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(state.failures[p1["id"]][0], 1)   # 예약 때문이 아니면 기다려도 풀리지 않으므로 실패로 센다
+        self.assertEqual(state.waiting, {})
+        self.assertEqual(self.backend.created_plans, [])
+
+    def test_reserved_vcpu_sums_only_pending_plans_of_other_projects(self):
+        os.environ.update(FAKE_QUOTA_VALUE="100")
+        p1, p2 = self.two_projects()
+        legacy = {"variables": {"app": {"task_size": "medium", "max_tasks": 2}}}   # cost.peak_vcpu가 생기기 전의 계획: 1 vCPU x 2
+        self.backend.plans = {
+            p1["id"]: [{"id": "own", "status": "awaiting_approval", "variables": {"cost": {"peak_vcpu": 50}}}],   # 계획하려는 프로젝트 자신은 뺀다
+            p2["id"]: [
+                {"id": "a", "status": "awaiting_approval", "variables": {"cost": {"peak_vcpu": 3}}},
+                {"id": "b", "status": "approved", **legacy},
+                {"id": "c", "status": "consumed", "variables": {"cost": {"peak_vcpu": 10}}},     # 배포됨: 사용량에 이미 있다
+                {"id": "d", "status": "superseded", "variables": {"cost": {"peak_vcpu": 20}}},   # 대체됨
+                {"id": "e", "status": "awaiting_approval", "variables": "broken"},               # 읽을 수 없으면 건너뛴다
+            ],
+        }
+        self.assertEqual(worker.reserved_vcpu(self.api, p1["id"]), 5.0)
+        self.assertEqual(worker.reserved_vcpu(self.api, "no-such-project"), 5.0 + 50.0)   # 자신이 아니면 그 계획도 센다
+
+    def test_plan_peak_vcpu_reads_cost_then_app_and_rejects_garbage(self):
+        peak = worker.plan_peak_vcpu
+        self.assertEqual(peak({"variables": {"cost": {"peak_vcpu": 4.5}}}), 4.5)
+        self.assertEqual(peak({"variables": {"cost": {"peak_vcpu": 0}}}), 0.0)
+        self.assertEqual(peak({"variables": {"app": {"task_size": "large", "max_tasks": 3}}}), 6.0)   # 2 vCPU x 3
+        for bad in (None, {}, {"variables": None}, {"variables": {"cost": {"peak_vcpu": True}}}, {"variables": {"cost": {"peak_vcpu": -1}}},
+                    {"variables": {"cost": {"peak_vcpu": float("nan")}}}, {"variables": {"app": {"task_size": "huge", "max_tasks": 2}}},
+                    {"variables": {"app": {"task_size": "small", "max_tasks": True}}}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(peak(bad))
 
     def test_skip_quota_check_does_not_call_aws_and_says_so(self):
         os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_FAIL="all")   # 조회했다면 실패했을 환경
