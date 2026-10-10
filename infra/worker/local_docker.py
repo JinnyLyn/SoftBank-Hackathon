@@ -302,7 +302,8 @@ def public_url(v):
     return f"http://{host}:{port}"
 
 
-def make_plan(*, deploy_id, image, dockerfile, app, source_sha256, tier, profile, reasons, host_port, bind, public_host, docker_info):
+def make_plan(*, deploy_id, image, dockerfile, app, source_sha256, tier, profile, reasons, host_port, bind, public_host, docker_info,
+              dockerfile_draft=None):
     """승인 화면에 보일 계획을 만든다. 반환: {"variables", "summary", "cost_estimate", "digest"}.
 
     cost_estimate는 0이다(추가 요금 없음). 전기·회선·PC 자원은 포함하지 않는다고 밝힌다(AGENTS.md 6장: 제외 비용을 총액에 섞지 않는다)."""
@@ -325,6 +326,8 @@ def make_plan(*, deploy_id, image, dockerfile, app, source_sha256, tier, profile
     excluded = ["전기·회선·PC 사용 비용", "이 PC의 디스크 사용량", "HTTPS·도메인(로컬 주소로만 접속)"]
     variables = {
         "deploy_id": deploy_id, "image": image, "dockerfile": dockerfile, "app": app,
+        # 소스에 Dockerfile이 없으면 분석기 초안 {content, sha256}. 계획 변수라 승인 대상이고, 빌드는 이 내용으로만 함
+        "dockerfile_draft": dockerfile_draft,
         "source_sha256": source_sha256,
         "tier": tier, "recommended": True, "headline": profile["headline"], "tradeoff": profile["tradeoff"], "reason": ". ".join(reasons),
         "resources": resources, "usage_note": usage,
@@ -455,9 +458,18 @@ def extract_zip(src, dst):
     return Path(one) if one and os.path.isdir(one) else Path(root)
 
 
-def build_image(lc, zip_path, dockerfile, image):
-    """승인된 소스 ZIP에서 이미지를 만든다(이 PC의 Docker에만 남고 어디에도 올리지 않는다). 압축을 푼 임시 폴더는 항상 지운다."""
-    if (not isinstance(dockerfile, str) or not dockerfile or len(dockerfile) > 200
+def build_image(lc, zip_path, dockerfile, image, draft=None):
+    """승인된 소스 ZIP에서 이미지를 만든다(이 PC의 Docker에만 남고 어디에도 올리지 않는다). 압축을 푼 임시 폴더는 항상 지운다.
+
+    dockerfile 이 None 이면 승인된 Dockerfile 초안(draft {content, sha256})을 지문 확인 뒤 소스 밖 임시 파일로 써서 -f 로 쓴다.
+    소스는 바꾸지 않는다."""
+    if dockerfile is None:
+        content = draft.get("content") if isinstance(draft, dict) else None
+        expected = draft.get("sha256") if isinstance(draft, dict) else None
+        if (not isinstance(content, str) or not isinstance(expected, str)
+                or hashlib.sha256(content.encode("utf-8")).hexdigest() != expected):
+            raise LocalError("draft_mismatch", "승인된 Dockerfile 초안을 확인하지 못했습니다(내용·지문 불일치). 빌드하지 않았습니다")
+    elif (not isinstance(dockerfile, str) or not dockerfile or len(dockerfile) > 200
             or PureWindowsPath(dockerfile).anchor or ".." in dockerfile):
         raise LocalError("invalid_job", f"dockerfile 경로가 올바르지 않습니다: {dockerfile!r}")
     if not IMAGE_RE.match(image or ""):
@@ -465,11 +477,16 @@ def build_image(lc, zip_path, dockerfile, image):
     work = Path(tempfile.mkdtemp(prefix="pc-local-build-"))
     try:
         ctx = extract_zip(zip_path, work / "src").resolve()
-        df = (ctx / dockerfile.replace("\\", "/")).resolve()
-        if not df.is_relative_to(ctx):
-            raise LocalError("invalid_job", f"dockerfile 경로가 소스 폴더 밖을 가리킵니다: {dockerfile!r}")
-        if not df.is_file():
-            raise LocalError("build_failed", f"Dockerfile을 찾지 못했습니다: {dockerfile}")
+        if dockerfile is None:
+            df = work / "draft" / "Dockerfile"   # 소스(ctx) 밖. 압축 푼 소스는 그대로 둔다
+            df.parent.mkdir()
+            df.write_text(draft["content"], encoding="utf-8", newline="\n")
+        else:
+            df = (ctx / dockerfile.replace("\\", "/")).resolve()
+            if not df.is_relative_to(ctx):
+                raise LocalError("invalid_job", f"dockerfile 경로가 소스 폴더 밖을 가리킵니다: {dockerfile!r}")
+            if not df.is_file():
+                raise LocalError("build_failed", f"Dockerfile을 찾지 못했습니다: {dockerfile}")
         env = docker_env()
         _run([*lc.docker, "rmi", "-f", image], 120, env=env)   # 같은 태그의 옛 이미지가 남아 빌드 실패 뒤에 쓰이지 않게 먼저 지운다
         rc, out = _run([*lc.docker, "build", "--progress=plain", "-f", str(df), "-t", image, str(ctx)], lc.build_timeout, env=env)
