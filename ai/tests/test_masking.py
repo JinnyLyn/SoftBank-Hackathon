@@ -1,6 +1,7 @@
 """비밀값 가리기 검사. 테스트용 값은 모두 가짜다."""
 
 import re
+import json
 import unittest
 from pathlib import Path
 
@@ -55,6 +56,25 @@ class MaskTextTests(unittest.TestCase):
         self.assertIn('password = request.form["password"]', out)
         self.assertIn('STRIPE_API_KEY = "<가림>"', out, "문자열로 박아 둔 값만 가림")
         self.assertEqual(n, 1)
+
+    def test_secret_named_scalar_literals_are_masked(self):
+        for value in ("true", "false", "null", "none", "yes", "no", "on", "off", "~"):
+            for key, separator in (("DB_PASSWORD", "="), ("password", ": "), ("api_key", ": "), ("PRIVATE", "=")):
+                with self.subTest(key=key, value=value):
+                    text = f"{key}{separator}{value}\n"
+                    out, count = mask_text(text, config_file=True)
+                    self.assertEqual(out, f"{key}{separator}<가림>\n")
+                    self.assertEqual(count, 1)
+
+    def test_json_secret_scalars_are_masked_while_private_stays_boolean(self):
+        for private in (True, False):
+            for value in (True, False, None):
+                for indent in (None, 2):
+                    with self.subTest(private=private, value=value, indent=indent):
+                        source = json.dumps({"private": private, "api_key": value}, indent=indent)
+                        out, count = mask_text(source, config_file=True)
+                        self.assertEqual(json.loads(out), {"private": private, "api_key": "<가림>"})
+                        self.assertEqual(count, 1)
 
 
     def test_short_secret_names_and_quoted_keys(self):

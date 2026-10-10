@@ -215,6 +215,8 @@ class UsageAndCacheTests(unittest.TestCase):
             # PR #29 재리뷰: 키는 있지만 타입·enum 이 스키마와 다른 답
             {"answers": [{**good, "line": "2"}], "notes": []},
             {"answers": [{**good, "field": "password"}], "notes": []},
+            {"answers": [{**good, "field": []}], "notes": []},
+            {"answers": [{**good, "field": {}}], "notes": []},
             {"answers": [{k: v for k, v in good.items() if k != "reason"}], "notes": []},
             {"answers": [good], "notes": [{**note, "level": "critical"}]},
             {"answers": [good], "notes": [{k: v for k, v in note.items() if k != "file"}]},
@@ -262,17 +264,53 @@ class SelectFilesTests(unittest.TestCase):
 
     def test_accepts_port_from_config_file(self):
         spec = {
-            "package.json": '{"name": "shop", "dependencies": {"express": "^4"}}\n',
+            "package.json": json.dumps({"name": "shop", "dependencies": {"express": "^4"},
+                                        "scripts": {"start": "node src/server.js"}}),
             "src/config.json": '{\n  "http": { "listen": 7311 }\n}\n',
             "src/server.js": "const cfg = require('./config.json')\napp.get('/', ok)\napp.listen(cfg.http.listen)\n",
         }
         fs = files(spec)
         analysis = analyze_files(fs)
+        self.assertEqual(analysis.dockerfile_draft["port"], 3000)
         self.assertIn("container_port", analysis.unresolved)
         client = FakeClient({"answers": [answer("container_port", "7311", "src/config.json", 2)], "notes": []})
         out = fill_unresolved(analysis, fs, client)
         self.assertEqual(out.filled, ["container_port"])
         self.assertIn("src/config.json", client.calls[0]["messages"][0]["content"])
+        result = analysis.to_result()
+        self.assertEqual(result["app_config"]["container_port"], 7311)
+        self.assertEqual(result["dockerfile_draft"]["port"], 7311)
+        self.assertIn("ENV PORT=7311\n", result["dockerfile_draft"]["content"])
+        self.assertIn("EXPOSE 7311\n", result["dockerfile_draft"]["content"])
+        draft_findings = [f for f in result["findings"] if f["title"] == "Dockerfile 초안을 만들었습니다"]
+        self.assertEqual(len(draft_findings), 1)
+        self.assertIn("7311", draft_findings[0]["detail"])
+
+    def test_python_draft_is_refreshed_after_port_evidence(self):
+        fs = files({p: t for p, t in APP.items() if p != "Dockerfile"})
+        analysis = analyze_files(fs)
+        self.assertEqual(analysis.dockerfile_draft["port"], 8000)
+        client = FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []})
+        out = fill_unresolved(analysis, fs, client)
+        self.assertEqual(out.filled, ["container_port"])
+        self.assertEqual(analysis.app_config()["container_port"], 5050)
+        self.assertEqual(analysis.dockerfile_draft["port"], 5050)
+        self.assertIn('"0.0.0.0:5050"', analysis.dockerfile_draft["content"])
+        self.assertIn("EXPOSE 5050\n", analysis.dockerfile_draft["content"])
+
+    def test_missing_or_rejected_port_keeps_draft_and_unresolved(self):
+        fs = files({p: t for p, t in APP.items() if p != "Dockerfile"})
+        for answers in ([], [answer("container_port", "8080", "config.py", 2)]):
+            with self.subTest(answers=answers):
+                analysis = analyze_files(fs)
+                original_draft = analysis.dockerfile_draft.copy()
+                out = fill_unresolved(analysis, fs, FakeClient({"answers": answers, "notes": []}))
+                self.assertIn("container_port", out.asked)
+                self.assertEqual(out.filled, [])
+                self.assertIn("container_port", analysis.unresolved)
+                self.assertIsNone(analysis.container_port)
+                self.assertEqual(analysis.dockerfile_draft, original_draft)
+                self.assertEqual(analysis.app_config()["container_port"], 8000)
 
 
 if __name__ == "__main__":

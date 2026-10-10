@@ -181,6 +181,32 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("FAKE-real-password", sent)
         self.assertIn(".env", self.backend.analyses["p1"]["result"]["masking"]["withheld_files"])
 
+    def test_draft_port_after_llm_and_unavailable_fallback(self):
+        from tests.test_llm import FakeClient, answer
+        from paved_ai.ollama import OllamaError
+
+        spec = {
+            "package.json": json.dumps({"dependencies": {"express": "^4"}, "scripts": {"start": "node server.js"}}),
+            "server.js": "const config = require('./config.json')\napp.get('/health', ok)\napp.listen(config.port)\n",
+            "config.json": '{\n  "port": 7311\n}\n',
+        }
+        clients = [
+            (FakeClient({"answers": [answer("container_port", "7311", "config.json", 2)], "notes": []}), 7311),
+            (FakeClient(error=OllamaError("test timeout")), 3000),
+            (None, 3000),
+        ]
+        for i, (client, expected_port) in enumerate(clients):
+            with self.subTest(llm=i):
+                pid = f"draft{i}"
+                self.add_project(pid, files=spec)
+                counts = runner.run_once(self.api, self.uploads, self.state, clock=lambda: self.now, llm=client)
+                self.assertEqual(counts["recorded"], 1)
+                result = self.backend.analyses[pid]["result"]
+                self.assertEqual(result["app_config"]["container_port"], expected_port)
+                self.assertEqual(result["dockerfile_draft"]["port"], expected_port)
+                self.assertIn(f"ENV PORT={expected_port}\n", result["dockerfile_draft"]["content"])
+                self.assertEqual("container_port" in result["unresolved"], expected_port == 3000)
+
     def test_skips_projects_already_analyzed(self):
         self.add_project("p1")
         self.backend.analyses["p1"] = {"id": "old", "result": {}}

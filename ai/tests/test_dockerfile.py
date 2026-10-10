@@ -43,6 +43,27 @@ class DraftTests(unittest.TestCase):
         self.assertNotIn("pip install --no-cache-dir uvicorn", d["content"], "이미 의존성에 있으면 더 설치하지 않음")
         self.assertIn('CMD ["uvicorn", "app.main:api", "--host", "0.0.0.0", "--port", "8000"]', d["content"])
 
+    def test_python_requirement_dependencies_exist_before_install(self):
+        # pip는 requirements의 재귀 include·constraint·로컬 패키지를 설치 시점에 읽는다.
+        for requirement in ("-r requirements/prod.txt", "-c constraints.txt", "-e ./local-package"):
+            with self.subTest(requirement=requirement):
+                _, draft = draft_of({
+                    "requirements.txt": f"flask\n{requirement}\n",
+                    "requirements/prod.txt": "-r base.txt\n",
+                    "requirements/base.txt": "gunicorn\n",
+                    "constraints.txt": "flask==3.0.0\n",
+                    "local-package/setup.py": "from setuptools import setup\nsetup(name='local-package', version='1')\n",
+                    "app.py": "from flask import Flask\napp = Flask(__name__)\n",
+                })
+                available = set()
+                for line in draft["content"].splitlines():
+                    if line == "COPY . .":
+                        available.update(("requirements/prod.txt", "requirements/base.txt", "constraints.txt", "local-package/setup.py"))
+                    if line.startswith("RUN pip install"):
+                        self.assertTrue({"requirements/prod.txt", "requirements/base.txt", "constraints.txt", "local-package/setup.py"} <= available,
+                                        "pip 실행 전에 중첩 의존성 파일과 로컬 패키지가 있어야 함")
+                        break
+
     def test_node_start_script_lockfile_and_build(self):
         _, d = draft_of({
             "package.json": json.dumps({"dependencies": {"express": "^4"}, "scripts": {"start": "node server.js", "build": "tsc"}}),
@@ -68,6 +89,16 @@ class DraftTests(unittest.TestCase):
         _, d = draft_of({**base, "yarn.lock": "# yarn lockfile v1\n"})
         self.assertIn("corepack enable && yarn install", d["content"])
         self.assertIn('CMD ["yarn", "start"]', d["content"])
+
+    def test_malformed_node_scripts_reports_reason_without_crashing(self):
+        for scripts in ("node server.js", ["node server.js"], 1, True, None):
+            with self.subTest(scripts=scripts):
+                result, draft = draft_of({
+                    "package.json": json.dumps({"dependencies": {"express": "^4"}, "scripts": scripts}),
+                    "server.js": "app.listen(3000)\n",
+                })
+                self.assertIsNone(draft)
+                self.assertIn("scripts가 객체가 아니어서", " ".join(f["detail"] for f in result["findings"]))
 
     def test_node_version_default_and_from_project(self):
         pkg = json.dumps({"dependencies": {"express": "^4"}, "scripts": {"start": "node a.js"}})

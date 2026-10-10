@@ -49,10 +49,8 @@ _PATTERNS: List[Tuple[re.Pattern, str]] = [
 
 # 설정 파일의 KEY=값, KEY: 값, - KEY=값, "KEY": 값 (env·yaml·ini·compose·json). 따옴표 문자열이거나 공백·쉼표 없는 값
 _ENV_ASSIGN = re.compile(
-    r"(?im)^(\s*(?:-\s*)?(?:export\s+)?[\"']?(" + _SECRET_NAME + r")[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#,\n]+)"
+    r"(?im)((?:^\s*(?:-\s*)?(?:export\s+)?|(?<=[{,])\s*)[\"']?(" + _SECRET_NAME + r")[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#,\n}\]]+)"
 )
-# 설정 파일에서 이름이 비밀스러워도 값이 이것이면 가리지 않음 (불리언·빈 값은 비밀이 아님)
-_NOT_SECRET_LITERALS = {"true", "false", "null", "none", "yes", "no", "on", "off", "~"}
 # 위 규칙을 적용할 설정 파일. 코드에는 적용하지 않음 (SECRET_KEY = os.getenv("SECRET_KEY") 같은 줄의 변수 이름을 지키려고)
 _CONFIG_FILE = re.compile(r"(?i)(^|/)(\.env(\.[\w-]+)?|[^/]+\.(ya?ml|ini|cfg|conf|toml|properties|json)|dockerfile)$")
 # 코드에서 비밀 이름 변수에 문자열 그대로 넣은 것만 (password = request.form[...] 같은 코드는 그대로 둠)
@@ -99,12 +97,14 @@ def mask_text(text: str, config_file: bool = False) -> Tuple[str, int]:
 
         def assign(m: re.Match) -> str:
             value = m.group(3)
-            # true·false·null 같은 값은 비밀이 아님. 가리면 package.json("private": true)이 깨져 의존성을 못 읽었음
-            if value.lower() in _NOT_SECRET_LITERALS:
+            # package.json의 구조 필드만 예외. 비밀 이름의 true/none/off 등도 실제 값일 수 있다.
+            if re.fullmatch(r'\s*"private"\s*:\s*', m.group(1)) and value in {"true", "false"}:
                 return m.group(0)
             hits[0] += 1
-            # 따옴표 값은 따옴표를 남겨 JSON·YAML 모양을 유지
+            # JSON의 비문자열 비밀값도 유효한 JSON 문자열로 가린다.
             quote = value[0] if value[:1] in "\"'" else ""
+            if not quote and re.search(r'"[^"\n]+"\s*:\s*$', m.group(1)):
+                quote = '"'
             return m.group(1) + quote + MASK + quote
 
         text = _ENV_ASSIGN.sub(assign, text)

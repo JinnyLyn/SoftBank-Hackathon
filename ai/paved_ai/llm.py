@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from . import cache
-from .analysis import Analysis, Evidence
+from .analysis import Analysis, Evidence, suggest_dockerfile
 from .masking import mask_files
 from .ollama import OllamaClient, OllamaError
 from .source import SourceFile
@@ -300,7 +300,8 @@ def _well_formed(data: dict) -> bool:
         return False
     for a in answers:
         if not (isinstance(a, dict) and set(a) == {"field", "value", "file", "line", "reason"}
-                and a["field"] in FILLABLE and all(isinstance(a[k], str) for k in ("value", "file", "reason"))
+                and isinstance(a["field"], str) and a["field"] in FILLABLE
+                and all(isinstance(a[k], str) for k in ("value", "file", "reason"))
                 and _is_int(a["line"])):
             return False
     for n in notes:
@@ -403,6 +404,9 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
     for t in targets:
         if t not in outcome.filled and t not in outcome.rejected:
             outcome.rejected[t] = "LLM이 답하지 않음"
+
+    if "container_port" in outcome.filled and analysis.dockerfile_draft:
+        suggest_dockerfile(analysis, masked)
 
     notes = data.get("notes") if isinstance(data.get("notes"), list) else []
     for note in [n for n in notes if isinstance(n, dict)][:MAX_NOTES]:

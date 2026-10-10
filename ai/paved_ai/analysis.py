@@ -644,19 +644,22 @@ def _check_dockerfile_copies(a: Analysis, repo: Repo, dockerfile: str) -> None:
         )
 
 
-def _suggest_dockerfile(a: Analysis, files: List[SourceFile], family: Optional[str], py: dict) -> None:
+def suggest_dockerfile(a: Analysis, files: List[SourceFile]) -> None:
     """Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 보여 줌. 배포는 여전히 Dockerfile이 저장소에 있어야 함"""
+    if a.has_dockerfile or not a.supported:
+        return
+    family = ("python" if a.framework in {name for _, name in PY_FRAMEWORKS}
+              else "node" if a.framework in {name for _, name in NODE_FRAMEWORKS} else None)
+    py = _python_deps(Repo(files))
     draft, why = draft_dockerfile(files, family, a.framework, a.runtime, a.container_port, py)
-    a.findings = [f for f in a.findings if f.title != "Dockerfile이 없습니다"]
+    a.dockerfile_draft = None
+    a.findings = [f for f in a.findings if f.title not in {"Dockerfile이 없습니다", "Dockerfile 초안을 만들었습니다"}]
     if draft is None:
         a.info("Dockerfile이 없습니다", f"배포하려면 Dockerfile이 필요합니다. 초안도 만들지 못했습니다: {why}")
         return
     a.dockerfile_draft = draft.as_dict()
-    # 초안이 앱이 들을 포트를 정함(uvicorn·gunicorn 바인드, Node 는 PORT 환경 변수) → 포트를 못 찾았으면 초안의 포트를 씀.
-    # worker가 초안을 승인 대상에 넣어 빌드하면 그대로 배포 설정이 됨 (dockerfile 은 null 로 두어 소스 안 경로가 없음을 알림)
-    # 코드에서 찾은 포트(a.container_port)는 그대로 두고(추측하지 않음), 배포 설정만 초안의 포트를 씀(Analysis.app_config)
-    if a.container_port is None:
-        a.unresolved.pop("container_port", None)
+    # 초안의 기본 포트는 코드 근거가 아님. unresolved를 유지해 LLM이 간접 설정을 확인하게 하고,
+    # 포트 근거를 찾으면 초안도 다시 생성한다. 규칙 전용 결과에서는 초안 기본값을 제안으로 유지한다.
     a.unresolved["dockerfile"] = "저장소에 Dockerfile이 없어 코드를 보고 초안을 만들었습니다. 초안을 확인한 뒤 그대로 쓰거나 저장소에 추가해 주세요."
     a.info("Dockerfile 초안을 만들었습니다",
            f"코드를 보고 {a.framework}용 초안을 만들었습니다(포트 {draft.port}). 비용 승인 화면에서 초안 내용을 확인할 수 있습니다.")
@@ -681,8 +684,7 @@ def analyze_files(files: List[SourceFile]) -> Analysis:
     _detect_environment(a, repo)
     _detect_hints(a, repo, family, deps)
     _check_shape(a, repo, family)
-    if not a.has_dockerfile and a.supported:
-        _suggest_dockerfile(a, report.files, family, py)
+    suggest_dockerfile(a, report.files)
     if report.withheld:
         a.info("비밀 파일은 분석에서 뺐습니다", f"{', '.join(report.withheld)}: 변수 이름만 보고 값은 보내지 않았습니다.")
 

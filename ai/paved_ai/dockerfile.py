@@ -78,7 +78,8 @@ _FLASK = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*Flask\(")
 def _python(files, framework: str, runtime: Optional[str], port: int, deps: Dict[str, tuple]) -> Tuple[Optional[Draft], Optional[str]]:
     based_on: List[str] = []
     if _root(files, "requirements.txt"):
-        install = ["COPY requirements.txt .", "RUN pip install --no-cache-dir -r requirements.txt", "COPY . ."]
+        # -r/-c로 포함한 파일과 로컬 패키지도 pip 실행 시점에 필요하다.
+        install = ["COPY . .", "RUN pip install --no-cache-dir -r requirements.txt"]
         based_on.append("requirements.txt")
     elif _root(files, "pyproject.toml"):
         install = ["COPY . .", "RUN pip install --no-cache-dir ."]
@@ -138,7 +139,9 @@ def _node(files, framework: str, runtime: Optional[str], port: int) -> Tuple[Opt
         pkg = json.loads(pkg_file.text)
     except ValueError:
         return None, "package.json 을 읽지 못했습니다."
-    scripts = pkg.get("scripts") or {}
+    scripts = pkg.get("scripts", {})
+    if not isinstance(scripts, dict):
+        return None, "package.json 의 scripts가 객체가 아니어서 시작 명령을 정할 수 없습니다."
     based_on = ["package.json"]
     # 패키지 매니저: lockfile 로 정함. pnpm·yarn 은 corepack 으로 package.json 의 packageManager 버전을 씀
     if _root(files, "pnpm-lock.yaml"):
