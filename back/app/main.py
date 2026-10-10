@@ -1026,7 +1026,7 @@ def _reject_secret_fields(value: Any, path: str = "") -> None:
         for item in value:
             _reject_secret_fields(item, path)
     elif isinstance(value, str) and (
-        _SECRET_VALUE.search(value)
+        _contains_inline_secret(value)
         or _CREDENTIAL_URL.search(value)
         or _BEARER.search(value)
         or _AWS_ACCESS_KEY.search(value)
@@ -1052,6 +1052,17 @@ def _redact(text: str) -> str:
         return f"{match.group('key_quote')}{key}{match.group('key_quote')}{match.group('separator')}{redacted}"
 
     return _SECRET_VALUE.sub(replace_secret, text)
+
+
+def _contains_inline_secret(text: str) -> bool:
+    """Return whether inline key/value text contains a value for a secret key.
+
+    `_SECRET_VALUE` intentionally recognizes generic ``key: value`` and
+    ``key=value`` forms so that log redaction can preserve their original
+    formatting.  A generic match alone is not sensitive, though: Docker image
+    references such as ``python:3.12`` must remain valid analysis input.
+    """
+    return any(_is_secret_key(match.group("key")) for match in _SECRET_VALUE.finditer(text))
 
 
 def _is_secret_key(key: str) -> bool:
