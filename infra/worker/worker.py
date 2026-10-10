@@ -2,12 +2,14 @@
 """플랫폼 백엔드(back/)와 deploy.sh를 잇는 worker. 표준 라이브러리만 쓴다.
 
 백엔드는 소스·분석 결과·계획·승인·배포 대기열을 저장만 하고 Terraform·Docker·AWS는 실행하지 않는다(back/API.md).
-이 worker가 그 빈 자리를 채운다. 두 가지 일을 한다.
+이 worker가 그 빈 자리를 채운다. 세 가지 일을 한다.
 
   planner   등록됐지만 아직 계획이 없는 프로젝트를 찾아, 분석 결과로 구성·비용을 정하고
             `deploy.sh up --plan-only`로 Terraform 계획을 만들어 백엔드에 등록한다(POST /api/plans).
   executor  사용자가 승인해 대기열에 들어간 작업을 가져와(claim) 이미지를 빌드하고 저장된 계획 그대로 적용한 뒤
             상태(deploying → healthy | failed)와 접속 주소를 보고한다.
+  connector 사용자가 CloudFormation으로 만든 역할(콜백으로 백엔드에 저장된 계정 ID·역할 ARN)을 실제로 AssumeRole 해 보고
+            `complete`(성공) 또는 `fail`(역할 쪽 문제로 끝내 실패)을 보고한다. 사용자 계정 연결은 기본 제품 흐름이 아니다(docs/PRODUCT_DIRECTION.md).
 
 지키는 규칙(AGENTS.md)
   - 승인된 저장 plan만 적용한다. 적용 직전에 plan 파일의 SHA-256이 승인된 값과 같은지 확인한다.
@@ -16,6 +18,7 @@
   - 실패는 자동 롤백하지 않고 그대로 보고한다(확정 정책). 원인은 diagnose 결과를 이벤트에 담는다.
     제품 롤백은 새 plan·diff의 사용자 승인이 필요하며, 이 worker의 롤백 연동은 아직 미구현이다(README 참조).
   - LLM 호출은 하지 않는다. 분석 결과(result)는 다른 담당 모듈이 백엔드에 기록한 것을 읽기만 한다.
+  - 연결 확인은 AssumeRole로 임시 자격 증명을 받지만 출력하지 않는다(`--query`로 역할 ARN만 읽는다). 확인 결과는 account_id·role_arn만 백엔드에 보낸다.
 """
 import argparse
 import hashlib
@@ -46,6 +49,17 @@ ENV_KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 SECRET_KEY_RE = re.compile(r"(SECRET|PASSWORD|PASSWD|TOKEN|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY)")
 SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+# 연결 확인 입력. back/app/schemas.py의 ConnectionRoleCallbackIn 규칙과 같다(external_id는 main.py의 pc-<hex 32자>). \Z로 끝의 개행을 거부한다
+AWS_ARN_NAME = r"[A-Za-z0-9+=,.@_-]+"
+ROLE_ARN_RE = re.compile(rf"^arn:(aws|aws-us-gov|aws-cn):iam::(\d{{12}}):role(?:/{AWS_ARN_NAME})+\Z")
+ASSUMED_ARN_RE = re.compile(rf"^arn:(aws|aws-us-gov|aws-cn):sts::(\d{{12}}):assumed-role/{AWS_ARN_NAME}/{AWS_ARN_NAME}\Z")
+EXTERNAL_ID_RE = re.compile(r"^pc-[0-9a-f]{32}\Z")
+ACCOUNT_ID_RE = re.compile(r"^\d{12}\Z")
+AWS_ERROR_RE = re.compile(r"An error occurred \((\w+)\) when calling the AssumeRole operation")
+# 역할 쪽 문제로 볼 오류 코드(신뢰 정책·ExternalId 불일치, 없는 역할, 비활성 리전). 그 밖의 오류(만료된 자격 증명·네트워크)는 worker 쪽 문제라 연결을 실패로 만들지 않는다
+ROLE_SIDE_ERRORS = {"AccessDenied", "ValidationError", "RegionDisabledException"}
+VERIFY_SESSION_NAME = "paved-clouds-verify"
+ASSUME_ROLE_TIMEOUT = 60   # 초. 시험에서는 줄인다
 # 로그를 백엔드로 보내기 전에 한 번 더 가린다(백엔드도 가리지만 호출 측에서도 비밀을 보내지 않아야 한다)
 REDACT_RES = [
     re.compile(r"(?i)\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -79,6 +93,7 @@ class Config:
     deploy_sh: Path = INFRA / "scripts" / "deploy.sh"
     deployments_dir: Path = INFRA / "deployments"
     bash: str = field(default_factory=lambda: find_bash())
+    aws_cmd: list = field(default_factory=lambda: ["aws"])   # 연결 확인에 쓰는 AWS CLI. 시험에서는 가짜 스크립트로 바꾼다
     region: str = ""
     poll_seconds: float = 5.0
     plan_timeout: int = 900
@@ -613,6 +628,130 @@ def execute_job(api, cfg, job):
             log(f"백엔드 보고 실패: {e2}")
 
 
+# --- connector -------------------------------------------------------------------------------------
+def post_retry(api, path, body):
+    """worker 경로로 보낸다. 연결 실패·5xx는 몇 번 다시 시도하고 4xx는 바로 올린다(report와 같은 규칙)."""
+    for attempt in range(REPORT_RETRIES):
+        try:
+            return api.post(path, body)
+        except ApiError as e:
+            if not (e.status == 0 or e.status >= 500) or attempt == REPORT_RETRIES - 1:
+                raise
+            time.sleep(REPORT_RETRY_DELAY)
+
+
+def check_role(cfg, env, role_arn, external_id, account_id):
+    """사용자 역할을 실제로 AssumeRole 해 본다. (결과, 설명)을 돌려준다. 설명은 로그용이고 사용자에게 보이는 오류에는 쓰지 않는다.
+
+    결과: "ok"      역할을 맡을 수 있고, 맡은 역할이 보고된 계정의 것이다
+          "denied"  역할 쪽 문제(신뢰 정책·ExternalId 불일치, 없는 역할, 다른 계정의 역할). 방금 만든 역할은 IAM 전파 때문에 잠깐 실패할 수 있다
+          "error"   worker 쪽 문제(만료된 자격 증명, 네트워크, CLI 없음). 연결을 실패로 만들지 않는다
+    임시 자격 증명은 출력하지 않는다: --query 로 AssumedRoleUser.Arn 만 읽는다."""
+    cmd = [*cfg.aws_cmd, "sts", "assume-role", "--role-arn", role_arn, "--role-session-name", VERIFY_SESSION_NAME,
+           "--external-id", external_id, "--duration-seconds", "900", "--query", "AssumedRoleUser.Arn", "--output", "text"]
+    try:
+        rc, out, err = run_capture(cmd, ASSUME_ROLE_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return "error", f"aws sts assume-role이 {ASSUME_ROLE_TIMEOUT}초 안에 끝나지 않았습니다"
+    except OSError as e:
+        return "error", f"aws CLI를 실행하지 못했습니다: {type(e).__name__}"
+    if rc != 0:
+        m = AWS_ERROR_RE.search(err)
+        code = m.group(1) if m else "unknown"
+        return ("denied" if code in ROLE_SIDE_ERRORS else "error"), f"{code}: {redact((err or out).strip())[-300:]}"
+    m = ASSUMED_ARN_RE.match(out.strip())
+    if not m:
+        return "error", "AssumeRole 결과의 ARN을 해석하지 못했습니다"
+    if m.group(2) != account_id:
+        return "denied", f"맡은 역할의 계정({m.group(2)})이 보고된 계정과 다릅니다"
+    return "ok", ""
+
+
+def verify_connection(api, cfg, state, env, conn):
+    """대기 연결 하나를 처리한다. 콜백으로 역할 정보가 아직 오지 않았으면 아무것도 하지 않고 기다린다(back/API.md)."""
+    cid, account_id, role_arn, external_id = conn.get("id"), conn.get("account_id"), conn.get("role_arn"), conn.get("external_id")
+    if account_id is None and role_arn is None:
+        return   # CloudFormation 콜백 전
+    role = ROLE_ARN_RE.match(role_arn) if isinstance(role_arn, str) else None
+    if (not role or not isinstance(account_id, str) or not ACCOUNT_ID_RE.match(account_id) or role.group(2) != account_id
+            or not isinstance(external_id, str) or not EXTERNAL_ID_RE.match(external_id)):
+        log(f"연결 {cid}: 역할 정보 형식이 올바르지 않아 건너뜁니다(백엔드 저장값을 확인하세요)")
+        state.conn_blocked.add(cid)
+        return
+    tries, last = state.conn_tries.get(cid, (0, 0.0))
+    if tries and time.time() - last < state.conn_retry_after:
+        return
+    result, why = check_role(cfg, env, role_arn, external_id, account_id)
+    if result == "ok":
+        try:
+            post_retry(api, f"/api/worker/connections/{cid}/complete", {"account_id": account_id, "role_arn": role_arn})
+        except ApiError as e:
+            log(f"연결 {cid}: 완료 보고 실패({e})")
+            if e.status == 0 or e.status >= 500:
+                state.conn_tries[cid] = (tries, time.time())   # 일시 오류: 다음 점검에서 다시 보고한다
+            else:
+                state.conn_blocked.add(cid)   # 4xx(저장된 값과 불일치 등): 다시 보내도 같다. 사람이 확인한다
+            return
+        state.conn_tries.pop(cid, None)
+        log(f"연결 확인 완료: {cid} (계정 {account_id})")
+        return
+    if result == "error":
+        # worker 쪽 문제다. 횟수를 올리지 않아 사용자의 연결이 실패로 끝나지 않는다
+        log(f"연결 {cid}: 역할을 확인하지 못했습니다(worker 환경 문제일 수 있어 다시 시도합니다): {why}")
+        state.conn_tries[cid] = (tries, time.time())
+        return
+    tries += 1
+    state.conn_tries[cid] = (tries, time.time())
+    log(f"연결 {cid}: AssumeRole 거부 {tries}/{state.conn_max_tries}회: {why}")
+    if tries < state.conn_max_tries:
+        return   # 방금 만든 역할은 IAM 전파가 끝나기 전에 잠깐 거부될 수 있다
+    # 사용자에게 보이는 오류에는 AWS 원문을 넣지 않는다(운영자 계정의 IAM 주체 이름이 들어 있다). ExternalId도 넣지 않는다
+    code = why.split(":", 1)[0]
+    msg = (f"AWS 역할({role_arn})을 맡지 못했습니다({code}). CloudFormation 스택의 신뢰 정책(운영자 계정·ExternalId)과 "
+           f"역할이 만들어졌는지 확인한 뒤 연결을 다시 만들어 주세요")
+    try:
+        post_retry(api, f"/api/worker/connections/{cid}/fail", {"error": msg})
+    except ApiError as e:
+        log(f"연결 {cid}: 실패 보고 실패({e})")
+        if not (e.status == 0 or e.status >= 500):
+            state.conn_blocked.add(cid)
+        return
+    state.conn_tries.pop(cid, None)
+    log(f"연결 실패 보고: {cid}")
+
+
+def verify_connections(api, cfg, state):
+    """백엔드의 대기 중인 AWS 연결을 확인한다. 이 일이 실패해도 배포 작업(claim·계획)은 계속한다."""
+    try:
+        pending = api.get("/api/worker/connections/pending") or []
+    except ApiError as e:
+        if not state.conn_warned:   # 5초마다 같은 줄이 반복되지 않게 처음 한 번만 알린다
+            log(f"대기 중인 연결 목록을 읽지 못했습니다(백엔드에 연결 API가 없거나 일시 오류): {e}")
+            state.conn_warned = True
+        return
+    state.conn_warned = False
+    if not isinstance(pending, list):
+        return
+    env = child_env(cfg)
+    live = set()
+    for conn in pending:
+        cid = conn.get("id") if isinstance(conn, dict) else None
+        if not isinstance(cid, str):
+            continue
+        live.add(cid)
+        if cid in state.conn_blocked:
+            continue
+        try:
+            verify_connection(api, cfg, state, env, conn)
+        except Exception as e:  # noqa: BLE001 - 연결 하나의 예상 못 한 오류가 다른 연결과 배포 작업을 멈추지 않게 한다
+            state.conn_tries[cid] = (state.conn_tries.get(cid, (0, 0.0))[0], time.time())
+            log(f"연결 {cid}: 처리 중 오류: {type(e).__name__}: {redact(str(e))[:200]}")
+    # 완료·실패·삭제돼 목록에서 사라진 연결의 기록은 버린다
+    for k in [k for k in state.conn_tries if k not in live]:
+        del state.conn_tries[k]
+    state.conn_blocked &= live
+
+
 # --- 반복 ------------------------------------------------------------------------------------------
 @dataclass
 class State:
@@ -622,6 +761,11 @@ class State:
     recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
     retry_after: float = 120.0
     max_tries: int = 3
+    conn_tries: dict = field(default_factory=dict)   # 연결 id → (AssumeRole 거부 횟수, 마지막 시도 시각)
+    conn_blocked: set = field(default_factory=set)   # 형식 오류·4xx로 이 프로세스에서 더 다루지 않는 연결
+    conn_warned: bool = False                        # 대기 연결 목록 조회 실패를 이미 알렸는지
+    conn_retry_after: float = 15.0                   # 같은 연결을 다시 확인하기까지의 간격(초)
+    conn_max_tries: int = 8                          # 역할 쪽 거부가 이만큼 이어지면 실패로 보고한다(약 2분)
 
 
 def list_projects(api, max_pages=10):
@@ -675,7 +819,9 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
 
 
 def tick(api, cfg, state, prices=None, arch="X86_64"):
-    """한 번 점검한다: 승인된 작업이 있으면 실행하고, 계획이 없는 프로젝트가 있으면 계획을 만든다."""
+    """한 번 점검한다: 대기 중인 연결을 확인하고, 승인된 작업이 있으면 실행하고, 계획이 없는 프로젝트가 있으면 계획을 만든다.
+    연결 확인은 몇 초면 끝나므로 길게 걸리는 배포 작업보다 먼저 한다."""
+    verify_connections(api, cfg, state)
     got = api.post("/api/worker/deployments/claim")
     job = (got or {}).get("job")
     if job:

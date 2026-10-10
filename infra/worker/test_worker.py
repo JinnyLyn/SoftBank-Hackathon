@@ -7,6 +7,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -58,6 +60,17 @@ case "$cmd" in
 esac
 '''
 
+# aws CLI의 가짜(sts assume-role만). 호출 인자는 $FAKE_AWS_LOG 에 남기고, 동작은 $FAKE_AWS_MODE 로 고른다
+FAKE_AWS = r'''#!/usr/bin/env bash
+echo "$*" >> "$FAKE_AWS_LOG"
+case "${FAKE_AWS_MODE:-ok}" in
+  ok) echo "${FAKE_AWS_ARN:-arn:aws:sts::123456789012:assumed-role/PavedCloudsReadOnlyRole/paved-clouds-verify}" ;;
+  denied) echo "An error occurred (AccessDenied) when calling the AssumeRole operation: User: arn:aws:iam::999999999999:user/operator is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole" >&2; exit 254 ;;
+  expired) echo "An error occurred (ExpiredToken) when calling the AssumeRole operation: The security token included in the request is expired" >&2; exit 254 ;;
+  hang) sleep 30 ;;
+esac
+'''
+
 
 class FakeBackend:
     """back/API.md의 필요한 부분만 흉내 내는 서버."""
@@ -77,6 +90,11 @@ class FakeBackend:
         self.upload_failures = 0  # 앞으로 몇 번의 plan 파일 업로드를 503으로 거절할지
         self.lose_plan_response = 0   # 앞으로 몇 번의 계획 등록을 "서버에는 등록하고 응답 없이 연결을 닫는" 방식으로 처리할지
         self.plans_get_failures = 0   # 앞으로 몇 번의 계획 목록 조회를 503으로 거절할지
+        self.connections = []         # GET /api/worker/connections/pending 의 응답
+        self.pending_status = 200     # 200이 아니면 대기 연결 조회를 그 코드로 거절한다(백엔드에 연결 API가 없는 경우 등)
+        self.conn_posts = []          # (경로, 본문, X-Worker-Token) — 연결 complete·fail 보고
+        self.conn_post_code = 200     # complete·fail 보고에 돌려줄 코드
+        self.conn_post_failures = 0   # 앞으로 몇 번의 연결 보고를 503으로 거절할지
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -98,6 +116,12 @@ class FakeBackend:
             def do_GET(self):
                 outer.headers_seen.append((self.path, self.headers.get("X-Worker-Token")))
                 p = self.path
+                if p == "/api/worker/connections/pending":
+                    if self.headers.get("X-Worker-Token") != TOKEN:
+                        return self._send(401, {"error": "인증 실패"})
+                    if outer.pending_status != 200:
+                        return self._send(outer.pending_status, {"error": "없음"})
+                    return self._send(200, outer.connections)
                 if p.startswith("/api/projects?"):
                     if outer.pages is not None:
                         cur = p.split("cursor=")[1] if "cursor=" in p else "0"
@@ -141,6 +165,14 @@ class FakeBackend:
                             if pl.get("id") == p.split("/")[4]:
                                 pl["terraform_plan_ready"] = True
                     return self._send(200, {"ok": True})
+                if p.startswith("/api/worker/connections/") and p.endswith(("/complete", "/fail")):
+                    if self.headers.get("X-Worker-Token") != TOKEN:
+                        return self._send(401, {"error": "인증 실패"})
+                    if outer.conn_post_failures > 0:
+                        outer.conn_post_failures -= 1
+                        return self._send(503, {"error": "일시 오류"})
+                    outer.conn_posts.append((p, json.loads(body), self.headers.get("X-Worker-Token")))
+                    return self._send(outer.conn_post_code, {})
                 if p == "/api/worker/deployments/claim":
                     if self.headers.get("X-Worker-Token") != TOKEN:
                         return self._send(401, {"error": "인증 실패"})
@@ -172,7 +204,8 @@ class Base(unittest.TestCase):
         self.log_file = self.tmp / "calls.log"
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
-        for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL"):
+        for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL",
+                  "FAKE_AWS_MODE", "FAKE_AWS_ARN"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
         os.environ["FAKE_HEARTBEAT"] = worker.posix(self.tmp / "heartbeat")
@@ -923,6 +956,357 @@ class LoopTests(Base):
     def test_main_requires_token(self):
         os.environ.pop("WORKER_API_TOKEN", None)
         self.assertEqual(worker.main(["--once"]), 2)
+
+
+CID = "22222222-2222-2222-2222-222222222222"
+ROLE_ARN = "arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole"
+EXT_ID = "pc-" + "ab" * 16
+
+
+def pending_conn(**over):
+    """GET /api/worker/connections/pending 의 항목(back/app/schemas.py의 PendingConnectionOut)."""
+    conn = {"id": CID, "provider": "aws", "name": "내 계정", "external_id": EXT_ID, "fields": {},
+            "created_at": "2026-10-10T00:00:00Z", "account_id": "123456789012", "role_arn": ROLE_ARN}
+    conn.update(over)
+    return conn
+
+
+class ConnectionTests(Base):
+    """사용자 AWS 연결 확인(back/API.md의 worker 연결 경로). 실제 AWS는 부르지 않고 aws CLI는 가짜 스크립트로 대신한다."""
+
+    def setUp(self):
+        super().setUp()
+        script = self.tmp / "aws.sh"
+        script.write_bytes(FAKE_AWS.encode("utf-8"))
+        self.aws_log = self.tmp / "aws.log"
+        os.environ["FAKE_AWS_LOG"] = worker.posix(self.aws_log)
+        self.cfg.aws_cmd = [self.cfg.bash, worker.posix(script)]
+        self.state = worker.State(conn_retry_after=0.0)
+        self.backend.connections = [pending_conn()]
+
+    def aws_calls(self):
+        return self.aws_log.read_text(encoding="utf-8").splitlines() if self.aws_log.exists() else []
+
+    def posts(self):
+        return [(p, b) for p, b, _ in self.backend.conn_posts]
+
+    def check(self):
+        worker.verify_connections(self.api, self.cfg, self.state)
+
+    def test_connection_waits_until_the_callback_brings_the_role(self):
+        self.backend.connections = [pending_conn(account_id=None, role_arn=None)]
+        self.check()
+        self.assertEqual(self.aws_calls(), [])
+        self.assertEqual(self.posts(), [])
+
+    def test_assumable_role_is_completed_with_account_and_role(self):
+        self.check()
+        calls = self.aws_calls()
+        self.assertEqual(len(calls), 1)
+        for part in (f"sts assume-role --role-arn {ROLE_ARN}", f"--external-id {EXT_ID}", "--role-session-name paved-clouds-verify"):
+            self.assertIn(part, calls[0])
+        # 임시 자격 증명은 출력하지 않는다: 역할 ARN만 읽는다
+        self.assertIn("--query AssumedRoleUser.Arn --output text", calls[0])
+        self.assertEqual(self.posts(), [(f"/api/worker/connections/{CID}/complete", {"account_id": "123456789012", "role_arn": ROLE_ARN})])
+        self.assertEqual(self.backend.conn_posts[0][2], TOKEN)   # worker 경로에는 토큰을 붙인다
+        self.assertNotIn(EXT_ID, json.dumps(self.backend.conn_posts))   # ExternalId는 백엔드로 되돌려 보내지 않는다
+
+    def test_role_assumed_in_another_account_is_never_completed(self):
+        os.environ["FAKE_AWS_ARN"] = "arn:aws:sts::999999999999:assumed-role/PavedCloudsReadOnlyRole/paved-clouds-verify"
+        self.state.conn_max_tries = 2
+        self.check()
+        self.assertEqual(self.posts(), [])
+        self.check()
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/fail"])
+
+    def test_denied_role_is_retried_then_fails_with_a_message_that_leaks_nothing(self):
+        os.environ["FAKE_AWS_MODE"] = "denied"
+        self.state.conn_max_tries = 3
+        self.check()
+        self.check()
+        self.assertEqual(self.posts(), [])   # 방금 만든 역할은 IAM 전파 전에 잠깐 거부될 수 있어 바로 실패로 만들지 않는다
+        self.assertEqual(self.state.conn_tries[CID][0], 2)
+        self.check()
+        self.assertEqual(len(self.aws_calls()), 3)
+        (path, body), = self.posts()
+        self.assertEqual(path, f"/api/worker/connections/{CID}/fail")
+        self.assertIn("AccessDenied", body["error"])
+        for secret in (EXT_ID, "999999999999", "operator"):   # ExternalId와 운영자 계정의 IAM 주체 이름은 사용자에게 보이는 오류에 넣지 않는다
+            self.assertNotIn(secret, body["error"])
+        self.assertTrue(0 < len(body["error"]) <= 2000)
+        self.assertNotIn(CID, self.state.conn_tries)   # 보고한 뒤에는 기록을 비운다
+
+    def test_retries_wait_between_attempts(self):
+        os.environ["FAKE_AWS_MODE"] = "denied"
+        self.state.conn_retry_after = 3600.0
+        self.check()
+        self.check()
+        self.assertEqual(len(self.aws_calls()), 1)
+
+    def test_worker_side_errors_never_fail_the_connection(self):
+        # 만료된 운영자 자격 증명은 사용자의 잘못이 아니다. 횟수를 올리지 않으니 몇 번을 시도해도 실패로 끝나지 않는다
+        os.environ["FAKE_AWS_MODE"] = "expired"
+        for _ in range(self.state.conn_max_tries + 2):
+            self.check()
+        self.assertEqual(self.posts(), [])
+        self.assertEqual(self.state.conn_tries[CID][0], 0)
+        os.environ["FAKE_AWS_MODE"] = "ok"   # 자격 증명이 복구되면 이어서 완료된다
+        self.check()
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/complete"])
+
+    def test_assume_role_timeout_is_a_worker_side_error_and_kills_the_child(self):
+        old = worker.ASSUME_ROLE_TIMEOUT
+        worker.ASSUME_ROLE_TIMEOUT = 1
+        self.addCleanup(setattr, worker, "ASSUME_ROLE_TIMEOUT", old)
+        os.environ["FAKE_AWS_MODE"] = "hang"
+        result, why = worker.check_role(self.cfg, os.environ.copy(), ROLE_ARN, EXT_ID, "123456789012")
+        self.assertEqual(result, "error")
+        self.assertIn("1초", why)
+
+    def test_complete_rejected_with_4xx_is_not_retried(self):
+        self.backend.conn_post_code = 409   # 저장된 콜백 값과 다르다 등
+        self.check()
+        self.check()
+        self.assertEqual(len(self.posts()), 1)
+        self.assertEqual(len(self.aws_calls()), 1)
+        self.assertIn(CID, self.state.conn_blocked)
+
+    def test_transient_complete_error_is_reported_again_on_the_next_check(self):
+        self.backend.conn_post_failures = worker.REPORT_RETRIES   # 이번 점검의 재시도를 모두 소진한다
+        self.check()
+        self.assertEqual(self.posts(), [])
+        self.assertNotIn(CID, self.state.conn_blocked)
+        self.check()
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/complete"])
+
+    def test_malformed_role_information_is_skipped_without_calling_aws(self):
+        bad = [pending_conn(role_arn="not-an-arn"),
+               pending_conn(account_id="999999999999"),                       # ARN의 계정과 다르다
+               pending_conn(external_id="pc-short"),
+               pending_conn(role_arn=ROLE_ARN + "\n"),                         # 끝의 개행
+               pending_conn(role_arn=None), pending_conn(account_id=None)]    # 한쪽만 비어 있다
+        for conn in bad:
+            with self.subTest(conn={k: conn[k] for k in ("account_id", "role_arn", "external_id")}):
+                self.state = worker.State(conn_retry_after=0.0)   # 한 번 건너뛴 연결은 막아 두므로 경우마다 새로 시작한다
+                self.backend.connections = [conn]
+                self.check()
+                self.assertIn(CID, self.state.conn_blocked)
+        self.assertEqual(self.aws_calls(), [])
+        self.assertEqual(self.posts(), [])
+
+    def test_missing_connection_api_does_not_stop_job_claims_or_planning(self):
+        self.backend.pending_status = 404   # 연결 API가 없는 백엔드
+        ex = ExecutorTests("test_success_reports_deploying_then_healthy_with_url")
+        ex.tmp, ex.cfg = self.tmp, self.cfg
+        self.backend.claims.append(ExecutorTests.make_job(ex))
+        self.assertTrue(worker.tick(self.api, self.cfg, self.state))
+        self.assertEqual([e[1]["status"] for e in self.backend.events], ["deploying", "healthy"])
+        self.assertTrue(self.state.conn_warned)
+
+    def test_tick_checks_connections_before_claiming_a_job(self):
+        self.assertFalse(worker.tick(self.api, self.cfg, self.state))
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{CID}/complete"])
+
+    def test_one_failing_connection_does_not_stop_the_others(self):
+        other_id = "33333333-3333-3333-3333-333333333333"
+        self.backend.connections = [pending_conn(), pending_conn(id=other_id)]
+        orig, seen = worker.check_role, []
+
+        def flaky(*a):
+            seen.append(a)
+            if len(seen) == 1:
+                raise TypeError("예상 못 한 오류")
+            return orig(*a)
+        worker.check_role = flaky
+        self.addCleanup(setattr, worker, "check_role", orig)
+        self.check()   # 예외가 밖으로 나오지 않는다
+        self.assertEqual([p for p, _ in self.posts()], [f"/api/worker/connections/{other_id}/complete"])
+
+    def test_records_of_connections_that_left_the_pending_list_are_dropped(self):
+        os.environ["FAKE_AWS_MODE"] = "denied"
+        self.check()
+        self.state.conn_blocked.add(CID)
+        self.assertIn(CID, self.state.conn_tries)
+        self.backend.connections = []   # 완료·삭제돼 목록에서 사라졌다
+        self.check()
+        self.assertEqual((self.state.conn_tries, self.state.conn_blocked), ({}, set()))
+
+    def test_input_rules_match_the_backend_schema(self):
+        schemas = Path(__file__).resolve().parents[2] / "back" / "app" / "schemas.py"
+        if not schemas.is_file():
+            self.skipTest("back/app/schemas.py 없음")
+        src = schemas.read_text(encoding="utf-8")
+        role = re.search(r'pattern=r"(\^arn:\(aws[^"]+)"', src).group(1)
+        samples = [ROLE_ARN, "arn:aws-cn:iam::123456789012:role/path/Name", "arn:aws:iam::12345:role/x", "arn:aws:iam::123456789012:user/x",
+                   "arn:aws:iam::123456789012:role/", "arn:aws:iam::123456789012:role/a b", "arn:gcp:iam::123456789012:role/x"]
+        for s in samples:
+            with self.subTest(arn=s):
+                self.assertEqual(bool(re.fullmatch(role, s)), bool(worker.ROLE_ARN_RE.match(s)))
+        self.assertIn('external_id = f"pc-{os.urandom(16).hex()}"', (schemas.parent / "main.py").read_text(encoding="utf-8"))
+        self.assertTrue(worker.EXTERNAL_ID_RE.match("pc-" + "0f" * 16))
+        self.assertIn("min_length=35, max_length=35", src)   # pc- + 32자
+
+
+TEMPLATE = Path(__file__).resolve().parents[1] / "connection" / "paved-clouds-connection.yaml"
+
+
+class _CallbackServer:
+    """CloudFormation 콜백을 받는 백엔드의 role-callback 경로 흉내."""
+
+    def __init__(self, code=200):
+        self.requests, self.code = [], code
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                outer.requests.append((self.path, json.loads(self.rfile.read(n))))
+                self.send_response(outer.code)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/api/connections/{CID}/role-callback"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TemplateTests(unittest.TestCase):
+    """infra/connection/paved-clouds-connection.yaml. 실제 CloudFormation 스택은 만들지 않는다."""
+
+    def setUp(self):
+        self.text = TEMPLATE.read_text(encoding="utf-8")
+
+    def parsed(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("PyYAML 없음(표준 라이브러리만으로는 YAML을 읽을 수 없다)")
+
+        def tag(loader, suffix, node):   # !Ref, !Sub 같은 CloudFormation 약식 함수
+            if isinstance(node, yaml.ScalarNode):
+                value = loader.construct_scalar(node)
+            elif isinstance(node, yaml.SequenceNode):
+                value = loader.construct_sequence(node, deep=True)
+            else:
+                value = loader.construct_mapping(node, deep=True)
+            return {suffix: value}
+
+        class Loader(yaml.SafeLoader):
+            pass
+        Loader.add_multi_constructor("!", tag)
+        return yaml.load(self.text, Loader=Loader)
+
+    def test_role_trusts_only_the_operator_account_with_the_external_id(self):
+        t = self.parsed()
+        role = t["Resources"]["PavedCloudsRole"]["Properties"]
+        self.assertEqual(role["RoleName"], "PavedCloudsReadOnlyRole")   # back/API.md의 complete 예시와 같은 이름
+        (stmt,) = role["AssumeRolePolicyDocument"]["Statement"]
+        self.assertEqual((stmt["Effect"], stmt["Action"]), ("Allow", "sts:AssumeRole"))
+        self.assertEqual(stmt["Principal"], {"AWS": {"Sub": "arn:${AWS::Partition}:iam::${PlatformAccountId}:root"}})
+        self.assertEqual(stmt["Condition"], {"StringEquals": {"sts:ExternalId": {"Ref": "ExternalId"}}})
+        self.assertEqual(role["ManagedPolicyArns"], [{"Sub": "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"}])
+        self.assertNotIn("AdministratorAccess", self.text)
+
+    def test_parameters_are_the_ones_the_backend_link_fills_in(self):
+        t = self.parsed()
+        self.assertEqual(set(t["Parameters"]), {"ExternalId", "PlatformAccountId", "RoleCallbackUrl"})
+        main = Path(__file__).resolve().parents[2] / "back" / "app" / "main.py"
+        if main.is_file():
+            src = main.read_text(encoding="utf-8")
+            for name in t["Parameters"]:
+                self.assertIn(f"param_{name}", src)   # 링크에 param_<이름>으로 실린다
+        self.assertRegex("pc-" + "0f" * 16, t["Parameters"]["ExternalId"]["AllowedPattern"])
+        self.assertTrue(worker.EXTERNAL_ID_RE.match("pc-" + "0f" * 16))
+        self.assertIsNone(re.match(t["Parameters"]["ExternalId"]["AllowedPattern"], "pc-short"))
+        self.assertIsNone(re.match(t["Parameters"]["RoleCallbackUrl"]["AllowedPattern"], "http://insecure.example/cb"))
+
+    def test_every_reference_points_to_a_declared_parameter_or_resource(self):
+        t = self.parsed()
+        known = set(t["Parameters"]) | set(t["Resources"])
+        refs = []
+
+        def walk(node):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k == "Ref":
+                        refs.append(v)
+                    elif k == "GetAtt":
+                        refs.append(v.split(".")[0] if isinstance(v, str) else v[0])
+                    elif k == "Sub" and isinstance(v, str):
+                        refs.extend(r.split(".")[0] for r in re.findall(r"\$\{([^}]+)\}", v))
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(t["Resources"])
+        walk(t["Outputs"])
+        self.assertTrue(refs)
+        self.assertEqual([r for r in refs if r not in known and not r.startswith("AWS::")], [])
+        # 콜백 관련 리소스는 모두 같은 조건 아래에 있다(콜백 주소가 없으면 만들지 않는다)
+        self.assertEqual({n for n, r in t["Resources"].items() if r.get("Condition") == "HasCallback"},
+                         {"CallbackFunctionRole", "CallbackFunction", "RoleCallback"})
+
+    def lambda_namespace(self, server_url, calls):
+        code = self.parsed()["Resources"]["CallbackFunction"]["Properties"]["Code"]["ZipFile"]
+        fake = type(sys)("cfnresponse")
+        fake.SUCCESS, fake.FAILED = "SUCCESS", "FAILED"
+        fake.send = lambda event, context, status, data, physical_id=None, **kw: calls.append((status, data, physical_id, kw))
+        sys.modules["cfnresponse"] = fake
+        self.addCleanup(sys.modules.pop, "cfnresponse", None)
+        ns = {}
+        exec(compile(code, "index.py", "exec"), ns)
+        event = {"RequestType": "Create", "ResourceProperties": {
+            "CallbackUrl": server_url, "ExternalId": EXT_ID, "AccountId": "123456789012", "RoleArn": ROLE_ARN}}
+        return ns["handler"], event
+
+    def test_callback_function_posts_the_backend_contract(self):
+        server = _CallbackServer()
+        self.addCleanup(server.close)
+        calls = []
+        handler, event = self.lambda_namespace(server.url, calls)
+        handler(event, None)
+        self.assertEqual(server.requests, [(f"/api/connections/{CID}/role-callback",
+                                            {"external_id": EXT_ID, "account_id": "123456789012", "role_arn": ROLE_ARN})])
+        self.assertEqual([c[0] for c in calls], ["SUCCESS"])
+        self.assertEqual(calls[0][2], "paved-clouds-role-callback")   # 갱신 때 물리 ID가 바뀌어 교체로 오인되지 않게 고정한다
+
+    def test_callback_function_does_not_retry_client_errors_and_fails_the_stack(self):
+        server = _CallbackServer(code=409)   # 다른 역할이 이미 보고된 연결
+        self.addCleanup(server.close)
+        calls = []
+        handler, event = self.lambda_namespace(server.url, calls)
+        handler(event, None)
+        self.assertEqual(len(server.requests), 1)
+        self.assertEqual(calls[0][0], "FAILED")
+        self.assertIn("HTTP 409", calls[0][3]["reason"])
+        self.assertNotIn(EXT_ID, calls[0][3]["reason"])
+
+    def test_callback_function_retries_server_errors_then_gives_up(self):
+        server = _CallbackServer(code=503)
+        self.addCleanup(server.close)
+        calls = []
+        handler, event = self.lambda_namespace(server.url, calls)
+        with mock.patch("time.sleep"):
+            handler(event, None)
+        self.assertEqual(len(server.requests), 4)
+        self.assertEqual(calls[0][0], "FAILED")
+
+    def test_callback_function_answers_delete_without_calling_the_backend(self):
+        server = _CallbackServer()
+        self.addCleanup(server.close)
+        calls = []
+        handler, event = self.lambda_namespace(server.url, calls)
+        handler({**event, "RequestType": "Delete"}, None)   # 응답이 없으면 스택 삭제가 한 시간 멈춘다
+        self.assertEqual(server.requests, [])
+        self.assertEqual([c[0] for c in calls], ["SUCCESS"])
 
 
 class PathTests(unittest.TestCase):

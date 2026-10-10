@@ -21,6 +21,7 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 | `modules/ecs-web-app/` | 검증된 모듈. 배포 1건 = 앱 전용 보안 그룹, 로그 그룹, 태스크 정의, 대상 그룹, 전용 포트 리스너, ECS 서비스, 오토스케일링 | 배포 루트가 호출 |
 | `modules/ecs-web-app/app-config.schema.json` | LLM 출력이 따라야 할 JSON 스키마. `variables.tf`의 LLM 입력과 규칙이 같다 | LLM 계층이 3·5단계 출력 검증에 사용 |
 | `deployments/_template/` | 배포 건별 루트 모듈 템플릿 | 플랫폼이 `deployments/<deploy_id>/`로 복사해서 사용 |
+| `connection/` | 사용자 AWS 계정 연결용 CloudFormation 템플릿(`paved-clouds-connection.yaml`). 백엔드의 빠른 생성 링크가 파라미터(`ExternalId`·`PlatformAccountId`·`RoleCallbackUrl`)를 채우고, 템플릿이 읽기 전용 역할을 만든 뒤 계정 ID·역할 ARN을 백엔드 콜백으로 보낸다. 기본 제품 흐름이 아니다 | 운영자가 공개 HTTPS(S3)에 올린 뒤 `AWS_CONNECTION_TEMPLATE_URL`에 지정. 아래 "사용자 AWS 연결" 참고 |
 | `scripts/deploy.sh` | 배포 1건을 만들고(`up`) 바꾸고(`update`) 되돌리고(`rollback`) 지우는(`destroy`) 자동화. 앱별 DB, 실패 분석 정보 수집(`diagnose`) 포함 | 플랫폼 백엔드 또는 담당자가 호출. 아래 "배포 스크립트" 참고 |
 | `scripts/test_infra.py` | 회귀 시험(AWS에 리소스를 만들지 않음). 입력 검증, 계획 내용, 스크립트 함수, 정적 검사 | 인프라를 바꾼 뒤 실행: `python infra/scripts/test_infra.py` |
 
@@ -217,6 +218,25 @@ bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 
 
 배포 디렉터리(`deployments/<id>/`)는 입력 파일(`*.auto.tfvars.json`)과 이력이 든 곳이라 state가 S3에 있어도 플랫폼 서버에 남겨 둔다. 입력 파일은 state에 없어서, 디렉터리를 잃으면 같은 입력으로 다시 만들어야 `destroy`할 수 있다.
 
+## 사용자 AWS 연결 (기존 연결 화면·백엔드 호환용)
+
+[PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)는 사용자 AWS 연결을 기본 가입·배포 흐름의 전제로 두지 않는다. 다만 백엔드(PR #23)에 연결 API가 남아 있어 인프라 쪽 두 부분을 맞췄다. 이 부분이 실제 AWS에서 끝까지 확인된 것은 아니다(아래 "검증 범위" 참고).
+
+```
+프런트 ─ POST /api/connections ─▶ 백엔드 ── 빠른 생성 링크(param_ExternalId·param_PlatformAccountId·param_RoleCallbackUrl)
+사용자 ─ CloudFormation 스택(connection/paved-clouds-connection.yaml) ─▶ 역할 PavedCloudsReadOnlyRole 생성
+스택의 콜백 ─ POST /api/connections/{id}/role-callback {external_id, account_id, role_arn} ─▶ 백엔드가 저장
+worker ─ GET /api/worker/connections/pending ─▶ sts:AssumeRole(ExternalId) ─▶ POST .../complete | .../fail
+```
+
+- **템플릿 호스팅**: 파일을 공개 HTTPS 주소(S3 객체 URL)에 올리고 백엔드 환경 변수 `AWS_CONNECTION_TEMPLATE_URL`로 지정한다. 백엔드의 `PLATFORM_AWS_ACCOUNT_ID`는 worker가 쓰는 **운영자 계정 ID**, `PUBLIC_API_BASE_URL`은 스택이 부를 수 있는 백엔드의 공개 HTTPS 주소다(없으면 콜백 없이 역할만 만들고 연결은 `pending`으로 남는다). 이 설정과 업로드는 운영자가 직접 한다.
+- **운영자 권한**: worker가 쓰는 AWS 자격 증명은 사용자 역할을 맡을 수 있어야 한다. 예) `sts:AssumeRole`을 `arn:aws:iam::*:role/PavedCloudsReadOnlyRole`에 허용하는 정책. 사용자 역할의 신뢰 정책은 `PlatformAccountId`의 계정과 연결별 `ExternalId`만 허용한다. 권한을 넓히거나 신뢰 정책을 바꾸는 것은 [OPERATOR_AWS.md](../docs/OPERATOR_AWS.md)의 운영자 실행 범위다.
+- **worker**: 콜백으로 역할 정보가 도착한 대기 연결만 확인한다(도착 전에는 기다린다). 확인은 `aws sts assume-role`로 하며 임시 자격 증명은 출력하지 않는다. 성공하면 `complete`, 역할 쪽 거부(`AccessDenied` 등)가 약 2분(8회) 이어지면 `fail`을 보고한다. 만료된 운영자 자격 증명이나 네트워크 오류는 사용자의 잘못이 아니므로 실패로 만들지 않고 다시 시도한다. 자세한 내용은 [worker/README.md](worker/README.md#connector-사용자-aws-연결-확인).
+- 이 역할은 **읽기 전용**(`ReadOnlyAccess`)이다. 사용자 계정에 앱을 배포하는 흐름(관리형 배포가 아닌 방식)은 이 템플릿 범위가 아니며, 구현하려면 권한 범위·승인 방식을 팀에서 먼저 정한다.
+- Windows의 AWS CLI로 `--template-body file://…`를 쓰면 한글 주석 때문에 `text contents could not be decoded` 오류가 난다. `AWS_CLI_FILE_ENCODING=UTF-8`을 지정한다(S3 주소로 만드는 빠른 생성 링크는 영향이 없다).
+- 틀린 ExternalId와 존재하지 않는 역할은 AWS가 같은 `AccessDenied` 문구로 응답한다. worker는 둘을 구분하지 못하고 둘 다 "역할 쪽 거부"로 센다.
+- 한 계정에는 연결 스택을 하나만 둘 수 있다(역할 이름 고정). 스택을 지우면 역할과 콜백용 Lambda가 함께 지워진다.
+
 ## 롤백
 
 정책은 [AGENTS §5](../AGENTS.md#5-처리-흐름과-계약), 요청·응답은 [백엔드 승인 계약](../back/API.md#실패-후-사용자-승인-롤백)을 따른다. 첫 배포 실패에는 롤백이 없다. AI 진단·수정안과 새 계획을 사용자 승인 후 재배포한다.
@@ -282,6 +302,12 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 ### worker 시험
 
 `python infra/worker/test_worker.py`. 시험용 HTTP 서버(`back/API.md`를 흉내)와 가짜 `deploy.sh`로 돌며 실제 AWS·Docker는 쓰지 않는다. 자세한 내용은 [worker/README.md](worker/README.md).
+
+사용자 AWS 연결 확인은 가짜 `aws` CLI와 시험용 백엔드로, 연결 템플릿은 YAML 구조 검사와 내장 Lambda 코드의 로컬 실행(가짜 `cfnresponse`, 로컬 HTTP 서버)으로만 시험했다. `cfn-lint`는 돌리지 않았다.
+
+2026-10-10에 시험 계정(sa-east-1)에서 실제로 확인한 것: 템플릿으로 스택 생성(역할 `PavedCloudsReadOnlyRole`, 운영자 계정 `root` 신뢰 + `sts:ExternalId` 조건, `ReadOnlyAccess`), 콜백 Lambda를 python3.12에서 실행해 콜백 주소에 닿지 못하면 `FAILED`(`Paved Clouds callback failed: URLError`)로 응답하고 스택이 롤백되는 것, 맞는 ExternalId로 `sts assume-role`이 성공하고 틀린 ExternalId는 `AccessDenied`(종료 코드 254)인 것, `worker.py`가 실제 AWS와 로컬 Docker 백엔드(PR #23)로 연결을 `connected`(계정 ID·역할 ARN 저장)로 만들고 거부가 이어지면 `error`로 만드는 것. 시험 스택·로그 그룹은 모두 지웠다.
+
+**확인하지 못한 것**: 콜백 Lambda의 **성공 경로**(공개 HTTPS 수신 지점을 만들 수 없어 백엔드의 `role-callback`은 같은 본문을 직접 POST해 대신했다), 공개 S3 템플릿 주소와 콘솔 빠른 생성 링크, 공개 주소로 배포된 백엔드, 사용자 계정이 운영자 계정과 다른 교차 계정 구성(시험은 같은 계정에서 했다).
 
 ### AWS 시험
 

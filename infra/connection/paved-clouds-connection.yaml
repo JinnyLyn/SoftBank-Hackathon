@@ -1,0 +1,137 @@
+# 사용자 AWS 계정 연결용 CloudFormation 템플릿.
+# 백엔드(back/app/main.py의 _aws_setup_url)가 만드는 빠른 생성 링크의 파라미터를 받는다:
+#   param_ExternalId, param_PlatformAccountId, param_RoleCallbackUrl
+# 이 스택이 하는 일
+#   1. 운영자 계정(PlatformAccountId)이 ExternalId를 대고 맡을 수 있는 읽기 전용 역할을 만든다.
+#   2. RoleCallbackUrl이 있으면 계정 ID와 역할 ARN을 그 주소로 보낸다(백엔드 POST /api/connections/{id}/role-callback).
+#      백엔드는 값을 저장만 하고, worker가 실제로 AssumeRole 해 본 뒤 연결을 완료한다(infra/worker/worker.py).
+# 이 템플릿은 백엔드가 읽을 수 있는 공개 HTTPS 주소(S3 객체 URL)에 올린 뒤 그 주소를 AWS_CONNECTION_TEMPLATE_URL에 넣어야 쓸 수 있다.
+# 사용자 계정 연결은 기본 제품 흐름이 아니다(docs/PRODUCT_DIRECTION.md). 이 템플릿은 기존 연결 화면·백엔드 API와의 호환을 위한 것이다.
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Paved Clouds connection - lets the Paved Clouds operator account assume a read-only role in this account (ExternalId required)
+
+Parameters:
+  ExternalId:
+    Type: String
+    Description: Per-connection ID issued by Paved Clouds. Do not change it.
+    AllowedPattern: "^pc-[0-9a-f]{32}$"
+    ConstraintDescription: Use the ExternalId from the Paved Clouds setup link (pc- followed by 32 hex characters).
+  PlatformAccountId:
+    Type: String
+    Description: AWS account ID of the Paved Clouds operator that is allowed to assume the role. Do not change it.
+    AllowedPattern: "^[0-9]{12}$"
+    ConstraintDescription: Use the 12-digit account ID from the Paved Clouds setup link.
+  RoleCallbackUrl:
+    Type: String
+    Default: ""
+    Description: HTTPS address that receives this account ID and the role ARN. Empty means no callback.
+    AllowedPattern: "^$|^https://[^\\s]+$"
+    ConstraintDescription: Use the HTTPS address from the Paved Clouds setup link, or leave it empty.
+
+Conditions:
+  HasCallback: !Not [!Equals [!Ref RoleCallbackUrl, ""]]
+
+Resources:
+  PavedCloudsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # 백엔드 API 문서의 예시와 같은 이름이다. 한 계정에는 연결 스택을 하나만 둘 수 있다
+      RoleName: PavedCloudsReadOnlyRole
+      Description: Read-only role that the Paved Clouds operator assumes with the ExternalId of this connection
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${PlatformAccountId}:root"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ExternalId
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/ReadOnlyAccess"
+
+  CallbackFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasCallback
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+  # 스택을 만들거나 고칠 때 한 번 실행돼 계정 ID와 역할 ARN을 백엔드로 보낸다. 이벤트(ExternalId 포함)는 로그에 남기지 않는다.
+  CallbackFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasCallback
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CallbackFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          import cfnresponse
+
+          PHYSICAL_ID = "paved-clouds-role-callback"
+
+
+          def handler(event, context):
+              # 삭제할 때는 보낼 것이 없다. 응답을 보내지 않으면 스택 삭제가 한 시간 동안 멈춘다
+              if event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, PHYSICAL_ID)
+                  return
+              props = event["ResourceProperties"]
+              body = json.dumps({
+                  "external_id": props["ExternalId"],
+                  "account_id": props["AccountId"],
+                  "role_arn": props["RoleArn"],
+              }).encode("utf-8")
+              reason = ""
+              for _ in range(4):
+                  try:
+                      req = urllib.request.Request(props["CallbackUrl"], data=body, method="POST",
+                                                   headers={"Content-Type": "application/json"})
+                      with urllib.request.urlopen(req, timeout=10) as r:
+                          if 200 <= r.status < 300:
+                              cfnresponse.send(event, context, cfnresponse.SUCCESS, {"RoleArn": props["RoleArn"]}, PHYSICAL_ID)
+                              return
+                          reason = "HTTP %d" % r.status
+                  except urllib.error.HTTPError as e:
+                      reason = "HTTP %d" % e.code
+                      if e.code < 500:
+                          break   # 4xx는 다시 보내도 같다(예: 409는 다른 역할이 이미 보고된 연결)
+                  except (urllib.error.URLError, OSError) as e:
+                      reason = type(e).__name__
+                  time.sleep(3)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, PHYSICAL_ID,
+                               reason="Paved Clouds callback failed: " + reason)
+
+  RoleCallback:
+    Type: Custom::PavedCloudsRoleCallback
+    Condition: HasCallback
+    Properties:
+      ServiceToken: !GetAtt CallbackFunction.Arn
+      CallbackUrl: !Ref RoleCallbackUrl
+      ExternalId: !Ref ExternalId
+      AccountId: !Ref AWS::AccountId
+      RoleArn: !GetAtt PavedCloudsRole.Arn
+
+Outputs:
+  RoleArn:
+    Description: Role that the Paved Clouds operator assumes
+    Value: !GetAtt PavedCloudsRole.Arn
+  AccountId:
+    Description: This AWS account ID
+    Value: !Ref AWS::AccountId
