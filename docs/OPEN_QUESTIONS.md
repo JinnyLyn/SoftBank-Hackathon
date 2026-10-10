@@ -40,7 +40,7 @@
 | 공통 API | 배포·상태·롤백 요청/응답과 오류·상태 스키마 | 프런트·백엔드·어댑터 통합 |
 | 공유 인프라 | PR #6은 SSM·S3 state·앱별 listener를 구현. 앱 모듈의 공유 ALB/DB 보안 그룹 변경 소유권은 여전히 미결 | AWS 모듈 |
 | 비용 | foundation 고정 비용과 앱 추가 비용의 포함 범위, 리전·가격 기준 | 비용 표시·예산 판정 |
-| 최저·평균·최대 3안 선택 | 인프라 worker(`infra/worker`)는 사용자 월 예산 안에서 세 안을 계산해 `variables.options`로 알리고 계획은 추천 안 하나만 등록한다(`peak_monthly` = 부하가 최대일 때 비용 기준으로 예산 판정). 사용자가 다른 안을 고르는 API(선택한 `tier`를 worker에 전달→그 안으로 재계획), 프런트의 세 안 표시, `monthly_budget_usd`가 분석 결과 `scale`로 전달되는 경로는 합의 필요. 태스크 수 상한을 없앴으므로 큰 예산에서 `max_tasks`가 4를 넘는 배포의 실제 검증과 공용 RDS 연결 수 한도 확인도 필요 | 프런트·백엔드·인프라 |
+| 최저·평균·최대 3안 선택 | 인프라 worker(`infra/worker`)는 사용자 월 예산 안에서 세 안을 계산해 `variables.options`로 알리고 계획은 추천 안 하나만 등록한다(`peak_monthly` = 부하가 최대일 때 비용 기준으로 예산 판정). 사용자가 다른 안을 고르는 API(선택한 `tier`를 worker에 전달→그 안으로 재계획), 프런트의 세 안 표시, `monthly_budget_usd`가 분석 결과 `scale`로 전달되는 경로는 합의 필요. 태스크 수 상한을 없앤 대신 worker가 Fargate vCPU 할당량(리전당 기본 6)을 조회해 최대 안을 제한한다(배포 계정에 `servicequotas:GetServiceQuota`·`servicequotas:GetAWSDefaultServiceQuota`·`cloudwatch:GetMetricStatistics` 읽기 권한 필요, 읽지 못하면 계획을 멈추고 `--skip-quota-check`로만 건너뜀). 이 조회의 실제 AWS 실행, 큰 예산에서 `max_tasks`가 4를 넘는 배포의 실제 검증, 공용 RDS 연결 수 한도 확인은 별도로 필요 | 프런트·백엔드·인프라 |
 | CI/CD | 10/10 초기 단계 기준: 구현된 파트의 독립 검사부터 적용하고 연결된 경계에 통합 검사를 추가(`CI.md`). 플랫폼 DB·프런트 통합, 새 check의 필수 등록, 실제 배포/CD는 별도 | 저장소 자동화 |
 
 담당자가 확정되면 각 항목에 이름·기한·결정 링크를 덧붙인다. 위 표는 역할 배정을 새로 확정한 것이 아니다.

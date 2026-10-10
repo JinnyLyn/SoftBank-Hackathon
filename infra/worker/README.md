@@ -81,19 +81,30 @@ python infra/worker/worker.py --once             # 한 번만 점검
 | 안 | 구성 | 금액 기준 |
 |---|---|---|
 | 최저 `lean` | xsmall 1개 고정 | 예산과 무관하게 가장 작은 구성 |
-| 평균 `balanced` | small, 최소 1개 | 최저와 최대 안의 **중간 금액**까지 `max_tasks`를 채움 |
+| 평균 `balanced` | small, 최소 1개 | 최저와 **실제로 만든 최대 안**의 중간 금액까지 `max_tasks`를 채움 |
 | 최대 `roomy` | medium, 최소 2개 | **예산 한도**까지 `max_tasks`를 채움 |
 
-- `max_tasks`는 코드에 상한이 없고 예산이 허용하는 만큼 정해진다(예: foundation 기본 구성(3 AZ, NAT 3대)에서 월 $300이면 최대 안은 medium 2~3개, $1000이면 2~14개). 예산을 늘리면 최대 안도 따라 커진다.
+- `max_tasks`는 코드에 상한이 없고 예산이 허용하는 만큼 정해진다(예: foundation 기본 구성(3 AZ, NAT 3대)에서 월 $300이면 최대 안은 medium 2~3개, $1000이면 2~14개). 예산을 늘리면 최대 안도 따라 커진다. 단, 아래 "Fargate vCPU 할당량"이 이를 다시 제한한다.
+- 평균 안의 기준은 예산 원금이 아니라 최대 안의 실제 금액이다. 태스크는 정수 개라 최대 안이 예산을 다 쓰지 못할 수 있어서, 원금 기준이면 평균이 중간보다 위로 치우친다(월 $250이면 최저 $91.40·최대 $199.73의 중간은 $145.57인데 원금 기준은 $168.78이 나왔다).
 - 예산이 작아 최대 안의 최소 구성(medium 2개)을 못 담으면 평균 안을 예산 한도까지 채워 최대 안으로 삼는다. 그것도 못 담으면 최저 안만 남는다. 최저 안도 예산을 넘으면 계획을 만들지 않고 이유와 함께 종료한다.
 - 예산이 없으면 예산 판정을 하지 않고 프리셋 세 안(1~1, 1~2, 2~4)을 그대로 쓴다.
-- 이 중 추천 안은 예상 사용자 수와 접속 패턴으로 고른다. 예산 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다.
+- 이 중 추천 안은 예상 사용자 수와 접속 패턴으로 고른다. 예산·할당량 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다. 이유 문구는 실제로 만든 안의 수만 말한다(안이 2개면 "2개 안은 모두…").
 - 비교 금액은 두 가지다. `total_monthly`는 평소(`min_tasks`개) 비용, `peak_monthly`는 부하가 최대일 때 비용이다. 승인 화면으로 가는 `cost_estimate.amount`는 평소 비용이다.
 - 제외 항목(NAT 인스턴스 EC2, ALB 처리 용량·데이터 전송, 로그·ECR·백업 저장)은 두 금액 모두에 들어 있지 않다. 그래서 실제 청구는 예산보다 클 수 있다. 이를 알아채려면 foundation의 `budget_monthly_usd` 알림(`infra/README.md`)을 쓴다.
 
+### Fargate vCPU 할당량
+
+예산만으로 `max_tasks`를 정하면 계정의 Fargate 할당량보다 큰 최대 구성이 나올 수 있다. AWS 문서의 기본 할당량("Fargate On-Demand vCPU resource count")은 **리전당 6 vCPU**라서, 예를 들어 월 $1000의 최대 안(medium 14개 = 14 vCPU)은 승인해도 최대 용량까지 늘지 못한다. 그래서 planner는 `foundation-info` 다음에 `fetch_fargate_capacity`로 한도를 읽고, 모든 안의 부하 최대 vCPU가 **남은 vCPU = 할당량 - 사용 중** 안에 들게 `max_tasks`를 줄인다(`cost.recommend(..., max_vcpu=)`).
+
+- 할당량: `aws service-quotas get-service-quota --service-code fargate --quota-code L-3032A538`. 적용된 값이 없는 계정은 `get-aws-default-service-quota`로 기본값을 읽는다.
+- 사용 중인 vCPU: CloudWatch `AWS/Usage`의 `ResourceCount`(차원 `Service=Fargate`, `Type=Resource`, `Resource=vCPU`, `Class=Standard/OnDemand`, 단위 vCPU)의 최근 30분 최댓값. 할당량 응답에 `UsageMetric`이 있으면 그 네임스페이스·차원을 우선한다. 데이터가 없으면 0으로 본다. 이 계정·리전의 모든 Fargate 작업(다른 앱 포함)이 포함된다.
+- 줄어든 안은 `options[].quota_limited=true`이고 이유 문구에 "Fargate 할당량(남은 N vCPU)"이 들어간다. 최소 구성도 못 담는 안은 빠지고, 가장 작은 안(0.25 vCPU)도 못 담으면 계획을 만들지 않고 이유와 함께 종료한다.
+- **읽지 못하면 멈춘다.** 한도를 모른 채 추천하지 않고 `PlanError`로 종료한다(`fetch_foundation`과 같은 원칙). 배포 계정에 `servicequotas:GetServiceQuota`, `servicequotas:GetAWSDefaultServiceQuota`, `cloudwatch:GetMetricStatistics` 권한이 필요하다. 권한이 없는 계정에서는 `--skip-quota-check`로 worker를 실행하면 조회를 건너뛰며(계획 요약에 "할당량 확인을 건너뜀"이 남는다) 이때는 할당량보다 큰 구성이 추천될 수 있다.
+- 한계: 현재 사용 중인 vCPU만 뺀다. 다른 앱이 부하로 최대까지 늘어날 때 쓸 몫은 따로 잡아 두지 않으므로, 여러 앱의 최대치를 합치면 할당량을 넘을 수 있다. 롤링 배포 중 옛·새 태스크가 함께 떠 있는 순간의 vCPU도 반영하지 않는다. 지표는 몇 분 늦게 올라온다.
+
 ### 계획 변수 (프런트가 읽는 키)
 
-`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`(`app_monthly`, `shared_monthly`, `peak_monthly`, `budget_usd`, `excluded`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `headline`, `tradeoff`, `recommended`)를 담는다.
+`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`(`app_monthly`, `shared_monthly`, `peak_monthly`, `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
 현재는 **권장 단계 하나만** 계획으로 등록하고, 나머지 안은 `options`로 비교 정보만 알린다. 단계마다 Terraform 저장 계획이 따로 필요한데 한 배포 폴더에는 계획 하나만 둘 수 있어서, 단계 비교용 여러 계획은 아직 만들지 않았다(프런트 `README`의 "추천 비교표"는 계획이 하나면 그 하나만 보여 준다). 사용자가 다른 안을 고르는 흐름(선택한 안을 worker에 전달해 그 안으로 다시 계획)은 백엔드·프런트와 계약을 맞춰야 한다(`docs/OPEN_QUESTIONS.md`).
 
 ## executor: 승인된 작업 실행

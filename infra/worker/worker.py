@@ -36,6 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -63,6 +64,14 @@ ROLE_SIDE_ERRORS = {"ValidationError", "RegionDisabledException"}
 AMBIGUOUS_ERRORS = {"AccessDenied"}
 VERIFY_SESSION_NAME = "paved-clouds-verify"
 ASSUME_ROLE_TIMEOUT = 15   # 초. aws sts assume-role 한 번의 제한 시간. 시험에서는 줄인다
+# Fargate On-Demand vCPU 할당량("Fargate On-Demand vCPU resource count", 리전당 기본 6, 계정마다 다를 수 있다)과 그 사용량 지표.
+# 사용량 지표는 AWS/Usage 네임스페이스의 ResourceCount이고 단위는 vCPU다(Amazon ECS 개발자 안내서 "AWS Fargate usage metrics").
+# 할당량 응답의 UsageMetric이 있으면 그 값을 우선하고, 없을 때만 아래 차원을 쓴다
+FARGATE_QUOTA_SERVICE = "fargate"
+FARGATE_QUOTA_CODE = "L-3032A538"
+FARGATE_USAGE_DIMENSIONS = {"Service": "Fargate", "Type": "Resource", "Resource": "vCPU", "Class": "Standard/OnDemand"}
+QUOTA_TIMEOUT = 30           # 초. aws CLI 호출 한 번의 제한 시간
+USAGE_WINDOW_MINUTES = 30    # 사용 중인 vCPU를 이 시간 동안의 최댓값으로 본다(지표는 몇 분 늦게 올라오고, 늘었다 줄어드는 사용량의 최대를 잡으려고)
 # 로그를 백엔드로 보내기 전에 한 번 더 가린다(백엔드도 가리지만 호출 측에서도 비밀을 보내지 않아야 한다)
 REDACT_RES = [
     re.compile(r"(?i)\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -96,7 +105,8 @@ class Config:
     deploy_sh: Path = INFRA / "scripts" / "deploy.sh"
     deployments_dir: Path = INFRA / "deployments"
     bash: str = field(default_factory=lambda: find_bash())
-    aws_cmd: list = field(default_factory=lambda: ["aws"])   # 연결 확인에 쓰는 AWS CLI. 시험에서는 가짜 스크립트로 바꾼다
+    aws_cmd: list = field(default_factory=lambda: ["aws"])   # 연결 확인과 Fargate 할당량 조회에 쓰는 AWS CLI. 시험에서는 가짜 스크립트로 바꾼다
+    quota_check: bool = True   # False면 Fargate vCPU 할당량을 조회하지 않고 제한하지 않는다(--skip-quota-check)
     region: str = ""
     poll_seconds: float = 5.0
     plan_timeout: int = 900
@@ -367,6 +377,72 @@ def fetch_foundation(cfg, env):
     return d or None
 
 
+class QuotaError(Exception):
+    """AWS CLI로 할당량·사용량을 읽지 못했다(권한 부족, 네트워크, 응답 형식). fetch_fargate_capacity가 PlanError로 바꾼다."""
+
+
+def aws_json(cfg, env, args):
+    """aws CLI를 JSON 출력으로 불러 결과를 돌려준다. 실패하면 QuotaError."""
+    region = ["--region", cfg.region] if cfg.region else []
+    name = " ".join(args[:2])
+    try:
+        rc, out, err = run_capture([*cfg.aws_cmd, *args, *region, "--output", "json"], QUOTA_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        raise QuotaError(f"aws {name}이 {QUOTA_TIMEOUT}초 안에 끝나지 않았습니다") from None
+    except OSError as e:
+        raise QuotaError(f"aws CLI를 실행하지 못했습니다({type(e).__name__})") from None
+    if rc != 0:
+        raise QuotaError(f"aws {name} 실패: {redact((err or out).strip())[-200:]}")
+    try:
+        data = json.loads(out)
+    except ValueError:
+        raise QuotaError(f"aws {name}의 출력이 JSON이 아닙니다") from None
+    if not isinstance(data, dict):
+        raise QuotaError(f"aws {name}의 출력 형식이 올바르지 않습니다")
+    return data
+
+
+def fetch_fargate_capacity(cfg, env):
+    """이 계정·리전의 Fargate On-Demand vCPU 할당량과 사용 중인 vCPU를 읽어 {quota_vcpu, used_vcpu, available_vcpu}로 돌려준다.
+
+    예산만으로 max_tasks를 정하면 할당량(리전당 기본 6 vCPU)보다 큰 최대 구성이 추천돼, 승인된 계획이 광고한 최대 용량에 닿지 못할 수 있다.
+    그래서 최대 안을 만들기 전에 한도를 읽는다. 사용 중인 vCPU(다른 앱 포함)는 최근 USAGE_WINDOW_MINUTES분 지표의 최댓값이다.
+    다른 앱이 부하로 최대까지 늘어날 때 쓸 몫은 따로 잡아 두지 않는다(현재 사용량만 뺀다).
+    읽지 못하면 한도를 모른 채로 추천하지 않고 PlanError로 멈춘다(fetch_foundation과 같은 원칙). 확인을 건너뛰려면 cfg.quota_check=False."""
+    try:
+        try:
+            data = aws_json(cfg, env, ["service-quotas", "get-service-quota", "--service-code", FARGATE_QUOTA_SERVICE, "--quota-code", FARGATE_QUOTA_CODE])
+        except QuotaError:
+            # 적용된 값이 따로 없는 계정은 기본 할당량만 조회된다
+            data = aws_json(cfg, env, ["service-quotas", "get-aws-default-service-quota", "--service-code", FARGATE_QUOTA_SERVICE, "--quota-code", FARGATE_QUOTA_CODE])
+        quota = data.get("Quota")
+        value = quota.get("Value") if isinstance(quota, dict) else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise QuotaError("Fargate vCPU 할당량 값을 해석하지 못했습니다")
+        metric = quota.get("UsageMetric") if isinstance(quota.get("UsageMetric"), dict) else {}
+        dims = metric.get("MetricDimensions")
+        if not isinstance(dims, dict) or not dims or not all(isinstance(k, str) and isinstance(v, str) for k, v in dims.items()):
+            dims = FARGATE_USAGE_DIMENSIONS
+        end = datetime.now(timezone.utc).replace(microsecond=0)
+        start = end - timedelta(minutes=USAGE_WINDOW_MINUTES)
+        stamp = "%Y-%m-%dT%H:%M:%SZ"
+        stats = aws_json(cfg, env, [
+            "cloudwatch", "get-metric-statistics",
+            "--namespace", metric.get("MetricNamespace") or "AWS/Usage", "--metric-name", metric.get("MetricName") or "ResourceCount",
+            "--dimensions", *[f"Name={k},Value={v}" for k, v in dims.items()],
+            "--start-time", start.strftime(stamp), "--end-time", end.strftime(stamp), "--period", "300", "--statistics", "Maximum"])
+        points = stats.get("Datapoints")
+        if not isinstance(points, list):
+            raise QuotaError("Fargate 사용량 지표의 Datapoints를 해석하지 못했습니다")
+        seen = [p["Maximum"] for p in points if isinstance(p, dict) and isinstance(p.get("Maximum"), (int, float)) and not isinstance(p["Maximum"], bool)]
+        used = float(max(seen)) if seen else 0.0   # 지표가 없으면 그 시간 동안 실행 중인 Fargate 작업이 없었다고 본다
+    except QuotaError as e:
+        raise PlanError(f"Fargate 할당량을 읽지 못해 계획을 만들 수 없습니다({e}). 배포 계정에 servicequotas:GetServiceQuota, "
+                        "servicequotas:GetAWSDefaultServiceQuota, cloudwatch:GetMetricStatistics 권한이 있는지 확인하세요. "
+                        "확인을 건너뛰려면 worker를 --skip-quota-check로 실행하세요(할당량보다 큰 최대 구성이 추천될 수 있습니다)") from None
+    return {"quota_vcpu": float(value), "used_vcpu": used, "available_vcpu": max(float(value) - used, 0.0)}
+
+
 def upload_plan(api, plan_id, plan_file):
     """plan 파일을 백엔드에 올린다. 연결 실패·5xx는 몇 번 다시 시도한다."""
     for attempt in range(REPORT_RETRIES):
@@ -425,7 +501,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     app_config_from_analysis(result, "lean")   # 앱 설정도 검증만 먼저 한다. 단계별 크기는 아래에서 고른 단계로 다시 정한다
     env = child_env(cfg)
     foundation = fetch_foundation(cfg, env)   # 비용을 확정하기 전에 최신 foundation 구성을 읽는다
-    rec = cost.recommend(users, pattern, budget, prices, arch, foundation)
+    capacity = fetch_fargate_capacity(cfg, env) if cfg.quota_check else None   # 최대 구성이 Fargate vCPU 할당량을 넘지 않게 한도를 읽는다
+    rec = cost.recommend(users, pattern, budget, prices, arch, foundation, capacity["available_vcpu"] if capacity else None)
     if rec["recommended"] is None:
         raise PlanError(rec["reason"])
     tier = rec["recommended"]
@@ -472,7 +549,9 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
         "resources": est["resources"],
         "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "peak_monthly": est["peak_monthly"],
-                 "budget_usd": budget, "excluded": est["excluded"]},
+                 "peak_vcpu": est["peak_vcpu"], "budget_usd": budget, "excluded": est["excluded"]},
+        # Fargate On-Demand vCPU 할당량 조회 결과(quota_vcpu, used_vcpu, available_vcpu). 조회를 건너뛰었으면 None
+        "fargate_vcpu": capacity,
         # 최저·평균·최대 금액 순의 비교 안. 승인 화면이 세 안을 나란히 보여주는 데 쓴다(선택한 안은 recommended=True)
         "options": rec["options"],
     }
@@ -483,6 +562,9 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         f"월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
         f"부하가 최대일 때(태스크 {app['max_tasks']}개) 월 ${est['peak_monthly']:.2f}"
         + (f", 월 예산 ${budget:.2f} 이내" if budget is not None else ", 월 예산 입력 없음"),
+        (f"Fargate vCPU 할당량: 한도 {capacity['quota_vcpu']:g}, 사용 중 {capacity['used_vcpu']:g}, 남은 {capacity['available_vcpu']:g}. "
+         f"부하가 최대일 때 이 앱은 {est['peak_vcpu']:g} vCPU" if capacity else
+         f"Fargate vCPU 할당량 확인을 건너뜀(--skip-quota-check): 부하가 최대일 때 이 앱은 {est['peak_vcpu']:g} vCPU이며 할당량 안인지 확인하지 않았다"),
         f"안 비교(평소·최대 월 비용): {comparison}",
         f"기준: {est['region']}, {est['pricing_as_of']} 가격표. 제외: " + "; ".join(est["excluded"]),
         f"선택 이유: {rec['reason']}",
@@ -872,12 +954,15 @@ def main(argv=None):
     p.add_argument("--poll", type=float, default=float(os.environ.get("POLL_SECONDS", "5")), help="점검 간격(초)")
     p.add_argument("--once", action="store_true", help="한 번만 점검하고 끝낸다")
     p.add_argument("--arch", default=os.environ.get("TARGET_ARCH", ""), help="X86_64 또는 ARM64(기본: 이 PC의 docker)")
+    p.add_argument("--skip-quota-check", action="store_true",
+                   help="Fargate vCPU 할당량을 조회하지 않는다. 배포 계정에 servicequotas·cloudwatch 읽기 권한이 없을 때만 쓴다(할당량보다 큰 구성이 추천될 수 있다)")
     a = p.parse_args(argv)
     token = os.environ.get("WORKER_API_TOKEN", "")
     if not token:
         print("오류: WORKER_API_TOKEN 환경 변수가 필요합니다(백엔드와 같은 값)", file=sys.stderr)
         return 2
-    cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll)
+    cfg = Config(api_url=a.api_url, token=token, deploy_sh=Path(a.deploy_sh), region=os.environ.get("AWS_REGION", ""), poll_seconds=a.poll,
+                 quota_check=not a.skip_quota_check)
     arch = a.arch
     if not arch:
         rc, out, _ = run_capture(deploy(cfg, "detect-arch"), 30, env=child_env(cfg))

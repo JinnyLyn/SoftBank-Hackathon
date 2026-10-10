@@ -60,9 +60,29 @@ case "$cmd" in
 esac
 '''
 
-# aws CLI의 가짜(sts assume-role만). 호출 인자는 $FAKE_AWS_LOG 에 남기고, 동작은 $FAKE_AWS_MODE 로 고른다
+# aws CLI의 가짜(sts assume-role, Fargate 할당량 조회). 호출 인자는 $FAKE_AWS_LOG 에 남긴다
+#   sts assume-role                : 동작은 $FAKE_AWS_MODE 로 고른다
+#   service-quotas, cloudwatch     : 할당량 FAKE_QUOTA_VALUE(기본 1000), 사용 중 vCPU FAKE_QUOTA_USED(기본 0, none이면 지표 없음).
+#                                    FAKE_QUOTA_FAIL=all(할당량 조회 전부 실패)|applied(적용된 값만 없음), FAKE_USAGE_FAIL=1(지표 조회 실패),
+#                                    FAKE_QUOTA_NOMETRIC=1(응답에 UsageMetric 없음)
 FAKE_AWS = r'''#!/usr/bin/env bash
 echo "$*" >> "$FAKE_AWS_LOG"
+case "$1" in
+  service-quotas)
+    case "${FAKE_QUOTA_FAIL:-0}" in
+      all) echo "An error occurred (AccessDeniedException) when calling the $2 operation: not authorized" >&2; exit 254 ;;
+      applied) if [ "$2" = "get-service-quota" ]; then echo "An error occurred (NoSuchResourceException) when calling the GetServiceQuota operation" >&2; exit 254; fi ;;
+    esac
+    metric=', "UsageMetric": {"MetricNamespace": "AWS/Usage", "MetricName": "ResourceCount", "MetricDimensions": {"Class": "Standard/OnDemand", "Resource": "vCPU", "Service": "Fargate", "Type": "Resource"}, "MetricStatisticRecommendation": "Maximum"}'
+    [ "${FAKE_QUOTA_NOMETRIC:-0}" = "0" ] || metric=""
+    printf '{"Quota": {"ServiceCode": "fargate", "QuotaCode": "L-3032A538", "QuotaName": "Fargate On-Demand vCPU resource count", "Value": %s%s}}\n' "${FAKE_QUOTA_VALUE:-1000}" "$metric"
+    exit 0 ;;
+  cloudwatch)
+    [ "${FAKE_USAGE_FAIL:-0}" = "0" ] || { echo "An error occurred (AccessDenied) when calling the GetMetricStatistics operation: not authorized" >&2; exit 254; }
+    if [ "${FAKE_QUOTA_USED:-0}" = "none" ]; then echo '{"Label": "ResourceCount", "Datapoints": []}'
+    else printf '{"Label": "ResourceCount", "Datapoints": [{"Timestamp": "2026-10-11T00:00:00+00:00", "Maximum": %s, "Unit": "None"}, {"Timestamp": "2026-10-11T00:05:00+00:00", "Maximum": 0, "Unit": "None"}]}\n' "${FAKE_QUOTA_USED:-0}"; fi
+    exit 0 ;;
+esac
 case "${FAKE_AWS_MODE:-ok}" in
   ok) echo "${FAKE_AWS_ARN:-arn:aws:sts::123456789012:assumed-role/PavedCloudsReadOnlyRole/paved-clouds-verify}" ;;
   denied) echo "An error occurred (AccessDenied) when calling the AssumeRole operation: User: arn:aws:iam::999999999999:user/operator is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole" >&2; exit 254 ;;
@@ -211,7 +231,7 @@ class Base(unittest.TestCase):
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
         for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL",
-                  "FAKE_AWS_MODE", "FAKE_AWS_ARN"):
+                  "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
         os.environ["FAKE_HEARTBEAT"] = worker.posix(self.tmp / "heartbeat")
@@ -220,6 +240,12 @@ class Base(unittest.TestCase):
         self.addCleanup(lambda: setattr(worker, "REPORT_RETRY_DELAY", self.old_retry_delay))
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.old_env)))
         self.cfg = worker.Config(token=TOKEN, deploy_sh=script, deployments_dir=self.tmp / "deployments")
+        # 모든 시험은 가짜 aws CLI를 쓴다(연결 확인과 Fargate 할당량 조회). 진짜 aws를 부르지 않는다
+        aws_script = self.tmp / "aws.sh"
+        aws_script.write_bytes(FAKE_AWS.encode("utf-8"))
+        self.aws_log = self.tmp / "aws.log"
+        os.environ["FAKE_AWS_LOG"] = worker.posix(self.aws_log)
+        self.cfg.aws_cmd = [self.cfg.bash, worker.posix(aws_script)]
         self.backend = FakeBackend()
         self.addCleanup(self.backend.close)
         self.api = worker.Api(self.backend.url, TOKEN, timeout=10)
@@ -227,6 +253,9 @@ class Base(unittest.TestCase):
 
     def calls(self):
         return self.log_file.read_text(encoding="utf-8").splitlines() if self.log_file.exists() else []
+
+    def aws_calls(self):
+        return self.aws_log.read_text(encoding="utf-8").splitlines() if self.aws_log.exists() else []
 
 
 GOOD_RESULT = {
@@ -389,6 +418,60 @@ class CostTests(unittest.TestCase):
                     self.assertLessEqual(got[tier]["peak_monthly"], exact)
                     below = {o["tier"] for o in cost.recommend("~1,000", "steady", exact - 0.01, self.p, foundation=foundation)["options"]}
                     self.assertNotIn(tier, below)   # 1센트만 모자라도 그 안은 만들 수 없다
+
+    def test_average_option_is_midway_between_the_lowest_and_the_actual_highest(self):
+        # 월 $250: 최대 안은 medium 2개(약 199.73)까지만 채워진다. 중간 금액은 예산 원금이 아니라 이 실제 최대 안 기준이어야 한다
+        low, avg, high = cost.recommend("~1,000", "steady", 250, self.p)["options"]
+        self.assertEqual((low["peak_monthly"], high["peak_monthly"]), (91.40, 199.73))
+        mid = (low["peak_monthly"] + high["peak_monthly"]) / 2   # 145.565
+        self.assertLessEqual(avg["peak_monthly"], mid)
+        over = cost.estimate("balanced", self.p, cfg={**cost.TIERS["balanced"], "max_tasks": avg["max_tasks"] + 1})
+        self.assertGreater(over["peak_monthly"], mid)   # 하나 더 늘리면 중간을 넘는다 = 중간에 가장 가깝게 채웠다
+        self.assertLess(avg["peak_monthly"], 150)   # 예산 원금 기준이면 168.78이 나왔다
+
+    def test_reason_counts_only_the_options_that_were_made(self):
+        for budget, n, want in [(300, 3, "3개 안은 모두"), (110, 2, "2개 안은 모두"), (100, 1, "하나뿐")]:
+            with self.subTest(budget=budget):
+                r = cost.recommend("~1,000", "steady", budget, self.p)
+                self.assertEqual(len(r["options"]), n)
+                self.assertIn(want, r["reason"])
+                self.assertNotIn("세 안 모두", r["reason"])   # 안이 세 개보다 적은데 세 안이라고 말하면 모순이다
+
+    def test_vcpu_quota_caps_presets_and_drops_options_that_cannot_fit(self):
+        # 예산이 없어도 할당량은 지킨다. 남은 3 vCPU: roomy(medium 1 vCPU, 2~4개)는 2~3개로 줄고, small(0.5 vCPU)은 영향이 없다
+        opts = {o["tier"]: o for o in cost.recommend("~10,000", "steady", None, self.p, max_vcpu=3)["options"]}
+        self.assertEqual((opts["roomy"]["max_tasks"], opts["roomy"]["peak_vcpu"], opts["roomy"]["quota_limited"]), (3, 3.0, True))
+        self.assertEqual((opts["balanced"]["max_tasks"], opts["balanced"]["quota_limited"]), (2, False))
+        # 남은 1.5 vCPU: roomy의 최소 구성(medium 2개 = 2 vCPU)을 못 담아 빠지고, 이유에 할당량이 나온다
+        r = cost.recommend("~10,000", "steady", None, self.p, max_vcpu=1.5)
+        self.assertEqual([o["tier"] for o in r["options"]], ["lean", "balanced"])
+        self.assertEqual(r["recommended"], "balanced")
+        self.assertIn("낮춤", r["reason"])
+        self.assertIn("할당량", r["reason"])
+        # 할당량을 모르면(None) 제한하지 않는다
+        self.assertEqual([o["max_tasks"] for o in cost.recommend("~10,000", "steady", None, self.p)["options"]], [1, 2, 4])
+
+    def test_budget_options_never_exceed_the_vcpu_quota(self):
+        # 월 $1000이면 할당량 없이는 최대 안이 medium 14개(14 vCPU). AWS 기본 할당량은 리전당 6 vCPU라 그만큼은 띄울 수 없다
+        self.assertEqual(cost.recommend("~10,000", "steady", 1000, self.p)["options"][-1]["peak_vcpu"], 14.0)
+        r = cost.recommend("~10,000", "steady", 1000, self.p, max_vcpu=6)
+        for o in r["options"]:
+            self.assertLessEqual(o["peak_vcpu"], 6)
+            self.assertLessEqual(o["peak_monthly"], 1000)
+        top = r["options"][-1]
+        self.assertEqual((top["tier"], top["max_tasks"], top["quota_limited"]), ("roomy", 6, True))
+        self.assertIn("할당량(남은 6 vCPU)", r["reason"])
+        # 평균 안은 할당량으로 줄어든 실제 최대 안을 기준으로 잡는다
+        low, avg, high = (o["peak_monthly"] for o in r["options"])
+        self.assertLessEqual(avg, (low + high) / 2)
+
+    def test_quota_too_small_for_the_smallest_option_gives_no_recommendation(self):
+        for budget in (None, 1000):
+            with self.subTest(budget=budget):
+                r = cost.recommend("~100", "steady", budget, self.p, max_vcpu=0.2)   # 가장 작은 구성은 0.25 vCPU가 필요하다
+                self.assertIsNone(r["recommended"])
+                self.assertEqual(r["options"], [])
+                self.assertIn("Fargate 할당량이 부족", r["reason"])
 
     def test_without_budget_the_three_presets_are_the_options(self):
         r = cost.recommend("~1,000", "steady", None, self.p)
@@ -578,6 +661,87 @@ class PlannerTests(Base):
         self.assertIn("안 비교", body["summary"])
         # 승인 화면에 나가는 금액은 평소 비용이다. 부하가 최대일 때 비용은 variables.cost와 요약에 따로 있다
         self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), 199.73, places=2)
+
+    def quota_plan(self, budget=1000, users="~10,000"):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users=users, monthly_budget_usd=budget)
+        return worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+
+    def test_plan_reads_the_fargate_quota_and_caps_the_biggest_option(self):
+        # 예산 $1000이면 할당량 없이는 medium 14개(14 vCPU)지만, 할당량 6 - 사용 중 2 = 남은 4 vCPU 안으로 줄어든다
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="2")
+        self.cfg.region = "sa-east-1"
+        self.quota_plan()
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        self.assertEqual(v["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 2.0, "available_vcpu": 4.0})
+        self.assertEqual((v["tier"], v["app"]["task_size"], v["app"]["min_tasks"], v["app"]["max_tasks"]), ("roomy", "medium", 2, 4))
+        self.assertEqual(v["cost"]["peak_vcpu"], 4.0)
+        top = v["options"][-1]
+        self.assertEqual((top["max_tasks"], top["peak_vcpu"], top["quota_limited"]), (4, 4.0, True))
+        self.assertTrue(all(o["peak_vcpu"] <= 4 for o in v["options"]))
+        self.assertIn("할당량(남은 4 vCPU)", v["reason"])
+        self.assertIn("Fargate vCPU 할당량: 한도 6, 사용 중 2, 남은 4", body["summary"])
+        # 할당량 조회 → 사용량 조회 순서이고, 문서에서 확인한 이름·차원·리전을 쓴다
+        quota, usage = [c for c in self.aws_calls() if c.startswith(("service-quotas", "cloudwatch"))]
+        self.assertIn("service-quotas get-service-quota --service-code fargate --quota-code L-3032A538", quota)
+        self.assertIn("--region sa-east-1", quota)
+        for part in ("cloudwatch get-metric-statistics", "--namespace AWS/Usage", "--metric-name ResourceCount", "Name=Service,Value=Fargate",
+                     "Name=Type,Value=Resource", "Name=Resource,Value=vCPU", "Name=Class,Value=Standard/OnDemand", "--statistics Maximum"):
+            self.assertIn(part, usage)
+
+    def test_usage_is_the_maximum_over_the_window_and_zero_without_datapoints(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="none")   # 지표가 비어 있다 = 그 시간 동안 실행 중인 작업이 없었다
+        self.quota_plan()
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 0.0, "available_vcpu": 6.0})
+
+    def test_usage_dimensions_fall_back_to_the_documented_ones_without_usage_metric(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="1", FAKE_QUOTA_NOMETRIC="1")
+        self.quota_plan()
+        usage = [c for c in self.aws_calls() if c.startswith("cloudwatch")][0]
+        self.assertIn("Name=Resource,Value=vCPU", usage)
+        self.assertIn("Name=Class,Value=Standard/OnDemand", usage)
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"]["available_vcpu"], 5.0)
+
+    def test_default_quota_is_used_when_the_applied_value_is_missing(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_FAIL="applied")
+        self.quota_plan()
+        calls = [c for c in self.aws_calls() if c.startswith("service-quotas")]
+        self.assertEqual([c.split()[1] for c in calls], ["get-service-quota", "get-aws-default-service-quota"])
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"]["quota_vcpu"], 6.0)
+
+    def test_not_enough_vcpu_for_the_smallest_option_is_a_plan_error(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="5.9")   # 남은 0.1 vCPU < 최소 구성 0.25 vCPU
+        with self.assertRaises(worker.PlanError) as cm:
+            self.quota_plan()
+        self.assertIn("Fargate 할당량이 부족", str(cm.exception))
+        self.assertEqual(self.backend.created_plans, [])
+        self.assertEqual(self.calls(), ["foundation-info"])   # plan·ID 생성·빌드·적용은 하지 않는다
+
+    def test_unreadable_quota_stops_planning_with_a_fix_hint(self):
+        for key, value in [("FAKE_QUOTA_FAIL", "all"), ("FAKE_USAGE_FAIL", "1")]:
+            with self.subTest(key=key):
+                os.environ.pop("FAKE_QUOTA_FAIL", None)
+                os.environ.pop("FAKE_USAGE_FAIL", None)
+                os.environ[key] = value
+                with self.assertRaises(worker.PlanError) as cm:
+                    self.quota_plan()
+                msg = str(cm.exception)
+                self.assertIn("Fargate 할당량을 읽지 못해", msg)
+                self.assertIn("servicequotas:GetServiceQuota", msg)
+                self.assertIn("--skip-quota-check", msg)
+                self.assertEqual(self.backend.created_plans, [])
+                self.assertFalse(any(c.startswith("up ") for c in self.calls()))   # 한도를 모른 채로 계획을 만들지 않는다
+
+    def test_skip_quota_check_does_not_call_aws_and_says_so(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_FAIL="all")   # 조회했다면 실패했을 환경
+        self.cfg.quota_check = False
+        self.quota_plan()
+        body = self.backend.created_plans[0]
+        self.assertEqual(self.aws_calls(), [])
+        self.assertIsNone(body["variables"]["fargate_vcpu"])
+        self.assertEqual(body["variables"]["app"]["max_tasks"], 14)   # 할당량으로 줄이지 않는다
+        self.assertIn("할당량 확인을 건너뜀", body["summary"])
 
     def test_plan_without_budget_uses_presets_and_says_so(self):
         res = json.loads(json.dumps(GOOD_RESULT))
@@ -1097,17 +1261,9 @@ class ConnectionTests(Base):
     """사용자 AWS 연결 확인(back/API.md의 worker 연결 경로). 실제 AWS는 부르지 않고 aws CLI는 가짜 스크립트로 대신한다."""
 
     def setUp(self):
-        super().setUp()
-        script = self.tmp / "aws.sh"
-        script.write_bytes(FAKE_AWS.encode("utf-8"))
-        self.aws_log = self.tmp / "aws.log"
-        os.environ["FAKE_AWS_LOG"] = worker.posix(self.aws_log)
-        self.cfg.aws_cmd = [self.cfg.bash, worker.posix(script)]
+        super().setUp()   # 가짜 aws CLI(self.cfg.aws_cmd, self.aws_calls())는 Base가 만든다
         self.state = worker.State(conn_retry_after=0.0)
         self.backend.connections = [pending_conn()]
-
-    def aws_calls(self):
-        return self.aws_log.read_text(encoding="utf-8").splitlines() if self.aws_log.exists() else []
 
     def posts(self):
         return [(p, b) for p, b, _ in self.backend.conn_posts]

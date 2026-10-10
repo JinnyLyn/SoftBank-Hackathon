@@ -66,7 +66,7 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 
 검증은 두 겹이다. 1차는 LLM 계층의 JSON 스키마, 2차는 Terraform 변수 검증과 사전 조건이다. JSON 스키마로 표현할 수 없는 `max_tasks >= min_tasks`는 LLM 계층 코드와 Terraform 사전 조건에서 확인한다.
 
-`min_tasks`·`max_tasks`는 1 이상의 정수이기만 하면 되고 **태스크 수 상한을 코드에 두지 않는다**(이전에는 `min_tasks` 1~2, `max_tasks` 1~4). 비용 한도는 사용자가 정한 월 예산이며 비용 계산 코드(`worker/cost.py`)가 부하가 최대일 때(`max_tasks`개)의 월 비용으로 판정한다. 이 모듈 자체는 비용을 막지 않으므로 직접 값을 넣는 경우에는 비용이 그대로 늘어난다. 상한이 없는 만큼 AWS 쪽 한도(Fargate·ECS 서비스 할당량)와 공용 RDS의 최대 연결 수(메모리 1GiB인 `db.t4g.micro`는 기본 파라미터에서 80개 안팎으로 알려져 있으나 이 저장소에서 확인하지는 않았다)를 넘지 않는지는 별도로 확인해야 한다. 태스크가 늘면 앱의 DB 연결도 태스크 수만큼 늘어난다.
+`min_tasks`·`max_tasks`는 1 이상의 정수이기만 하면 되고 **태스크 수 상한을 코드에 두지 않는다**(이전에는 `min_tasks` 1~2, `max_tasks` 1~4). 비용 한도는 사용자가 정한 월 예산이며 비용 계산 코드(`worker/cost.py`)가 부하가 최대일 때(`max_tasks`개)의 월 비용으로 판정한다. 이 모듈 자체는 비용을 막지 않으므로 직접 값을 넣는 경우에는 비용이 그대로 늘어난다. 상한이 없는 만큼 AWS 쪽 한도를 넘지 않아야 한다. **Fargate On-Demand vCPU 할당량**(리전당 기본 6 vCPU)은 worker가 계획을 만들 때 `service-quotas`·CloudWatch로 한도와 사용량을 읽어 모든 안의 부하 최대 vCPU를 남은 vCPU 안으로 줄인다([worker/README.md](worker/README.md#fargate-vcpu-할당량)). 이 모듈에 직접 값을 넣는 경우에는 이 확인을 거치지 않는다. 공용 RDS의 최대 연결 수(메모리 1GiB인 `db.t4g.micro`는 기본 파라미터에서 80개 안팎으로 알려져 있으나 이 저장소에서 확인하지는 않았다)는 확인하지 않는다. 태스크가 늘면 앱의 DB 연결도 태스크 수만큼 늘어난다.
 
 태스크 크기 프리셋 (6단계 비용 계산 코드도 같은 값을 쓴다):
 
@@ -367,6 +367,7 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - `db_multi_az`, `final_snapshot=true`로 삭제(스냅샷 남기기), `nat_high_availability=false`, `az_count=2`의 **실제 생성**(계획 내용만 회귀 시험으로 확인).
 - 두 배포를 정확히 동시에 `up`할 때의 포트 경합(문서에 한계를 적었다).
 - CPU 기반 오토스케일링(`max_tasks > min_tasks`)의 실제 증감, 부하 상황. 태스크 수 상한을 없앤 뒤 `max_tasks`가 4를 넘는 배포(예: 예산이 큰 경우)의 실제 생성과 공용 RDS 연결 수 한도.
+- worker의 Fargate vCPU 할당량 조회(`service-quotas get-service-quota`, CloudWatch `AWS/Usage`)를 **실제 AWS에서는 실행하지 않았다.** 가짜 `aws` CLI로 로직만 시험했다. 실제 응답 형식, 사용량 지표의 차원, 배포 계정의 `servicequotas:`·`cloudwatch:` 읽기 권한은 서버에서 확인해야 한다.
 - `large`·`xlarge` 태스크 크기의 실제 배포(계획 입력 검증과 비용 계산만 시험했다).
 - AWS Budgets 알림(`budget_monthly_usd`)의 실제 생성과 메일 수신. 가짜 자격 증명으로 계획 내용(예산 1개, 알림 3건)만 확인했고 실제 계정·권한에서는 적용하지 않았다.
 - `cpu_architecture = ARM64` 이미지.
