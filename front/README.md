@@ -37,12 +37,13 @@ npm run build
 | 승인하고 배포 | `POST /api/plans/{id}/approve` `{ expected_fingerprint }` → `POST /api/deployments` `{ plan_id, expected_fingerprint }` (202 = 대기열 등록) |
 | 배포 진행 | `GET /api/projects/{id}/status` 0.7초 간격 (404는 대기열 대기로 표시) |
 | 배포 이력 | `GET /api/deployments?limit=50` |
+| 사용 규모·월 예산 | ZIP은 업로드 쿼리, GitHub는 등록 본문의 `expected_users`·`traffic_pattern`·`monthly_budget_usd`·`purpose`. 백엔드가 저장하고 AI runner가 분석 결과 `scale` 로 복사해 인프라 worker가 구성·예산 검사에 씀 |
 
 ### 아직 백엔드와 맞춰야 할 것
 
 - **분석 결과(`result`) 형태**: 백엔드가 고정하지 않음. 화면은 `stack`(`[{label, value}]`), `findings`(`[{level: info|warn, title, detail}]`), `evidence`(문자열 또는 `{file, line, text}`)를 읽고, 없으면 최상위 값들을 스택 표로 보여 줌. LLM 담당과 합의 필요.
 - **계획 변수 중 화면용 키**: `tier`(lean/balanced/roomy), `recommended`(true면 추천), `headline`, `tradeoff`, `reason`, `resources`(`[{service, spec, monthlyUsd, why}]`). 없으면 비용 순서로 크기를 정하고 계획 전체를 한 줄로 보여 줌.
-- **사용 규모·월 예산 전달**: ZIP 업로드 쿼리로 보내고 있음(백엔드 저장 작업 중). GitHub 등록 본문에는 백엔드가 `scale` 을 받기 시작하면 추가. 저장되면 AI runner가 분석 결과 `scale` 로 복사해 인프라 worker가 구성·예산 검사에 씀.
+- **도메인(제안 API, 백엔드·인프라 미구현)**: `GET /api/domains/check?name=` → `{name, available, price_usd_per_year, reason?, suggestions?}`, `PUT /api/projects/{id}/domain` `{mode: own|buy|later, name}` → `{mode, name, one_time_usd, monthly_usd, records, note?}`, `POST /api/projects/{id}/domain/approve` `{name, one_time_usd}`(구매 확정), `status.domain` = `{state: skipped|registering|waiting_dns|issuing_cert|active|failed, name, message?, records?, url?}`. 404/405면 "나중에"(AWS 기본 주소)로 진행하고 안내함. 등록·DNS·인증서 진행은 mock에서만 동작.
 - **분석·계획 생성 시작**: 프로젝트를 등록하면 누가 분석과 계획 생성을 시작하는지 정해지지 않음. 화면은 결과가 생길 때까지 기다리기만 함.
 - **plan 요약 개수**: 추가/변경/삭제 개수를 주는 필드가 없어 `-` 로 표시.
 - **실패 후 수정**: 수정안 반영 API(`/fix`)가 없어 안내 문구로 실패 처리. `status` 의 `diagnosis` 는 `{cause, fix, patch: {file, before, after}}` 형태일 때 화면에 나옴.
