@@ -9,7 +9,7 @@
 | 단계 | 검사 범위 | 현재 적용 |
 |---|---|---|
 | 파트 독립 검증 | manifest 기반 설치, 문법·타입·빌드, 작은 동작 검사 | 프런트 빌드, 플랫폼 백엔드 기동·HTTP smoke, 인프라 정적 검사 |
-| 연결된 경계 검증 | 실제 임시 DB/API, 합의한 요청·응답 계약 | 샘플 앱 DB·브라우저 검사는 유지. 플랫폼 DB·migration과 프런트/API 검사는 후속 통합 작업 |
+| 연결된 경계 검증 | 실제 임시 DB/API, 합의한 요청·응답 계약 | 샘플 앱 DB·브라우저와 플랫폼 MySQL·migration·마스킹·롤백 승인 검사를 실행. 플랫폼 프런트/API는 후속 통합 작업 |
 | 제품 흐름 검증 | 소스 입력→분석→승인→배포 등 소수 핵심 E2E | 연결된 흐름부터 추가. 실제 AWS·유료 LLM 실행은 일반 PR 검사와 분리 |
 
 - **기능 담당자:** 변경한 동작의 테스트와 실행 방법을 코드와 함께 유지한다. CI 실패를 자신의 환경에서 재현할 수 있게 한다.
@@ -29,6 +29,7 @@
 - main 대상 PR의 생성·본문/제목 수정·추가 push·재오픈에 실행한다(`opened`, `edited`, `synchronize`, `reopened`). 본문 수정은 이 워크플로를 재실행하며 앱 빌드 전체를 재실행하지 않는다. 같은 PR의 이전 실행은 취소하고 최신 실행을 판정한다.
 - 템플릿의 필수 제목이 하나 있고 `해당 없음`·`해당 있음` 중 하나만 체크됐는지 확인한다. `해당 있음`은 항목마다 관련 기준, 실제 변경, 이유, 영향, 문서 처리, 미결 사항을 작성해야 한다. 빈칸·TODO·TBD·이유 없는 `미정`은 실패한다. `TODO: 추후 작성`, `TBD - 담당자 확인`처럼 뒤에 설명을 붙인 미작성 표시도 상세 항목과 문서 처리 사유에서 거부한다. `해당 없음`이면 상세 항목은 남기거나 삭제할 수 있다.
 - 제목·항목 이름과 블록 순서는 템플릿을 유지한다. 상세 내용은 여러 줄로 쓸 수 있지만 주석·코드 블록만으로 대신하지 않는다. 설명의 사실성·충분성이나 숨겨진 우회는 자동 판정하지 않는다.
+- 문서 처리 사유는 `변경 불필요(기존 기준 유지)`처럼 괄호로 붙여 써도 된다. ASCII·전각 괄호와 공백 유무를 허용하며, 괄호 안 빈칸·TODO·TBD는 계속 거부한다. Git guard의 보고 오류는 앱·롤백 검사 실패와 구분한다.
 - 실패 메시지에 나온 항목을 PR 본문에서 보완하면 새 실행으로 재검사한다. 이미 완료된 실행의 재실행은 당시 이벤트 본문을 사용하므로, 본문 변경 뒤 생성된 최신 실행을 확인한다.
 - 이벤트 파일 `GITHUB_EVENT_PATH`를 JSON 데이터로 읽는다. PR 본문을 셸 코드에 삽입하거나 로그에 출력하지 않고 추가 토큰·외부 호출을 사용하지 않는다.
 - main push와 수동 실행은 보고 검사 자체의 회귀 테스트만 실행하며 PR 본문을 요구하지 않는다.
@@ -60,7 +61,7 @@ python3 scripts/ci/check_pr_report.py --body-file /path/to/pr-body.md
 | `Sample frontend (MOCK browser)` | 항상 | Chrome에서 가입, 세션, 글쓰기, HTML 문자 표시, 응원/취소, 로그아웃, 로그인 오류, 새로고침 후 유지. API 없는 서버를 real 모드가 거부하는지도 확인 | 실제 API·DB |
 | `Sample app (real MySQL and browser)` | `sample-back/` 구현 존재 | 기존 Compose·Dockerfile 빌드, MySQL 8.4, DB 조회 `/health`, JSON 오류, 인증·쿠키 폐기, 글/투표 저장, 실제 브라우저에서 MOCK 전환 없음, DB 중지 후 `/health` JSON 500 | AWS/RDS, 부하, DB 재시작 후 복구·마이그레이션 |
 | `Platform frontend (typecheck and build)` | `front/` 구현 존재 | `npm ci`, TypeScript/Vite의 MOCK·실제 API 설정 빌드 | 실제 API/분석/승인/배포 흐름 |
-| `Platform backend (startup and API smoke)` | `back/` 구현 존재 | `.python-version`과 requirements 기반 설치, 의존성 호환성·문법, DB 없는 앱 기동·OpenAPI 및 오류 계약, MySQL 8.4 migration, 첫 실패 롤백 차단, 새 rollback plan/diff 승인, worker claim 계약 | 프런트 연동, LLM·AWS Terraform/ECS 실행, Docker 이미지 빌드 |
+| `Platform backend (API smoke and MySQL contracts)` | `back/` 구현 존재 | `.python-version`·requirements 기반 설치, 문법·DB 없는 smoke, 마스킹 회귀, 백엔드 Docker 빌드, 격리 MySQL 8.4 migration·재실행, 첫 실패 롤백 차단, 새 plan/diff 승인·claim, 오래된 승인·동시 등록 차단, 실제 API의 비밀 저장 거부·로그 마스킹 | 프런트 연동, LLM·AWS Terraform/ECS 실행, 업로드 앱 이미지 빌드 |
 | `Infrastructure (static validation)` | `infra/` 구현 존재 | Terraform 1.16.5의 fmt, backend 비활성 init, validate, deploy.sh 셸 문법 | AWS plan/apply/destroy, 헬스·롤백·비용 |
 
 10/10 확인한 main `432a52e`에는 샘플 프런트와 [PR #4](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/4)의 샘플 백엔드가 있다. 플랫폼 백엔드는 [PR #10](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/10) `147ad5e`, 인프라·플랫폼 프런트는 [#6](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/6)·[#7](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/7)의 파일 계약에 맞춘 조건부 검사다. 각 PR이 변경된 CI를 반영하면 해당 구현이 있는 검사만 활성화된다. 열린 PR 코드를 CI가 별도로 가져오거나 자동으로 합치지 않는다.
@@ -114,11 +115,22 @@ python -m pip install -r back/requirements.txt
 python -m pip check
 python -m compileall -q back/app
 python scripts/ci/test_platform_back.py
+python -m unittest discover -s scripts/ci -p 'test_platform_back_secrets.py' -v
 ```
 
 smoke 스크립트는 loopback의 임시 포트에서 실제 Uvicorn을 실행한다. 서비스 자격 증명·프록시·DB 설정을 상속하지 않고 임시 업로드 경로를 사용한다. 기동·요청에 제한 시간을 두고 정상/실패 시 해당 프로세스와 임시 파일을 정리한다. 없는 DB 설정에 대해 503을 내는지 검사하며, 실제 DB 연결 성공을 흉내 내지 않는다.
 
 실패 시 정리 전에 로그 끝의 최대 16 KiB에서 traceback 파일명·줄 번호·예외 종류 또는 Uvicorn 오류 여부를 추출해 진단 항목 최대 12줄을 남긴다. 소스 코드·예외 메시지·환경값·원문 로그는 출력하지 않는다. 표시된 위치의 코드를 확인하고 동일한 smoke 명령으로 재현한다.
+
+플랫폼 DB 통합 검사는 Linux/WSL의 Bash·GNU `timeout`·Python 3·Docker Compose v2로 저장소 루트에서 실행한다. API Python은 `back/Dockerfile`의 3.13.16, DB는 `back/compose.yaml`과 같은 MySQL 8.4.11을 사용한다.
+
+```bash
+bash scripts/ci/run_platform_stack.sh
+```
+
+runner는 CI 전용 Compose 구성으로 임의 프로젝트·네트워크·볼륨을 만들고, 호스트 포트와 `.env`·AWS/LLM/기존 worker 키를 전달하지 않는다. API 기동 후 모든 migration을 두 차례 실행해 적용 이력을 확인하고 `test_platform_back_rollbacks.py`, `test_platform_back_masking.py`를 컨테이너 안에서 실행한다. 성공·실패 시 생성한 프로젝트만 `down --volumes`로 정리한다. 각 단계에 timeout을 두며 원문 서비스 로그는 출력하지 않는다.
+
+이 검사는 실제 DB·HTTP를 사용한다. 업로드하는 plan 바이트와 worker 상태 보고는 합성 테스트 데이터이며 실제 Terraform plan/apply·AWS rollback 성공을 의미하지 않는다. [Issue #16](https://github.com/JinnyLyn/SoftBank-Hackathon/issues/16) 이전에는 롤백 검사 파일만 있었고 workflow에서 호출하지 않았으며, 이 runner 연결부터 DB 검증 범위가 추가된다.
 
 ## 검사 확장과 운영
 
@@ -127,7 +139,7 @@ smoke 스크립트는 loopback의 임시 포트에서 실제 Uvicorn을 실행�
 | 시점 | 담당과 실행 방식 |
 |---|---|
 | 이번 CI 변경이 main에 반영된 직후 | 열린 PR에 최신 main을 반영하고 해당 파트의 조건부 job이 실제로 실행·성공하는지 확인한다. 이 CI PR의 backend skip을 PR #10 검증으로 대신하지 않는다. |
-| 플랫폼 백엔드의 다음 검증 작업 | 이미 구현된 DB 계약은 프런트를 기다리지 않고 격리 MySQL에서 migration·재실행·CRUD·승인/작업자 상태 전환부터 검증한다. 백엔드 담당자가 테스트를 작성하고 CI 담당자가 연결한다. |
+| 플랫폼 백엔드의 다음 검증 작업 | 현재 migration·마스킹·롤백 계약 검사에 변경 동작의 회귀를 추가한다. 전체 CRUD·연결 완료·재기동 후 영속성 등의 미검증 경계는 백엔드 담당자가 확장하고 CI 담당자가 연결한다. |
 | 프런트와 API를 연결하는 PR | 양쪽 담당자가 실제 API 설정으로 정상·오류 응답을 검사한다. MOCK 자동 전환으로 실패를 숨기지 않는다. |
 | LLM·배포 worker를 연결하는 PR | 연결 담당자가 외부 호출 대역으로 잘못된 출력·timeout·승인 전 실행 차단·실패 상태를 검사한다. 일반 PR에서는 실제 키·유료 호출을 요구하지 않는다. |
 | 데모 리허설 전 | 발표자 환경에서 실제 입력→분석→승인→선택한 대상 배포→상태 확인을 실행한다. 실제 AWS 실행은 담당자의 명시적인 실행 요청 범위로 제한하고 실패·정리 결과까지 기록한다. |
@@ -135,8 +147,8 @@ smoke 스크립트는 loopback의 임시 포트에서 실제 Uvicorn을 실행�
 기능 동작을 바꾸는 PR은 해당 테스트를 함께 갱신한다. 재현된 버그는 수정과 함께 회귀 테스트를 추가한다. 후속 통합 검사가 남아 있다는 이유만으로 현재의 독립 CI 개선을 보류하지 않는다.
 
 - 코드가 있는데 검사 계약 파일이 없으면 inventory가 실패한다. PR의 base SHA 또는 main push 직전 SHA에 있던 구성요소가 통째로 사라져도 실패한다(비교 커밋이 없는 수동 실행은 현재 파일 계약만 검사). 디렉터리 이동·manifest·실행 계약 변경 시 `scripts/ci/components.py`, 워크플로, 해당 README와 이 문서를 함께 바꾼다.
-- `back/`는 `.python-version`, `requirements.txt`, `app/main.py`가 있어야 기본 검사를 실행한다. 구현 존재만으로 실패시키거나 성공시키지 않고 실제 기동·HTTP 검사 결과를 판정한다. 새로운 컴포넌트나 실행 구조 변경 시 현재 구현에 맞는 독립 검사부터 등록한다.
-- 플랫폼 백엔드 후속 통합 작업은 격리 MySQL에서 migration·재실행·CRUD·승인/작업자 상태 전환을 검증하고, 프런트 API 계약이 연결될 때 해당 경계 검사를 추가하는 것이다. 이 범위를 기본 smoke 성공으로 완료 처리하지 않는다.
+- `back/`는 `.python-version`, `requirements.txt`, `app/main.py`와 Dockerfile·migration 실행 모듈·필수 SQL이 있어야 검사를 실행한다. 정확한 파일 목록은 `scripts/ci/components.py`의 계약을 따른다. 구현 존재만으로 통과시키지 않고 실제 기동·HTTP·DB 검사 결과를 판정한다.
+- 플랫폼 프런트 API 계약이 연결되면 해당 경계 검사를 추가한다. 현재 DB 계약 검사의 성공을 전체 CRUD·프런트·worker 통합 완료로 처리하지 않는다.
 - 전체 플랫폼 검증에는 소스 입력→분석→가격 계산→선택→검토·승인→실행→상태·실패 처리의 계약이 필요하다. LLM·AWS 모의 검사는 그 사실을 표시하고 실제 외부 연동 시험과 구분한다. 회의 변경 근거는 `MEETING_UPDATES.md`를 따른다.
 - 새 검사를 필수 check로 등록할 때는 최초 원격 성공을 확인한 뒤 고정 이름 `Available app checks`를 사용한다. 조건부 개별 job을 필수로 등록하면 미통합 컴포넌트 때문에 정상 PR도 막힐 수 있다. 등록 여부는 `GITHUB_SETUP.md`에 기록한다.
 - workflow 전체의 경로 필터는 필수 검사를 Pending으로 남길 수 있으므로 현재는 사용하지 않는다. job의 skip은 그 자체로 실패가 아니므로, 항상 실행되는 최종 job이 탐지 결과와 `needs`를 대조해 실행 대상의 실패·취소·예상 밖 skip을 차단한다. [GitHub 필수 검사 문제 해결](https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks)

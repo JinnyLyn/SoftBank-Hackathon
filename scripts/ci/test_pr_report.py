@@ -120,6 +120,31 @@ class ReportTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(validate(YES.replace(original, value)), [])
 
+    def test_document_treatment_accepts_parenthetical_explanation(self):
+        original = "이 PR에서 갱신 — WORKFLOW.md와 docs/CI.md에 실행 방법 반영"
+        for treatment in ("이 PR에서 갱신", "JinnyLyn 갱신 요청", "변경 불필요"):
+            for opening, closing in (("(", ")"), ("（", "）")):
+                for separator in ("", " ", " — "):
+                    value = treatment + separator + opening + "기존 지침 범위 안임" + closing
+                    with self.subTest(value=value):
+                        self.assertEqual(validate(YES.replace(original, value)), [])
+
+    def test_document_treatment_parentheses_cannot_hide_missing_reason(self):
+        original = "이 PR에서 갱신 — WORKFLOW.md와 docs/CI.md에 실행 방법 반영"
+        for treatment in ("이 PR에서 갱신", "JinnyLyn 갱신 요청", "변경 불필요"):
+            for opening, closing in (("(", ")"), ("（", "）")):
+                for separator in ("", " ", " — "):
+                    for reason in ("", " ", "TODO", "TBD", "TODO: 추후 작성", "TBD - 확인",
+                                   "**TODO**", "`TBD`", "미정", "..."):
+                        value = treatment + separator + opening + reason + closing
+                        with self.subTest(value=value):
+                            self.assertTrue(validate(YES.replace(original, value)))
+
+    def test_parenthesis_support_preserves_treatment_and_field_names(self):
+        original = "이 PR에서 갱신 — WORKFLOW.md와 docs/CI.md에 실행 방법 반영"
+        self.assertTrue(validate(YES.replace(original, "변경 불필요함(기존 지침 범위 안임)")))
+        self.assertTrue(validate(YES.replace("영향·한계·후속 작업:", "영향·한계·후속:")))
+
     def test_current_template_can_be_filled_without_changing_labels(self):
         template = (ROOT / ".github/PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8")
         self.assertTrue(validate(template))

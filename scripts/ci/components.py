@@ -12,7 +12,7 @@ CONTRACTS = {
     "sample_front": ("sample-front", ("index.html", "login.html", "signup.html", "app.js", "mock-api.js", "style.css")),
     "sample_back": ("sample-back", ("Dockerfile", "docker-compose.yml", "requirements.txt", "app/main.py", "app/initialize_database.py", "app/schema.sql")),
     "front": ("front", ("package.json", "package-lock.json", "src/App.tsx")),
-    "back": ("back", (".python-version", "requirements.txt", "app/main.py")),
+    "back": ("back", (".python-version", "requirements.txt", "Dockerfile", "app/main.py", "app/cli.py", "app/migrations.py", "migrations/001_initial.sql", "migrations/004_deployment_rollbacks.sql", "migrations/005_rollback_plan_approval.sql")),
     "infra": ("infra", ("bootstrap/versions.tf", "foundation/versions.tf", "deployments/_template/versions.tf", "modules/ecs-web-app/main.tf", "scripts/deploy.sh")),
 }
 IGNORED_DIRS = {"node_modules", ".venv", "__pycache__", ".terraform", "dist", "screenshots"}
@@ -68,7 +68,7 @@ def report(needs):
         "sample_front": "Chrome 사용자 흐름 · MOCK (실제 API/DB 아님)",
         "sample_back": "Docker 빌드 + MySQL 8.4 + 실제 API/브라우저 + DB 중단 감지",
         "front": "잠긴 의존성 설치 + TypeScript/Vite 빌드 (MOCK/실제 API 설정)",
-        "back": "Python 의존성·문법 + 앱 기동·OpenAPI·입력/인증 오류 응답 (DB 연결·마이그레이션·프런트 연동은 미검증)",
+        "back": "Python 의존성·문법 + DB 없는 HTTP smoke + Docker/MySQL 8.4·마이그레이션 재실행·롤백 API 계약 (프런트·LLM·실제 AWS 배포는 미검증)",
         "infra": "Terraform fmt/init/validate + 셸 문법 (AWS plan/apply 아님)",
     }
     for key, scope in scopes.items():

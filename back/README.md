@@ -82,6 +82,8 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 첫 AWS 배포가 실패하면 이전 `healthy` 배포가 없으므로 롤백을 제공하지 않습니다. 프런트는 `rollback-candidate` 응답의 `first_deployment` 또는 `no_previous_healthy` 이유를 표시하고, AI 실패 원인 분석·수정안 → 새 계획·비용·plan 확인 → 사용자 승인 → 재배포 흐름으로 진행해야 합니다. 이후 실패에서 사용자가 롤백을 선택하면 `rollback` endpoint가 새 `awaiting_approval` rollback plan을 만듭니다. worker는 그 설정으로 **새 Terraform plan과 diff 요약**을 생성·저장하고, 사용자는 새 fingerprint·digest·diff를 확인한 뒤 기존 plan 승인 API로 승인합니다. 승인 전 새 rollback plan은 대기열에 등록할 수 없으며, 자동 롤백은 수행하지 않습니다.
 
+롤백 승인·큐 등록·claim·진행 상태 보고에서 같은 프로젝트의 실패 원본과 정상 복귀 대상을 재검증합니다. 후속 배포나 다른 대기·실행 작업이 있으면 409로 거부하고, 이미 큐에 든 오래된 롤백은 claim 시 `failed`와 `rollback_context_invalidated` 이벤트로 남깁니다. 롤백이 `provisioning`·`deploying`인 동안 같은 프로젝트의 새 배포 등록은 409이며, 종료 후 다시 등록할 수 있습니다. DB 변경은 프로젝트 행을 먼저 잠가 직렬화합니다.
+
 연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. 연결 상태는 검증된 AWS 계정 확인 주체가 `POST /api/worker/connections/{id}/complete`로 계정 ID를 보고할 때 `connected`가 됩니다. `WORKER_API_TOKEN` 없이 연결 완료를 호출할 수 없습니다.
 
 ## DB 테이블
@@ -95,10 +97,20 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 비밀 키처럼 보이는 JSON 필드는 분석 결과와 Terraform 변수에서 거부합니다. 키가 평문인 환경 변수, DB URL, API 자격 증명은 코드·분석 결과·계획 변수·로그에 저장하지 마세요. 업로드 디렉터리와 MySQL 데이터 볼륨은 서로 별도로 백업해야 합니다.
 
+## 회귀 검사
+
+저장소 루트에서 Linux/WSL의 Bash·GNU `timeout`·Python 3·Docker Compose v2로 실행합니다.
+
+```bash
+bash scripts/ci/run_platform_stack.sh
+```
+
+백엔드 Dockerfile과 MySQL 8.4.11로 임시 DB/API를 만들고 모든 migration을 두 번 실행합니다. 첫 실패·새 rollback plan 승인·오래된 승인 무효화·동시 등록·실행 중 충돌과 비밀 저장 거부·이벤트 마스킹을 실제 HTTP로 검사합니다. CI 전용 계정·볼륨을 사용하며 호스트 포트·기존 `.env`를 사용하지 않고 종료 시 해당 프로젝트만 정리합니다. 합성 plan/worker 보고를 사용하므로 실제 AWS·Terraform 실행 증거는 아닙니다. DB 없는 smoke와 단위 검사 명령은 [CI 문서](../docs/CI.md)를 따릅니다.
+
 ## 현재 연결 경계
 
 - LLM 분석은 이 API에 분석 JSON을 기록하는 방식으로 연결합니다. 모델, endpoint, 프롬프트, 분석 JSON의 필드 스키마는 이 백엔드에서 고정하지 않았습니다.
 - PR #7 프런트는 분석·추천·코드 생성 API를 예상하지만, LLM 분석 JSON 및 추천 번들 계약은 아직 연결되지 않았습니다. `VITE_USE_MOCK=false` 전환 전 이 계약을 확정해야 합니다.
-- 배포 worker는 AWS 작업과 사용자 승인 롤백 작업을 claim하고 이벤트를 보고할 계약을 갖습니다. 롤백 작업에는 이전 `healthy` 배포의 검증된 Terraform plan과 원래 실패/복구 기준 배포 ID가 전달됩니다. AWS Terraform 모듈 입력/출력과 DB 마이그레이션 하위 호환성은 인프라 담당과 합의한 뒤 worker에서 구현해야 합니다. Compose는 개발용 API/MySQL 실행에만 사용합니다.
+- 배포 worker는 AWS 작업과 사용자 승인 롤백 작업을 claim하고 이벤트를 보고할 계약을 갖습니다. 롤백 작업에는 이전 `healthy` 설정으로 새로 생성·승인한 Terraform plan과 원래 실패/복구 기준 배포 ID가 전달됩니다. AWS Terraform 모듈 입력/출력과 DB 마이그레이션 하위 호환성은 인프라 담당과 합의한 뒤 worker에서 구현해야 합니다. Compose는 개발·검사용 API/MySQL 실행에 사용합니다.
 - 인증된 작업자 API 외의 제품 사용자 인증·인가, 승인자 신원, 브라우저 CORS 도메인은 아직 팀 계약으로 확정되지 않았습니다. 이 API를 공개 ALB에 직접 노출하지 말고, 접근 경계를 합의한 후 배포해야 합니다.
 - DB 스키마는 수동 실행 마이그레이션으로 제공했습니다. 시작 시 자동 DDL을 적용하지 않으며, 운영 DB에 적용하기 전 백업과 마이그레이션 실행 주체를 정해야 합니다.
