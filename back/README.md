@@ -67,6 +67,8 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 | `POST` | `/api/deployments` | 승인된 fingerprint를 다시 확인하고 배포 작업을 대기열에 등록 |
 | `GET` | `/api/deployments?project_id=...` | 배포 이력 목록 |
 | `GET` | `/api/deployments/{id}` | 배포 상태와 이벤트 이력 |
+| `GET` | `/api/deployments/{id}/rollback-candidate` | 실패 배포의 사용자 승인 롤백 가능 여부와 이전 정상 버전 조회 |
+| `POST` | `/api/deployments/{id}/rollback` | 사용자가 확인한 이전 `healthy` 버전으로 롤백 작업 등록 |
 | `GET` | `/api/projects/{id}/status` | 프런트용 최근 배포 상태·로그 조회 |
 | `POST` | `/api/worker/deployments/claim` | 인증된 작업자가 대기 작업을 원자적으로 가져옴 |
 | `POST` | `/api/worker/deployments/{id}/events` | 인증된 작업자의 상태 전이·이벤트 기록 |
@@ -76,7 +78,9 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 계획은 저장 시 정규 JSON으로 fingerprint를 계산합니다. AWS 계획은 비용 추정치와 저장된 Terraform plan의 SHA-256이 필요합니다. 작업자가 `/api/worker/plans/{id}/terraform-plan`으로 binary plan을 올리면 백엔드는 해시를 확인하고 별도 비공개 디렉터리에 저장합니다. 승인 전, 배포 등록 전, 작업자에게 전달하기 전에 파일 해시를 다시 확인합니다. 승인 요청이 받은 fingerprint와 DB의 값이 다르면 거부하고, 배포 등록 때에도 승인 당시 값과 다시 비교합니다. 승인은 한 번의 배포 등록에만 사용할 수 있습니다. 계획을 바꾸거나 재시도하려면 새 계획을 만들고 다시 승인해야 합니다. API는 승인만 기록하고 Terraform/Docker/AWS 명령을 실행하지 않습니다.
 
-작업자 API는 `WORKER_API_TOKEN`이 설정되어야 사용할 수 있으며 `X-Worker-Token` 헤더를 비교합니다. 가능한 상태 전이는 `queued → provisioning → deploying → healthy`이며 실패와 롤백 경로는 이벤트 API가 제한된 전이만 허용합니다. 로그의 흔한 credential 패턴은 저장 전에 마스킹합니다. 호출 측에서도 로그에 비밀을 보내지 않아야 합니다.
+작업자 API는 `WORKER_API_TOKEN`이 설정되어야 사용할 수 있으며 `X-Worker-Token` 헤더를 비교합니다. 일반 배포와 롤백 작업 모두 `queued → provisioning → deploying → healthy` 또는 `failed`의 제한된 전이를 따릅니다. 롤백은 실패한 원래 배포를 바꾸지 않고, 별도 `operation_type: rollback` 이력으로 실행합니다. 로그의 흔한 credential 패턴은 저장 전에 마스킹합니다. 호출 측에서도 로그에 비밀을 보내지 않아야 합니다.
+
+첫 AWS 배포가 실패하면 이전 `healthy` 배포가 없으므로 롤백을 제공하지 않습니다. 프런트는 `rollback-candidate` 응답의 `first_deployment` 또는 `no_previous_healthy` 이유를 표시하고, AI 실패 원인 분석·수정안 → 새 계획·비용·plan 확인 → 사용자 승인 → 재배포 흐름으로 진행해야 합니다. 이전 배포가 있는 실패에서는 사용자가 롤백을 선택했을 때만 `rollback` endpoint를 호출합니다. 백엔드는 사용자가 화면에서 확인한 직전 `healthy` 배포 ID와 현재 후보가 일치하는지, 저장 Terraform plan의 SHA-256이 유효한지를 다시 검사합니다. 자동 롤백은 수행하지 않습니다.
 
 연결 API는 AWS만 지원합니다. CloudFormation 링크를 표시하려면 템플릿을 공개 HTTPS 주소에 배포하고 `AWS_CONNECTION_TEMPLATE_URL`을 설정합니다. 연결 상태는 검증된 AWS 계정 확인 주체가 `POST /api/worker/connections/{id}/complete`로 계정 ID를 보고할 때 `connected`가 됩니다. `WORKER_API_TOKEN` 없이 연결 완료를 호출할 수 없습니다.
 
@@ -85,7 +89,7 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 - `projects`: ZIP/GitHub 출처, 원본 경로·크기·SHA-256
 - `analyses`: 분석 스키마 버전, 원본 해시, JSON 결과
 - `deployment_plans`: 대상, 모듈 변수, 비용 추정치, plan digest, 승인 fingerprint와 시각
-- `deployments`: 계획별 실행 상태와 배포 URL
+- `deployments`: 일반 배포·사용자 승인 롤백별 실행 상태와 URL, 원래 실패 배포/복구 기준 정상 배포 연결
 - `deployment_events`: 추가 전용 상태/로그 이력
 - `schema_migrations`: 적용한 SQL 마이그레이션 버전
 
@@ -95,6 +99,6 @@ ZIP과 GitHub 아카이브는 압축 해제하지 않고 보관합니다. 업로
 
 - LLM 분석은 이 API에 분석 JSON을 기록하는 방식으로 연결합니다. 모델, endpoint, 프롬프트, 분석 JSON의 필드 스키마는 이 백엔드에서 고정하지 않았습니다.
 - PR #7 프런트는 분석·추천·코드 생성 API를 예상하지만, LLM 분석 JSON 및 추천 번들 계약은 아직 연결되지 않았습니다. `VITE_USE_MOCK=false` 전환 전 이 계약을 확정해야 합니다.
-- 배포 worker는 AWS 작업을 claim하고 이벤트를 보고할 계약을 갖습니다. AWS Terraform 모듈 입력/출력과 부분 성공·롤백 정책은 인프라 담당과 합의한 뒤 worker에서 구현해야 합니다. Compose는 개발용 API/MySQL 실행에만 사용합니다.
+- 배포 worker는 AWS 작업과 사용자 승인 롤백 작업을 claim하고 이벤트를 보고할 계약을 갖습니다. 롤백 작업에는 이전 `healthy` 배포의 검증된 Terraform plan과 원래 실패/복구 기준 배포 ID가 전달됩니다. AWS Terraform 모듈 입력/출력과 DB 마이그레이션 하위 호환성은 인프라 담당과 합의한 뒤 worker에서 구현해야 합니다. Compose는 개발용 API/MySQL 실행에만 사용합니다.
 - 인증된 작업자 API 외의 제품 사용자 인증·인가, 승인자 신원, 브라우저 CORS 도메인은 아직 팀 계약으로 확정되지 않았습니다. 이 API를 공개 ALB에 직접 노출하지 말고, 접근 경계를 합의한 후 배포해야 합니다.
 - DB 스키마는 수동 실행 마이그레이션으로 제공했습니다. 시작 시 자동 DDL을 적용하지 않으며, 운영 DB에 적용하기 전 백업과 마이그레이션 실행 주체를 정해야 합니다.

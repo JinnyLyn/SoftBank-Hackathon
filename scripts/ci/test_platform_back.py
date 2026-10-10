@@ -128,7 +128,9 @@ def check(root):
                 paths = schema.get("paths")
                 require(isinstance(paths, dict), "/openapi.json: missing paths")
                 for path, method in (("/health", "get"), ("/ready", "get"),
-                                     ("/api/worker/deployments/claim", "post"), ("/api/plans", "post")):
+                                     ("/api/worker/deployments/claim", "post"), ("/api/plans", "post"),
+                                     ("/api/deployments/{deployment_id}/rollback-candidate", "get"),
+                                     ("/api/deployments/{deployment_id}/rollback", "post")):
                     require(isinstance(paths.get(path), dict) and method in paths[path],
                             f"/openapi.json: missing {method.upper()} {path}")
                 client.json("/ready", status=503)

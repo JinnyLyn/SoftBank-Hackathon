@@ -37,6 +37,8 @@ from app.schemas import (
     PlanOut,
     ProjectListOut,
     ProjectOut,
+    RollbackCandidateOut,
+    RollbackRequestIn,
     WorkerEventIn,
 )
 from app.settings import ConfigurationError
@@ -548,12 +550,133 @@ def list_deployments(
             "version": str(row["id"])[:8],
             "tier": variables.get("tier", row["module_id"]),
             "provider": "aws" if row["target"] == "aws" else "onprem",
-            "target": variables.get("connection_name", "AWS" if row["target"] == "aws" else "로컬 Docker"),
+            "target": variables.get("connection_name", "AWS"),
             "monthlyUsd": float(cost.get("amount", 0)),
             "status": status_alias,
             "createdAt": _as_utc(row["created_at"]).isoformat(),
         })
     return result
+
+
+@app.get(
+    "/api/deployments/{deployment_id}/rollback-candidate",
+    response_model=RollbackCandidateOut,
+    tags=["deployments"],
+)
+def rollback_candidate(deployment_id: UUID) -> RollbackCandidateOut:
+    """Return only the immediately previous healthy AWS deployment as a rollback candidate."""
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM deployments WHERE id = %s", (str(deployment_id),))
+        failed = cursor.fetchone()
+        if failed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
+        if failed["operation_type"] != "deploy" or failed["status"] != "failed":
+            return RollbackCandidateOut(rollback_available=False, reason="not_failed")
+        cursor.execute(
+            """SELECT id FROM deployments
+               WHERE project_id = %s AND target = 'aws' AND created_at < %s
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (failed["project_id"], failed["created_at"]),
+        )
+        previous_attempt = cursor.fetchone()
+        if previous_attempt is None:
+            return RollbackCandidateOut(rollback_available=False, reason="first_deployment")
+        cursor.execute(
+            """SELECT d.*, p.terraform_plan_sha256, p.terraform_plan_path
+               FROM deployments d
+               JOIN deployment_plans p ON p.id = d.plan_id
+               WHERE d.project_id = %s AND d.target = 'aws' AND d.status = 'healthy'
+                 AND d.created_at < %s
+               ORDER BY d.created_at DESC, d.id DESC LIMIT 1""",
+            (failed["project_id"], failed["created_at"]),
+        )
+        candidate = cursor.fetchone()
+    if candidate is None or not _terraform_plan_is_valid(candidate):
+        return RollbackCandidateOut(rollback_available=False, reason="no_previous_healthy")
+    return RollbackCandidateOut(
+        rollback_available=True,
+        reason="available",
+        target_deployment_id=UUID(candidate["id"]),
+        target_plan_id=UUID(candidate["plan_id"]),
+    )
+
+
+@app.post(
+    "/api/deployments/{deployment_id}/rollback",
+    response_model=DeploymentOut,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["deployments"],
+)
+def queue_rollback(deployment_id: UUID, body: RollbackRequestIn) -> DeploymentOut:
+    """Queue a user-approved rollback without mutating the failed deployment record."""
+    rollback_id = uuid4()
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT * FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
+        failed = cursor.fetchone()
+        if failed is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
+        if failed["operation_type"] != "deploy" or failed["status"] != "failed":
+            raise HTTPException(status.HTTP_409_CONFLICT, "실패한 일반 배포에 대해서만 롤백을 요청할 수 있습니다.")
+        cursor.execute(
+            """SELECT id FROM deployments
+               WHERE project_id = %s AND target = 'aws' AND created_at < %s
+               ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+            (failed["project_id"], failed["created_at"]),
+        )
+        if cursor.fetchone() is None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "첫 배포 실패에는 롤백할 이전 정상 버전이 없습니다. 분석·수정 후 새 계획을 승인해 재배포하세요.",
+            )
+        cursor.execute(
+            """SELECT d.*, p.terraform_plan_sha256, p.terraform_plan_path
+               FROM deployments d
+               JOIN deployment_plans p ON p.id = d.plan_id
+               WHERE d.project_id = %s AND d.target = 'aws' AND d.status = 'healthy'
+                 AND d.created_at < %s
+               ORDER BY d.created_at DESC, d.id DESC LIMIT 1 FOR UPDATE""",
+            (failed["project_id"], failed["created_at"]),
+        )
+        candidate = cursor.fetchone()
+        if candidate is None or not _terraform_plan_is_valid(candidate):
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "검증된 이전 정상 버전이 없어 롤백할 수 없습니다. 분석·수정 후 새 계획을 승인해 재배포하세요.",
+            )
+        if candidate["id"] != str(body.expected_target_deployment_id):
+            raise HTTPException(status.HTTP_409_CONFLICT, "사용자가 확인한 롤백 대상이 현재 이전 정상 버전과 다릅니다.")
+        cursor.execute(
+            """SELECT id FROM deployments
+               WHERE rollback_from_deployment_id = %s
+                 AND status IN ('queued', 'provisioning', 'deploying')
+               LIMIT 1 FOR UPDATE""",
+            (str(deployment_id),),
+        )
+        if cursor.fetchone() is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, "이 실패 배포에 대한 롤백이 이미 진행 중입니다.")
+        cursor.execute(
+            """INSERT INTO deployments
+               (id, plan_id, project_id, target, operation_type, rollback_from_deployment_id,
+                rollback_to_deployment_id, status)
+               VALUES (%s, %s, %s, 'aws', 'rollback', %s, %s, 'queued')""",
+            (
+                str(rollback_id), candidate["plan_id"], failed["project_id"], str(deployment_id), candidate["id"],
+            ),
+        )
+        _insert_event(
+            cursor, deployment_id, "info", "rollback_requested",
+            "사용자가 이전 정상 버전으로의 롤백을 승인했습니다.",
+            {"rollback_deployment_id": str(rollback_id), "target_deployment_id": candidate["id"]},
+        )
+        _insert_event(
+            cursor, rollback_id, "info", "rollback_queued",
+            "사용자 승인 롤백을 실행 대기열에 등록했습니다.",
+            {"failed_deployment_id": str(deployment_id), "target_deployment_id": candidate["id"]},
+        )
+        connection.commit()
+        cursor.execute("SELECT * FROM deployments WHERE id = %s", (str(rollback_id),))
+        rollback = cursor.fetchone()
+    return _deployment_out(rollback)
 
 
 @app.get("/api/deployments/{deployment_id}", response_model=DeploymentDetailOut, tags=["deployments"])
@@ -603,7 +726,8 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
     with connect() as connection, connection.cursor() as cursor:
         while True:
             cursor.execute(
-                """SELECT d.id AS deployment_id, d.status, d.target, d.plan_id, d.project_id,
+                """SELECT d.id AS deployment_id, d.status, d.target, d.operation_type,
+                          d.rollback_from_deployment_id, d.rollback_to_deployment_id, d.plan_id, d.project_id,
                           p.module_id, p.variables, p.summary, p.cost_estimate, p.terraform_plan_sha256,
                           p.terraform_plan_path,
                           pr.source_path, pr.source_filename, pr.source_sha256
@@ -647,7 +771,7 @@ def claim_deployment(x_worker_token: str | None = Header(default=None)) -> dict[
                 UUID(job["deployment_id"]),
                 "info",
                 "provisioning",
-                "배포 작업자가 실행을 시작했습니다.",
+                "롤백 작업자가 실행을 시작했습니다." if job["operation_type"] == "rollback" else "배포 작업자가 실행을 시작했습니다.",
                 None,
             )
             connection.commit()
@@ -730,7 +854,7 @@ def record_worker_event(
     body_dict["message"] = _redact(body.message)
     body_dict["details"] = _redact_tree(body.details) if body.details is not None else None
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT status FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
+        cursor.execute("SELECT status, operation_type FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
         current = cursor.fetchone()
         if current is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력을 찾을 수 없습니다.")
@@ -744,6 +868,8 @@ def record_worker_event(
             "rolled_back": set(),
         }
         same_status = body.status == current["status"]
+        if current["operation_type"] == "rollback" and body.status in {"rolling_back", "rolled_back"}:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "롤백 실행은 일반 배포와 같은 상태 흐름을 사용합니다.")
         if not same_status and body.status not in allowed[current["status"]]:
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
@@ -946,7 +1072,12 @@ def _plan_out(row: dict[str, Any]) -> PlanOut:
 def _deployment_out(row: dict[str, Any]) -> DeploymentOut:
     return DeploymentOut(
         id=UUID(row["id"]), plan_id=UUID(row["plan_id"]), project_id=UUID(row["project_id"]),
-        target=row["target"], status=row["status"], url=row["url"],
+        target=row["target"], operation_type=row.get("operation_type", "deploy"),
+        rollback_from_deployment_id=(UUID(row["rollback_from_deployment_id"])
+                                     if row.get("rollback_from_deployment_id") else None),
+        rollback_to_deployment_id=(UUID(row["rollback_to_deployment_id"])
+                                   if row.get("rollback_to_deployment_id") else None),
+        status=row["status"], url=row["url"],
         created_at=_as_utc(row["created_at"]), updated_at=_as_utc(row["updated_at"]),
     )
 

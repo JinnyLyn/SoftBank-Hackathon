@@ -139,11 +139,27 @@ class DeploymentCreateIn(APIModel):
     expected_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
 
 
+class RollbackRequestIn(APIModel):
+    """The displayed healthy deployment the user explicitly approved for rollback."""
+
+    expected_target_deployment_id: UUID
+
+
+class RollbackCandidateOut(APIModel):
+    rollback_available: bool
+    reason: Literal["available", "first_deployment", "no_previous_healthy", "not_failed"]
+    target_deployment_id: UUID | None = None
+    target_plan_id: UUID | None = None
+
+
 class DeploymentOut(APIModel):
     id: UUID
     plan_id: UUID
     project_id: UUID
     target: str
+    operation_type: Literal["deploy", "rollback"]
+    rollback_from_deployment_id: UUID | None = None
+    rollback_to_deployment_id: UUID | None = None
     status: Literal[
         "queued", "provisioning", "deploying", "healthy", "failed", "rolling_back", "rolled_back"
     ]
