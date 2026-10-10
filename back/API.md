@@ -2,6 +2,8 @@
 
 프런트엔드와 백엔드 연동을 위한 현재 API 계약입니다. 구현의 상세 스키마는 실행 중인 FastAPI 문서(`/docs`)와 OpenAPI JSON(`/openapi.json`)을 기준으로 합니다.
 
+제품 방향은 [PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`을 따릅니다. 운영자 관리형 AWS와 사용자 독립 도메인이 목표지만, **도메인 조회·신규 등록·연결·상태 API는 현재 이 문서의 구현 계약에 포함되지 않습니다.** 프런트 `JinVibe:f169d27`의 `/api/domains/check`, `/api/projects/{id}/domain`, `/api/projects/{id}/domain/approve`, `status.domain`은 제안입니다. 이번 시연의 A/B 범위와 파트 간 계약을 먼저 확인하며 구매 자동화를 필수 구현으로 가정하지 않습니다. 기존 연결 API의 존재가 사용자 AWS 연결을 필수로 요구하는 근거는 아닙니다.
+
 ## 접속 및 공통 규칙
 
 - 로컬 기본 주소: `http://127.0.0.1:8000`
