@@ -60,9 +60,29 @@ case "$cmd" in
 esac
 '''
 
-# aws CLI의 가짜(sts assume-role만). 호출 인자는 $FAKE_AWS_LOG 에 남기고, 동작은 $FAKE_AWS_MODE 로 고른다
+# aws CLI의 가짜(sts assume-role, Fargate 할당량 조회). 호출 인자는 $FAKE_AWS_LOG 에 남긴다
+#   sts assume-role                : 동작은 $FAKE_AWS_MODE 로 고른다
+#   service-quotas, cloudwatch     : 할당량 FAKE_QUOTA_VALUE(기본 1000), 사용 중 vCPU FAKE_QUOTA_USED(기본 0, none이면 지표 없음).
+#                                    FAKE_QUOTA_FAIL=all(할당량 조회 전부 실패)|applied(적용된 값만 없음), FAKE_USAGE_FAIL=1(지표 조회 실패),
+#                                    FAKE_QUOTA_NOMETRIC=1(응답에 UsageMetric 없음)
 FAKE_AWS = r'''#!/usr/bin/env bash
 echo "$*" >> "$FAKE_AWS_LOG"
+case "$1" in
+  service-quotas)
+    case "${FAKE_QUOTA_FAIL:-0}" in
+      all) echo "An error occurred (AccessDeniedException) when calling the $2 operation: not authorized" >&2; exit 254 ;;
+      applied) if [ "$2" = "get-service-quota" ]; then echo "An error occurred (NoSuchResourceException) when calling the GetServiceQuota operation" >&2; exit 254; fi ;;
+    esac
+    metric=', "UsageMetric": {"MetricNamespace": "AWS/Usage", "MetricName": "ResourceCount", "MetricDimensions": {"Class": "Standard/OnDemand", "Resource": "vCPU", "Service": "Fargate", "Type": "Resource"}, "MetricStatisticRecommendation": "Maximum"}'
+    [ "${FAKE_QUOTA_NOMETRIC:-0}" = "0" ] || metric=""
+    printf '{"Quota": {"ServiceCode": "fargate", "QuotaCode": "L-3032A538", "QuotaName": "Fargate On-Demand vCPU resource count", "Value": %s%s}}\n' "${FAKE_QUOTA_VALUE:-1000}" "$metric"
+    exit 0 ;;
+  cloudwatch)
+    [ "${FAKE_USAGE_FAIL:-0}" = "0" ] || { echo "An error occurred (AccessDenied) when calling the GetMetricStatistics operation: not authorized" >&2; exit 254; }
+    if [ "${FAKE_QUOTA_USED:-0}" = "none" ]; then echo '{"Label": "ResourceCount", "Datapoints": []}'
+    else printf '{"Label": "ResourceCount", "Datapoints": [{"Timestamp": "2026-10-11T00:00:00+00:00", "Maximum": %s, "Unit": "None"}, {"Timestamp": "2026-10-11T00:05:00+00:00", "Maximum": 0, "Unit": "None"}]}\n' "${FAKE_QUOTA_USED:-0}"; fi
+    exit 0 ;;
+esac
 case "${FAKE_AWS_MODE:-ok}" in
   ok) echo "${FAKE_AWS_ARN:-arn:aws:sts::123456789012:assumed-role/PavedCloudsReadOnlyRole/paved-clouds-verify}" ;;
   denied) echo "An error occurred (AccessDenied) when calling the AssumeRole operation: User: arn:aws:iam::999999999999:user/operator is not authorized to perform: sts:AssumeRole on resource: arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole" >&2; exit 254 ;;
@@ -211,7 +231,7 @@ class Base(unittest.TestCase):
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
         for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL",
-                  "FAKE_AWS_MODE", "FAKE_AWS_ARN"):
+                  "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
         os.environ["FAKE_HEARTBEAT"] = worker.posix(self.tmp / "heartbeat")
@@ -220,6 +240,12 @@ class Base(unittest.TestCase):
         self.addCleanup(lambda: setattr(worker, "REPORT_RETRY_DELAY", self.old_retry_delay))
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(self.old_env)))
         self.cfg = worker.Config(token=TOKEN, deploy_sh=script, deployments_dir=self.tmp / "deployments")
+        # 모든 시험은 가짜 aws CLI를 쓴다(연결 확인과 Fargate 할당량 조회). 진짜 aws를 부르지 않는다
+        aws_script = self.tmp / "aws.sh"
+        aws_script.write_bytes(FAKE_AWS.encode("utf-8"))
+        self.aws_log = self.tmp / "aws.log"
+        os.environ["FAKE_AWS_LOG"] = worker.posix(self.aws_log)
+        self.cfg.aws_cmd = [self.cfg.bash, worker.posix(aws_script)]
         self.backend = FakeBackend()
         self.addCleanup(self.backend.close)
         self.api = worker.Api(self.backend.url, TOKEN, timeout=10)
@@ -227,6 +253,9 @@ class Base(unittest.TestCase):
 
     def calls(self):
         return self.log_file.read_text(encoding="utf-8").splitlines() if self.log_file.exists() else []
+
+    def aws_calls(self):
+        return self.aws_log.read_text(encoding="utf-8").splitlines() if self.aws_log.exists() else []
 
 
 GOOD_RESULT = {
@@ -389,6 +418,60 @@ class CostTests(unittest.TestCase):
                     self.assertLessEqual(got[tier]["peak_monthly"], exact)
                     below = {o["tier"] for o in cost.recommend("~1,000", "steady", exact - 0.01, self.p, foundation=foundation)["options"]}
                     self.assertNotIn(tier, below)   # 1센트만 모자라도 그 안은 만들 수 없다
+
+    def test_average_option_is_midway_between_the_lowest_and_the_actual_highest(self):
+        # 월 $250: 최대 안은 medium 2개(약 199.73)까지만 채워진다. 중간 금액은 예산 원금이 아니라 이 실제 최대 안 기준이어야 한다
+        low, avg, high = cost.recommend("~1,000", "steady", 250, self.p)["options"]
+        self.assertEqual((low["peak_monthly"], high["peak_monthly"]), (91.40, 199.73))
+        mid = (low["peak_monthly"] + high["peak_monthly"]) / 2   # 145.565
+        self.assertLessEqual(avg["peak_monthly"], mid)
+        over = cost.estimate("balanced", self.p, cfg={**cost.TIERS["balanced"], "max_tasks": avg["max_tasks"] + 1})
+        self.assertGreater(over["peak_monthly"], mid)   # 하나 더 늘리면 중간을 넘는다 = 중간에 가장 가깝게 채웠다
+        self.assertLess(avg["peak_monthly"], 150)   # 예산 원금 기준이면 168.78이 나왔다
+
+    def test_reason_counts_only_the_options_that_were_made(self):
+        for budget, n, want in [(300, 3, "3개 안은 모두"), (110, 2, "2개 안은 모두"), (100, 1, "하나뿐")]:
+            with self.subTest(budget=budget):
+                r = cost.recommend("~1,000", "steady", budget, self.p)
+                self.assertEqual(len(r["options"]), n)
+                self.assertIn(want, r["reason"])
+                self.assertNotIn("세 안 모두", r["reason"])   # 안이 세 개보다 적은데 세 안이라고 말하면 모순이다
+
+    def test_vcpu_quota_caps_presets_and_drops_options_that_cannot_fit(self):
+        # 예산이 없어도 할당량은 지킨다. 남은 3 vCPU: roomy(medium 1 vCPU, 2~4개)는 2~3개로 줄고, small(0.5 vCPU)은 영향이 없다
+        opts = {o["tier"]: o for o in cost.recommend("~10,000", "steady", None, self.p, max_vcpu=3)["options"]}
+        self.assertEqual((opts["roomy"]["max_tasks"], opts["roomy"]["peak_vcpu"], opts["roomy"]["quota_limited"]), (3, 3.0, True))
+        self.assertEqual((opts["balanced"]["max_tasks"], opts["balanced"]["quota_limited"]), (2, False))
+        # 남은 1.5 vCPU: roomy의 최소 구성(medium 2개 = 2 vCPU)을 못 담아 빠지고, 이유에 할당량이 나온다
+        r = cost.recommend("~10,000", "steady", None, self.p, max_vcpu=1.5)
+        self.assertEqual([o["tier"] for o in r["options"]], ["lean", "balanced"])
+        self.assertEqual(r["recommended"], "balanced")
+        self.assertIn("낮춤", r["reason"])
+        self.assertIn("할당량", r["reason"])
+        # 할당량을 모르면(None) 제한하지 않는다
+        self.assertEqual([o["max_tasks"] for o in cost.recommend("~10,000", "steady", None, self.p)["options"]], [1, 2, 4])
+
+    def test_budget_options_never_exceed_the_vcpu_quota(self):
+        # 월 $1000이면 할당량 없이는 최대 안이 medium 14개(14 vCPU). AWS 기본 할당량은 리전당 6 vCPU라 그만큼은 띄울 수 없다
+        self.assertEqual(cost.recommend("~10,000", "steady", 1000, self.p)["options"][-1]["peak_vcpu"], 14.0)
+        r = cost.recommend("~10,000", "steady", 1000, self.p, max_vcpu=6)
+        for o in r["options"]:
+            self.assertLessEqual(o["peak_vcpu"], 6)
+            self.assertLessEqual(o["peak_monthly"], 1000)
+        top = r["options"][-1]
+        self.assertEqual((top["tier"], top["max_tasks"], top["quota_limited"]), ("roomy", 6, True))
+        self.assertIn("할당량(남은 6 vCPU)", r["reason"])
+        # 평균 안은 할당량으로 줄어든 실제 최대 안을 기준으로 잡는다
+        low, avg, high = (o["peak_monthly"] for o in r["options"])
+        self.assertLessEqual(avg, (low + high) / 2)
+
+    def test_quota_too_small_for_the_smallest_option_gives_no_recommendation(self):
+        for budget in (None, 1000):
+            with self.subTest(budget=budget):
+                r = cost.recommend("~100", "steady", budget, self.p, max_vcpu=0.2)   # 가장 작은 구성은 0.25 vCPU가 필요하다
+                self.assertIsNone(r["recommended"])
+                self.assertEqual(r["options"], [])
+                self.assertIn("Fargate 할당량이 부족", r["reason"])
 
     def test_without_budget_the_three_presets_are_the_options(self):
         r = cost.recommend("~1,000", "steady", None, self.p)
@@ -576,8 +659,274 @@ class PlannerTests(Base):
                          [("lowest", "lean", False), ("average", "balanced", False), ("highest", "roomy", True)])
         self.assertIn("월 예산 $400.00 이내", body["summary"])
         self.assertIn("안 비교", body["summary"])
-        # 승인 화면에 나가는 금액은 평소 비용이다. 부하가 최대일 때 비용은 variables.cost와 요약에 따로 있다
-        self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), 199.73, places=2)
+        # 승인 화면에 나가는 금액(cost_estimate.amount)은 예산을 판정한 기준과 같은 부하 최대 비용이다. 평소 비용은 variables.cost에 따로 있다
+        self.assertAlmostEqual(float(body["cost_estimate"]["amount"]), v["cost"]["peak_monthly"], places=2)
+        self.assertAlmostEqual(v["cost"]["total_monthly"], 199.73, places=2)
+
+    def test_approval_amount_is_the_peak_cost_the_budget_was_judged_on(self):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users="~10,000", monthly_budget_usd=400)   # roomy medium 2~5개: 평소 $199.73, 최대 약 $385
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        amount = float(body["cost_estimate"]["amount"])
+        self.assertEqual(body["cost_estimate"]["amount"], f"{v['cost']['peak_monthly']:.4f}")
+        self.assertGreater(amount, v["cost"]["total_monthly"])   # 평소 금액만 보여주면 승인 때 최대 청구를 모른다
+        self.assertLessEqual(amount, 400)                         # 승인 금액은 사용자가 정한 예산 안이다
+        self.assertEqual(v["cost"]["amount_basis"], "peak_monthly")
+        # 승인 화면은 리소스 행을 나열하고 amount를 합계로 보여준다: 행의 합이 합계와 맞고, 최대 시 추가분이 행으로 보인다
+        rows = v["resources"]
+        self.assertAlmostEqual(sum(r["monthlyUsd"] for r in rows), amount, delta=0.05)
+        extra = rows[-1]
+        self.assertEqual(extra["service"], "ECS Fargate 오토스케일링 최대 시 추가분")
+        self.assertAlmostEqual(extra["monthlyUsd"], amount - v["cost"]["total_monthly"], delta=0.02)
+        self.assertIn("태스크 3개 더 (최대 5개)", extra["spec"])
+        self.assertIn("승인 금액은 부하가 최대일 때(태스크 5개)", body["summary"])
+        self.assertIn("평소 월 추정", body["summary"])
+
+    def test_no_autoscale_row_when_the_peak_equals_the_typical_cost(self):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users="~100", monthly_budget_usd=100)   # 월 $100에는 최저 안(1~1개)만 들어간다
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        self.assertEqual(float(body["cost_estimate"]["amount"]), v["cost"]["total_monthly"])
+        self.assertFalse(any("오토스케일링" in r["service"] for r in v["resources"]))
+
+    def quota_plan(self, budget=1000, users="~10,000"):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["scale"].update(expected_users=users, monthly_budget_usd=budget)
+        return worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+
+    def test_plan_reads_the_fargate_quota_and_caps_the_biggest_option(self):
+        # 예산 $1000이면 할당량 없이는 medium 14개(14 vCPU)지만, 할당량 6 - 사용 중 2 = 남은 4 vCPU 안으로 줄어든다
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="2")
+        self.cfg.region = "sa-east-1"
+        self.quota_plan()
+        body = self.backend.created_plans[0]
+        v = body["variables"]
+        self.assertEqual(v["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 2.0, "reserved_vcpu": 0.0, "available_vcpu": 4.0})
+        self.assertEqual((v["tier"], v["app"]["task_size"], v["app"]["min_tasks"], v["app"]["max_tasks"]), ("roomy", "medium", 2, 4))
+        self.assertEqual(v["cost"]["peak_vcpu"], 4.0)
+        top = v["options"][-1]
+        self.assertEqual((top["max_tasks"], top["peak_vcpu"], top["quota_limited"]), (4, 4.0, True))
+        self.assertTrue(all(o["peak_vcpu"] <= 4 for o in v["options"]))
+        self.assertIn("할당량(남은 4 vCPU)", v["reason"])
+        self.assertIn("Fargate vCPU 할당량: 한도 6, 사용 중 2, 승인 대기·승인된 다른 계획이 예약 0, 남은 4", body["summary"])
+        # 할당량 조회 → 사용량 조회 순서이고, 문서에서 확인한 이름·차원·리전을 쓴다
+        quota, usage = [c for c in self.aws_calls() if c.startswith(("service-quotas", "cloudwatch"))]
+        self.assertIn("service-quotas get-service-quota --service-code fargate --quota-code L-3032A538", quota)
+        self.assertIn("--region sa-east-1", quota)
+        for part in ("cloudwatch get-metric-statistics", "--namespace AWS/Usage", "--metric-name ResourceCount", "Name=Service,Value=Fargate",
+                     "Name=Type,Value=Resource", "Name=Resource,Value=vCPU", "Name=Class,Value=Standard/OnDemand", "--statistics Maximum"):
+            self.assertIn(part, usage)
+
+    def test_usage_is_the_maximum_over_the_window_and_zero_without_datapoints(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="none")   # 지표가 비어 있다 = 그 시간 동안 실행 중인 작업이 없었다
+        self.quota_plan()
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"],
+                         {"quota_vcpu": 6.0, "used_vcpu": 0.0, "reserved_vcpu": 0.0, "available_vcpu": 6.0})
+
+    def test_usage_dimensions_fall_back_to_the_documented_ones_without_usage_metric(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="1", FAKE_QUOTA_NOMETRIC="1")
+        self.quota_plan()
+        usage = [c for c in self.aws_calls() if c.startswith("cloudwatch")][0]
+        self.assertIn("Name=Resource,Value=vCPU", usage)
+        self.assertIn("Name=Class,Value=Standard/OnDemand", usage)
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"]["available_vcpu"], 5.0)
+
+    def test_default_quota_is_used_when_the_applied_value_is_missing(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_FAIL="applied")
+        self.quota_plan()
+        calls = [c for c in self.aws_calls() if c.startswith("service-quotas")]
+        self.assertEqual([c.split()[1] for c in calls], ["get-service-quota", "get-aws-default-service-quota"])
+        self.assertEqual(self.backend.created_plans[0]["variables"]["fargate_vcpu"]["quota_vcpu"], 6.0)
+
+    def test_not_enough_vcpu_for_the_smallest_option_is_a_plan_error(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="5.9")   # 남은 0.1 vCPU < 최소 구성 0.25 vCPU
+        with self.assertRaises(worker.PlanError) as cm:
+            self.quota_plan()
+        self.assertIn("Fargate 할당량이 부족", str(cm.exception))
+        self.assertEqual(self.backend.created_plans, [])
+        self.assertEqual(self.calls(), ["foundation-info"])   # plan·ID 생성·빌드·적용은 하지 않는다
+
+    def test_unreadable_quota_stops_planning_with_a_fix_hint(self):
+        for key, value in [("FAKE_QUOTA_FAIL", "all"), ("FAKE_USAGE_FAIL", "1")]:
+            with self.subTest(key=key):
+                os.environ.pop("FAKE_QUOTA_FAIL", None)
+                os.environ.pop("FAKE_USAGE_FAIL", None)
+                os.environ[key] = value
+                with self.assertRaises(worker.PlanError) as cm:
+                    self.quota_plan()
+                msg = str(cm.exception)
+                self.assertIn("Fargate 할당량을 읽지 못해", msg)
+                self.assertIn("servicequotas:GetServiceQuota", msg)
+                self.assertIn("--skip-quota-check", msg)
+                self.assertEqual(self.backend.created_plans, [])
+                self.assertFalse(any(c.startswith("up ") for c in self.calls()))   # 한도를 모른 채로 계획을 만들지 않는다
+
+    # --- 승인 대기·승인된 계획의 vCPU 예약 ---------------------------------------------------------------
+    P2_ID = "22222222-2222-2222-2222-222222222222"
+
+    def two_projects(self, budget="1000.0000"):
+        """예산이 큰 신규 프로젝트 둘(분석 결과에는 scale이 없다). 할당량 한 몫을 둘이 나눠 가져야 하는 상황을 만든다."""
+        res = json.loads(json.dumps(GOOD_RESULT))
+        del res["scale"]
+        projects = []
+        for pid, name in ((PROJECT["id"], "A"), (self.P2_ID, "B")):
+            projects.append({**PROJECT, "id": pid, "name": name, "expected_users": "~10,000", "traffic_pattern": "steady", "monthly_budget_usd": budget})
+            self.backend.analyses[pid] = {"id": "aa-" + name, "project_id": pid, "result": res}
+        self.backend.projects = projects
+        return projects
+
+    def test_plans_created_in_the_same_pass_do_not_share_the_same_vcpu(self):
+        # 할당량 6 vCPU. 첫 프로젝트가 예산 안에서 가능한 최대(6 vCPU)를 받으면 두 번째는 같은 몫을 또 받지 못한다
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="0")
+        p1, p2 = self.two_projects()
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)   # 합계 12 vCPU의 계획 두 개가 승인되지 않는다
+        first = self.backend.created_plans[0]["variables"]
+        self.assertEqual((first["cost"]["peak_vcpu"], first["fargate_vcpu"]["reserved_vcpu"]), (6.0, 0.0))
+        self.assertIn(p2["id"], state.waiting)
+        self.assertNotIn(p2["id"], state.failures)   # 용량이 풀리면 만들 수 있어서 실패로 세지 않는다
+        # 몇 번을 다시 점검해도 실패 횟수가 쌓여 영구 중단되지 않는다(max_tries 3회를 넘겨도 계속 기다린다)
+        for _ in range(state.max_tries + 2):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertNotIn(p2["id"], state.failures)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        # 첫 계획이 배포돼 consumed가 되면 예약은 풀리고 실제 사용량(2 vCPU)만 남는다 → 두 번째 프로젝트가 나머지 4 vCPU 안에서 계획된다
+        self.backend.plans[p1["id"]][0]["status"] = "consumed"
+        os.environ["FAKE_QUOTA_USED"] = "2"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2)
+        second = self.backend.created_plans[1]["variables"]
+        self.assertEqual(second["fargate_vcpu"], {"quota_vcpu": 6.0, "used_vcpu": 2.0, "reserved_vcpu": 0.0, "available_vcpu": 4.0})
+        self.assertLessEqual(second["cost"]["peak_vcpu"], 4)
+        self.assertNotIn(p2["id"], state.waiting)
+
+    def test_a_pending_plan_reserves_its_peak_vcpu_for_the_next_plan(self):
+        # 할당량 8, 첫 프로젝트 예산이 작아 2 vCPU만 쓰는 계획 → 두 번째는 남은 6 vCPU를 받는다(예약이 전체를 막지 않는다)
+        os.environ.update(FAKE_QUOTA_VALUE="8", FAKE_QUOTA_USED="0")
+        p1, p2 = self.two_projects()
+        p1["monthly_budget_usd"] = "200.0000"   # 최대 안: medium 2개(약 $199.73) = 2 vCPU
+        worker.plan_pending(self.api, self.cfg, worker.State(retry_after=0.0, recheck_after=0.0))
+        self.assertEqual(len(self.backend.created_plans), 2)
+        first, second = (p["variables"] for p in self.backend.created_plans)
+        self.assertEqual(first["cost"]["peak_vcpu"], 2.0)
+        self.assertEqual(second["fargate_vcpu"], {"quota_vcpu": 8.0, "used_vcpu": 0.0, "reserved_vcpu": 2.0, "available_vcpu": 6.0})
+        self.assertLessEqual(second["cost"]["peak_vcpu"], 6)
+        self.assertIn("예약 2, 남은 6", self.backend.created_plans[1]["summary"])
+
+    def test_waiting_projects_are_not_retried_until_retry_after(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_USED="0")
+        _, p2 = self.two_projects()
+        state = worker.State(retry_after=3600.0, recheck_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertIn(p2["id"], state.waiting)
+        before = len(self.aws_calls())
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.aws_calls()), before)   # 기다리는 프로젝트는 간격 안에서는 AWS를 다시 부르지 않는다
+
+    def test_shortage_without_any_reservation_is_still_a_counted_failure(self):
+        os.environ.update(FAKE_QUOTA_VALUE="0.1", FAKE_QUOTA_USED="0")   # 가장 작은 구성(0.25 vCPU)도 못 담는 계정
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(state.failures[p1["id"]][0], 1)   # 예약 때문이 아니면 기다려도 풀리지 않으므로 실패로 센다
+        self.assertEqual(state.waiting, {})
+        self.assertEqual(self.backend.created_plans, [])
+
+    def test_reserved_vcpu_sums_only_pending_plans_of_other_projects(self):
+        os.environ.update(FAKE_QUOTA_VALUE="100")
+        p1, p2 = self.two_projects()
+        legacy = {"variables": {"app": {"task_size": "medium", "max_tasks": 2}}}   # cost.peak_vcpu가 생기기 전의 계획: 1 vCPU x 2
+        self.backend.plans = {
+            p1["id"]: [{"id": "own", "status": "awaiting_approval", "variables": {"cost": {"peak_vcpu": 50}}}],   # 계획하려는 프로젝트 자신은 뺀다
+            p2["id"]: [
+                {"id": "a", "status": "awaiting_approval", "variables": {"cost": {"peak_vcpu": 3}}},
+                {"id": "b", "status": "approved", **legacy},
+                {"id": "c", "status": "consumed", "variables": {"cost": {"peak_vcpu": 10}}},     # 배포됨: 사용량에 이미 있다
+                {"id": "d", "status": "superseded", "variables": {"cost": {"peak_vcpu": 20}}},   # 대체됨
+                {"id": "e", "status": "awaiting_approval", "variables": "broken"},               # 읽을 수 없으면 건너뛴다
+            ],
+        }
+        self.assertEqual(worker.reserved_vcpu(self.api, p1["id"]), 5.0)
+        self.assertEqual(worker.reserved_vcpu(self.api, "no-such-project"), 5.0 + 50.0)   # 자신이 아니면 그 계획도 센다
+
+    def test_plan_peak_vcpu_reads_cost_then_app_and_rejects_garbage(self):
+        peak = worker.plan_peak_vcpu
+        self.assertEqual(peak({"variables": {"cost": {"peak_vcpu": 4.5}}}), 4.5)
+        self.assertEqual(peak({"variables": {"cost": {"peak_vcpu": 0}}}), 0.0)
+        self.assertEqual(peak({"variables": {"app": {"task_size": "large", "max_tasks": 3}}}), 6.0)   # 2 vCPU x 3
+        for bad in (None, {}, {"variables": None}, {"variables": {"cost": {"peak_vcpu": True}}}, {"variables": {"cost": {"peak_vcpu": -1}}},
+                    {"variables": {"cost": {"peak_vcpu": float("nan")}}}, {"variables": {"app": {"task_size": "huge", "max_tasks": 2}}},
+                    {"variables": {"app": {"task_size": "small", "max_tasks": True}}}):
+            with self.subTest(bad=bad):
+                self.assertIsNone(peak(bad))
+
+    def test_skip_quota_check_does_not_call_aws_and_says_so(self):
+        os.environ.update(FAKE_QUOTA_VALUE="6", FAKE_QUOTA_FAIL="all")   # 조회했다면 실패했을 환경
+        self.cfg.quota_check = False
+        self.quota_plan()
+        body = self.backend.created_plans[0]
+        self.assertEqual(self.aws_calls(), [])
+        self.assertIsNone(body["variables"]["fargate_vcpu"])
+        self.assertEqual(body["variables"]["app"]["max_tasks"], 14)   # 할당량으로 줄이지 않는다
+        self.assertIn("할당량 확인을 건너뜀", body["summary"])
+
+    def plan_with_project(self, project_fields, scale=None):
+        """분석 결과의 scale을 바꿔 프로젝트 API 필드(project_fields)와의 우선순위를 시험한다. scale을 주지 않으면(None) 분석 결과에서 scale을 뺀다."""
+        res = json.loads(json.dumps(GOOD_RESULT))
+        if scale is None:
+            del res["scale"]
+        else:
+            res["scale"] = scale
+        return worker.plan_project(self.api, self.cfg, {**PROJECT, **project_fields}, self.analysis(res))
+
+    def test_project_api_fields_are_used_when_the_analysis_has_no_scale(self):
+        # 분석기가 프로젝트 입력을 scale에 복사하지 않아도 사용자가 프로젝트에 입력한 월 예산이 적용돼야 한다.
+        # 백엔드는 예산을 "120.0000" 같은 문자열로 돌려준다
+        self.plan_with_project({"expected_users": "~10,000", "traffic_pattern": "steady", "monthly_budget_usd": "120.0000"})
+        v = self.backend.created_plans[0]["variables"]
+        self.assertEqual(v["cost"]["budget_usd"], 120.0)
+        self.assertLessEqual(v["cost"]["peak_monthly"], 120)
+        self.assertEqual((v["tier"], v["app"]["max_tasks"]), ("balanced", 1))   # roomy(약 $200)는 예산을 넘어 낮췄다. 예산을 무시했다면 roomy 프리셋이었다
+        self.assertIn("월 예산 $120.00 이내", self.backend.created_plans[0]["summary"])
+
+    def test_project_api_fields_win_over_the_analysis_scale_per_field(self):
+        # 분석 scale은 월 $120, ~1,000명. 프로젝트는 예산만 $100을 입력했다 → 예산은 프로젝트 값, 사용자 수는 분석 값으로 대체한다
+        self.plan_with_project({"monthly_budget_usd": "100.0000", "expected_users": None, "traffic_pattern": None},
+                               scale={"expected_users": "~1,000", "traffic_pattern": "steady", "monthly_budget_usd": 120})
+        v = self.backend.created_plans[0]["variables"]
+        self.assertEqual(v["cost"]["budget_usd"], 100.0)
+        self.assertEqual([o["tier"] for o in v["options"]], ["lean"])   # $100에는 최저 안만 들어간다(권장 안은 $106.87)
+        self.assertIn("~1,000명", v["reason"])
+
+    def test_analysis_scale_is_the_fallback_when_the_project_has_no_values(self):
+        # 프로젝트 값이 모두 비어 있으면 분석 결과의 scale(GOOD_RESULT: 월 $120)을 쓴다
+        self.plan_with_project({"monthly_budget_usd": None, "expected_users": None, "traffic_pattern": None}, scale=dict(GOOD_RESULT["scale"]))
+        self.assertEqual(self.backend.created_plans[0]["variables"]["cost"]["budget_usd"], 120.0)
+
+    def test_scale_priority_unit(self):
+        sa = worker.scale_from_analysis
+        self.assertEqual(sa({}, {"expected_users": "~100", "traffic_pattern": "peak", "monthly_budget_usd": "30.0000"}), ("~100", "peak", 30.0))
+        self.assertEqual(sa({"scale": {"expected_users": "~1,000", "monthly_budget_usd": 120}},
+                            {"expected_users": "~100", "traffic_pattern": None, "monthly_budget_usd": None}), ("~100", None, 120.0))
+        self.assertEqual(sa({"scale": {"monthly_budget_usd": 120}}, {"monthly_budget_usd": "0.0000"})[2], 0.0)   # 0을 입력했으면 0이 우선이다(None이 아니다)
+        self.assertEqual(sa({"scale": {"monthly_budget_usd": 120}}, None)[2], 120.0)   # project를 안 주는 호출은 이전과 같다
+        self.assertEqual(sa({}, {}), (None, None, None))
+
+    def test_invalid_project_values_are_plan_errors_that_name_the_project_field(self):
+        for key, bad in [("monthly_budget_usd", "abc"), ("monthly_budget_usd", True), ("monthly_budget_usd", "-1"),
+                         ("monthly_budget_usd", "nan"), ("expected_users", 123), ("traffic_pattern", [])]:
+            with self.subTest(key=key, bad=bad):
+                with self.assertRaises(worker.PlanError) as cm:
+                    self.plan_with_project({key: bad})
+                self.assertIn(f"프로젝트 {key}", str(cm.exception))
+        self.assertEqual(self.backend.created_plans, [])
+        self.assertEqual(self.calls(), [])   # 잘못된 입력에는 deploy.sh를 부르지 않는다
 
     def test_plan_without_budget_uses_presets_and_says_so(self):
         res = json.loads(json.dumps(GOOD_RESULT))
@@ -1097,17 +1446,9 @@ class ConnectionTests(Base):
     """사용자 AWS 연결 확인(back/API.md의 worker 연결 경로). 실제 AWS는 부르지 않고 aws CLI는 가짜 스크립트로 대신한다."""
 
     def setUp(self):
-        super().setUp()
-        script = self.tmp / "aws.sh"
-        script.write_bytes(FAKE_AWS.encode("utf-8"))
-        self.aws_log = self.tmp / "aws.log"
-        os.environ["FAKE_AWS_LOG"] = worker.posix(self.aws_log)
-        self.cfg.aws_cmd = [self.cfg.bash, worker.posix(script)]
+        super().setUp()   # 가짜 aws CLI(self.cfg.aws_cmd, self.aws_calls())는 Base가 만든다
         self.state = worker.State(conn_retry_after=0.0)
         self.backend.connections = [pending_conn()]
-
-    def aws_calls(self):
-        return self.aws_log.read_text(encoding="utf-8").splitlines() if self.aws_log.exists() else []
 
     def posts(self):
         return [(p, b) for p, b, _ in self.backend.conn_posts]

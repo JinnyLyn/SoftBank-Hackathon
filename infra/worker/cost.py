@@ -7,6 +7,8 @@ task_size 프리셋(CPU·메모리)은 modules/ecs-web-app/main.tf의 표와 같
 월 예산이 있으면 그 금액을 넘지 않는 범위에서 최저·평균·최대 세 안을 만든다(budget_configs). 예산 판정은 부하가 최대일 때
 (오토스케일링이 max_tasks까지 늘었을 때)의 월 비용(peak_monthly)으로 한다. 태스크 수·크기에 코드로 박아 둔 상한은 없고,
 한도는 사용자가 정한 예산이다. 예산이 없으면 TIERS 프리셋을 그대로 쓴다.
+다만 계정의 Fargate vCPU 할당량을 넘는 최대 구성은 도달할 수 없으므로, worker가 읽어 온 남은 vCPU(max_vcpu)를 알면 그 안으로
+max_tasks를 줄인다(할당량 값은 코드에 박지 않고 worker가 AWS에서 읽는다).
 """
 import json
 from pathlib import Path
@@ -126,10 +128,18 @@ def estimate(tier, prices, arch="X86_64", foundation=None, cfg=None):
         "headline": cfg["headline"], "tradeoff": cfg["tradeoff"],
         "app_monthly": _money(app_monthly), "shared_monthly": _money(shared), "total_monthly": _money(app_monthly + shared),
         "peak_monthly": _money(app_peak_monthly + shared),
+        # 부하가 최대일 때 동시에 띄우는 Fargate vCPU. 리전의 Fargate On-Demand vCPU 할당량과 비교하는 값이다
+        "peak_vcpu": vcpu * cfg["max_tasks"],
+        "quota_limited": bool(cfg.get("quota_limited")),   # 예산이 아니라 vCPU 할당량 때문에 max_tasks가 줄었는지
         "resources": resources,
         "region": prices["region"], "currency": prices["currency"], "pricing_as_of": prices["pricing_as_of"],
         "excluded": list(prices.get("excluded", [])),
     }
+
+
+def _quota_fit(cfg, max_vcpu):
+    """남은 Fargate vCPU 할당량(max_vcpu) 안에서 이 구성의 태스크를 동시에 몇 개까지 띄울 수 있는지. 할당량을 모르면(None) 제한 없음."""
+    return None if max_vcpu is None else int(max_vcpu // SIZES[cfg["task_size"]][0])
 
 
 def _tradeoff(tier, lo, hi):
@@ -142,9 +152,21 @@ def _tradeoff(tier, lo, hi):
     return TIERS[tier]["tradeoff"]
 
 
-def _fill_tier(tier, target, prices, arch, foundation):
-    """프리셋 tier의 크기·최소 태스크 수는 그대로 두고, 부하가 최대일 때의 월 비용이 target 이하인 가장 큰 max_tasks를 정한다.
+def _preset_cfg(tier, max_vcpu=None):
+    """예산을 모를 때 쓰는 프리셋 구성. 남은 Fargate vCPU 할당량(max_vcpu)을 알면 그 안으로 max_tasks를 줄이고,
     최소 태스크 수도 담지 못하면 None."""
+    base = TIERS[tier]
+    fit = _quota_fit(base, max_vcpu)
+    if fit is None or fit >= base["max_tasks"]:
+        return base
+    if fit < base["min_tasks"]:
+        return None
+    return {**base, "max_tasks": fit, "tradeoff": _tradeoff(tier, base["min_tasks"], fit), "quota_limited": True}
+
+
+def _fill_tier(tier, target, prices, arch, foundation, max_vcpu=None):
+    """프리셋 tier의 크기·최소 태스크 수는 그대로 두고, 부하가 최대일 때의 월 비용이 target 이하인 가장 큰 max_tasks를 정한다.
+    남은 Fargate vCPU 할당량(max_vcpu)을 알면 그 안으로 더 줄이고(quota_limited=True), 최소 태스크 수도 담지 못하면 None."""
     base = TIERS[tier]
     shared = estimate(tier, prices, arch, foundation)["shared_monthly"]
     compute, ipv4 = _task_cost(base["task_size"], prices, arch, foundation)
@@ -159,31 +181,43 @@ def _fill_tier(tier, target, prices, arch, foundation):
         n -= 1
     while peak(n + 1) <= target:
         n += 1
+    fit = _quota_fit(base, max_vcpu)
+    limited = fit is not None and n > fit
+    if limited:
+        n = fit
     if n < base["min_tasks"]:
         return None
-    return {**base, "max_tasks": n, "tradeoff": _tradeoff(tier, base["min_tasks"], n)}
+    cfg = {**base, "max_tasks": n, "tradeoff": _tradeoff(tier, base["min_tasks"], n)}
+    if limited:
+        cfg["quota_limited"] = True
+    return cfg
 
 
-def budget_configs(budget_usd, prices, arch="X86_64", foundation=None):
-    """월 예산을 넘지 않는 최저·평균·최대 세 안의 구성을 {tier: 구성}으로 돌려준다. 어느 안도 못 만들면 빈 딕셔너리.
+def budget_configs(budget_usd, prices, arch="X86_64", foundation=None, max_vcpu=None):
+    """월 예산과 Fargate vCPU 할당량을 넘지 않는 최저·평균·최대 세 안의 구성을 {tier: 구성}으로 돌려준다. 어느 안도 못 만들면 빈 딕셔너리.
 
     - 최저(lean): 가장 작은 구성(xsmall 1개 고정).
     - 최대(roomy): 부하가 최대일 때의 월 비용이 예산 한도에 닿도록 max_tasks를 채운 구성.
-    - 평균(balanced): 최저와 최대의 중간 금액에 맞춰 max_tasks를 채운 구성.
+    - 평균(balanced): 최저와 **실제로 만든 최대 안**의 중간 금액에 맞춰 max_tasks를 채운 구성. 태스크는 정수 개라 최대 안이
+      예산을 다 쓰지 못할 수 있어, 예산 원금이 아니라 최대 안의 실제 금액을 기준으로 해야 중간이 된다.
     예산이 작아 최대(roomy)의 최소 구성(medium 2개)도 담지 못하면 balanced를 예산 한도까지 채워 최대 안으로 삼는다.
     그것도 못 담으면 최저 안만 남는다. 만들 수 없는 안은 뺀다.
+    max_vcpu는 이 계정·리전에서 앞으로 더 띄울 수 있는 Fargate vCPU(할당량 - 사용 중). 알면 안마다 max_tasks를 그 안으로 줄이고,
+    모르면(None) 할당량은 제한하지 않는다.
     """
     budget = float(budget_usd)
+    lean_cfg = _preset_cfg("lean", max_vcpu)
     lean = estimate("lean", prices, arch, foundation)
-    if lean["peak_monthly"] > budget:
+    if lean_cfg is None or lean["peak_monthly"] > budget:
         return {}
-    cfgs = {"lean": dict(TIERS["lean"])}
-    top = _fill_tier("roomy", budget, prices, arch, foundation)
+    cfgs = {"lean": lean_cfg}
+    top = _fill_tier("roomy", budget, prices, arch, foundation, max_vcpu)
     if top is not None:
         cfgs["roomy"] = top
-        mid = _fill_tier("balanced", (lean["peak_monthly"] + budget) / 2, prices, arch, foundation)
+        top_peak = estimate("roomy", prices, arch, foundation, top)["peak_monthly"]
+        mid = _fill_tier("balanced", (lean["peak_monthly"] + top_peak) / 2, prices, arch, foundation, max_vcpu)
     else:
-        mid = _fill_tier("balanced", budget, prices, arch, foundation)
+        mid = _fill_tier("balanced", budget, prices, arch, foundation, max_vcpu)
     if mid is not None:
         cfgs["balanced"] = mid
     return {t: cfgs[t] for t in ORDER if t in cfgs}
@@ -193,7 +227,8 @@ def option_summary(est, rank, recommended):
     """프런트·승인 화면에 보여줄 한 안의 요약. rank는 lowest/average/highest(최저·평균·최대 금액 순)."""
     return {"tier": est["tier"], "rank": rank, "label": est["label"], "task_size": est["task_size"],
             "min_tasks": est["min_tasks"], "max_tasks": est["max_tasks"],
-            "total_monthly": est["total_monthly"], "peak_monthly": est["peak_monthly"],
+            "total_monthly": est["total_monthly"], "peak_monthly": est["peak_monthly"], "peak_vcpu": est["peak_vcpu"],
+            "quota_limited": est["quota_limited"],
             "headline": est["headline"], "tradeoff": est["tradeoff"], "recommended": recommended}
 
 
@@ -201,21 +236,31 @@ def _rank(i, n):
     return "lowest" if i == 0 else ("highest" if i == n - 1 else "average")
 
 
-def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", foundation=None):
+def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", foundation=None, max_vcpu=None):
     """권장 단계를 고르고, 비교할 최저·평균·최대 안(options)을 함께 낸다.
 
     - 예산이 없으면 TIERS 프리셋 세 안을 쓴다. 예산이 있으면 budget_configs가 예산 안에서 세 안을 만든다.
+    - max_vcpu(이 계정·리전에서 더 띄울 수 있는 Fargate vCPU)를 알면 어느 안도 부하가 최대일 때 그 vCPU를 넘지 않게 max_tasks를 줄인다.
+      모르면(None) 할당량은 제한하지 않는다. 상한이 없는 예산만으로는 할당량보다 큰 최대 구성이 나올 수 있어서 둔 인자다.
     - 예상 사용자 수로 기본 단계를 정하고, 접속이 특정 시간에 몰리면(peak) 한 단계 올린다.
-    - 예산 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다. 예산 판정은 부하가 최대일 때의 월 비용(peak_monthly) 기준이다.
-    - 가장 작은 안도 예산을 넘으면 recommended=None 과 이유를 낸다(AGENTS.md 5장 6단계: 만족할 구성이 없으면 이유를 알리고 종료).
+    - 예산·할당량 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다. 예산 판정은 부하가 최대일 때의 월 비용(peak_monthly) 기준이다.
+    - 가장 작은 안도 예산을 넘거나 할당량에 못 담으면 recommended=None 과 이유를 낸다(AGENTS.md 5장 6단계: 만족할 구성이 없으면 이유를 알리고 종료).
     """
     budget = None if budget_usd is None else float(budget_usd)
-    cfgs = {t: TIERS[t] for t in ORDER} if budget is None else budget_configs(budget, prices, arch, foundation)
+    if budget is None:
+        cfgs = {t: c for t in ORDER if (c := _preset_cfg(t, max_vcpu)) is not None}
+    else:
+        cfgs = budget_configs(budget, prices, arch, foundation, max_vcpu)
     if not cfgs:
         estimates = {t: estimate(t, prices, arch, foundation) for t in ORDER}
-        cheapest = estimates[ORDER[0]]["peak_monthly"]
-        return {"recommended": None, "estimates": estimates, "options": [],
-                "reason": f"월 예산 ${budget:.2f} 안에 들어가는 구성이 없습니다. 가장 작은 구성도 월 약 ${cheapest:.2f}입니다(공용 ALB·RDS 포함, 제외 항목 별도)."}
+        if _preset_cfg("lean", max_vcpu) is None:
+            need = SIZES[TIERS["lean"]["task_size"]][0] * TIERS["lean"]["min_tasks"]
+            reason = (f"Fargate 할당량이 부족해 구성을 만들 수 없습니다. 이 리전에서 더 띄울 수 있는 vCPU가 {max_vcpu:g}개인데 "
+                      f"가장 작은 구성도 {need:g} vCPU가 필요합니다(할당량 증설을 요청하거나 사용 중인 작업을 줄이세요).")
+        else:
+            cheapest = estimates[ORDER[0]]["peak_monthly"]
+            reason = f"월 예산 ${budget:.2f} 안에 들어가는 구성이 없습니다. 가장 작은 구성도 월 약 ${cheapest:.2f}입니다(공용 ALB·RDS 포함, 제외 항목 별도)."
+        return {"recommended": None, "estimates": estimates, "options": [], "reason": reason}
     estimates = {t: estimate(t, prices, arch, foundation, cfgs[t]) for t in cfgs}
     base = USERS_TO_TIER.get(expected_users, "balanced")
     idx = ORDER.index(base)
@@ -227,12 +272,19 @@ def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", founda
     if pattern == "peak" and idx < len(ORDER) - 1:
         idx += 1
         reasons.append("특정 시간에 접속이 몰려 한 단계 올림")
+    fitting = [i for i in range(idx + 1) if ORDER[i] in estimates]
+    if fitting[-1] < idx:
+        limits = ([f"월 예산 ${budget:.2f}"] if budget is not None else []) + ([f"Fargate 할당량(남은 {max_vcpu:g} vCPU)"] if max_vcpu is not None else [])
+        reasons.append(f"{' 및 '.join(limits)} 안에서는 '{TIERS[ORDER[idx]]['label']}' 안을 만들 수 없어 낮춤")
+    idx = fitting[-1]
     if budget is not None:
-        fitting = [i for i in range(idx + 1) if ORDER[i] in estimates]
-        if fitting[-1] < idx:
-            reasons.append(f"월 예산 ${budget:.2f}으로는 '{TIERS[ORDER[idx]]['label']}' 안을 만들 수 없어 낮춤")
-        idx = fitting[-1]
-        reasons.append(f"세 안 모두 부하가 최대일 때도 월 예산 ${budget:.2f}을 넘지 않음")
+        # 예산이 작으면 안이 세 개보다 적게 만들어진다. 만든 안의 수만 말한다
+        n = len(estimates)
+        who = "제시하는 안이 하나뿐이고 그 안은" if n == 1 else f"제시하는 {n}개 안은 모두"
+        reasons.append(f"{who} 부하가 최대일 때도 월 예산 ${budget:.2f}을 넘지 않음")
+    limited = [estimates[t]["label"] for t in ORDER if t in estimates and estimates[t]["quota_limited"]]
+    if limited:
+        reasons.append(f"Fargate 할당량(남은 {max_vcpu:g} vCPU)에 맞춰 {', '.join(limited)} 안의 최대 태스크 수를 줄임")
     tier = ORDER[idx]
     names = [t for t in ORDER if t in estimates]
     options = [option_summary(estimates[t], _rank(i, len(names)), t == tier) for i, t in enumerate(names)]
