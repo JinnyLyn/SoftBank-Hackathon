@@ -673,6 +673,16 @@ class LocalPlannerTests(WorkerBase):
         # 이미지를 만들거나 컨테이너를 띄우지 않는다(승인 전). docker는 info·compose version만 불렀다
         self.assertEqual({self.sub(a) for a in self.docker_calls()}, {"info", "compose"})
 
+    def test_dockerfile_draft_goes_into_local_plan_variables(self):
+        res = json.loads(json.dumps(test_worker.GOOD_RESULT))
+        res["dockerfile"] = None
+        res["dockerfile_draft"] = {"path": "Dockerfile", "content": "FROM python:3.12-slim\nCMD [\"python\"]\n", "port": 8000, "based_on": []}
+        self.seed_project(result=res)
+        worker.plan_pending_local(self.api, self.cfg, worker.State())
+        v = self.backend.created_plans[0]["variables"]
+        self.assertIsNone(v["dockerfile"])
+        self.assertEqual(v["dockerfile_draft"]["sha256"], hashlib.sha256(res["dockerfile_draft"]["content"].encode()).hexdigest())
+
     def test_budget_does_not_block_a_free_target(self):
         project = self.seed_project()
         project["monthly_budget_usd"] = "0.0000"
@@ -836,6 +846,25 @@ class LocalExecutorTests(WorkerBase):
     def assert_nothing_ran(self):
         names = {self.sub(a) for a in self.docker_calls()}
         self.assertFalse(names & {"build", "up", "run", "rmi"}, names)
+
+    def draft_vars(self, content="FROM python:3.12-slim\n", sha=None):
+        v = json.loads(json.dumps(self.plan["variables"]))
+        v["dockerfile"] = None
+        v["dockerfile_draft"] = {"content": content, "sha256": sha or hashlib.sha256(content.encode()).hexdigest()}
+        return v
+
+    def test_approved_draft_is_built_from_outside_the_source(self):
+        self.run_job(variables=self.draft_vars())
+        self.assertEqual(self.statuses()[-1], ("healthy", "healthy"))
+        built = json.loads(Path(os.environ["FAKE_BUILD_LOG"]).read_text(encoding="utf-8"))
+        self.assertTrue(built["dockerfile_exists"])
+        self.assertNotIn("Dockerfile", built["files"], "초안은 소스(컨텍스트) 안에 쓰지 않음")
+        self.assertFalse(Path(built["dockerfile"]).exists(), "빌드 뒤 임시 파일은 지움")
+
+    def test_local_draft_changed_after_approval_is_not_built(self):
+        self.run_job(variables=self.draft_vars(sha="0" * 64))
+        self.assertEqual(self.statuses()[-1][0], "failed")
+        self.assert_nothing_ran()
 
     def test_success_reports_deploying_then_healthy_with_the_local_url(self):
         self.run_job()

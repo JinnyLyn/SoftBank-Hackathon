@@ -28,6 +28,10 @@ const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 // AWS 연결 확인(worker의 AssumeRole)은 최대 2분쯤 걸림. 저장된 상태만 다시 읽으므로 AWS에는 영향 없음
 const AWS_POLL_MS = 5000
 
+/** 서버에 AWS 연결 템플릿이 설정되지 않아 콘솔 링크가 없는 AWS 연결. 기다려도 완료되지 않으므로 폴링하지 않고 그렇게 안내함 */
+const noSetup = (c: Connection) =>
+  c.provider === 'aws' && c.status === 'pending' && !c.accountId && !c.roleArn && !(c.setupUrl && isSafeRedirect(c.setupUrl, CONSOLE_HOSTS))
+
 interface Props {
   connections: Connection[] | null
   loadError: string | null
@@ -51,7 +55,7 @@ export default function Connections({ connections, loadError, onReload, onChange
   const installConn = list.find((c) => c.id === installFor) ?? null
 
   // 확인을 기다리는 AWS 연결이 있으면 몇 초마다 목록을 다시 읽음 → "다시 확인"을 계속 누르지 않아도 됨
-  const awsPending = list.some((c) => c.provider === 'aws' && c.status === 'pending')
+  const awsPending = list.some((c) => c.provider === 'aws' && c.status === 'pending' && !noSetup(c))
   useEffect(() => {
     if (!awsPending) return
     const timer = window.setInterval(async () => {
@@ -251,15 +255,15 @@ export default function Connections({ connections, loadError, onReload, onChange
                           콘솔에서 연결 스택 만들기
                         </a>
                       ) : (
-                        '콘솔 연결 링크가 아직 준비되지 않았습니다 (서버의 AWS 연결 템플릿 설정 필요).'
+                        '이 서버에는 AWS 계정 연결 템플릿이 설정되지 않아 이 연결은 완료되지 않습니다. 새 배포는 연결 없이 운영자 AWS로 진행되니, 필요 없으면 삭제하세요.'
                       )}
                       {c.setupUrl ? ' → 스택을 만들면 자동으로 확인합니다' : ''}
                     </span>
                   )}
                 </div>
                 <div className="conn-side">
-                  <span className={'conn-status is-' + c.status}>
-                    {{ connected: '연결됨', pending: '연결 대기', error: '확인 필요' }[c.status]}
+                  <span className={'conn-status is-' + (noSetup(c) ? 'error' : c.status)}>
+                    {noSetup(c) ? '설정 없음' : { connected: '연결됨', pending: '연결 대기', error: '확인 필요' }[c.status]}
                   </span>
                   <span className="small muted">{shortTime(c.checkedAt)} 확인</span>
                 </div>

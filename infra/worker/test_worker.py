@@ -999,6 +999,35 @@ class PlannerTests(Base):
         self.assertIn("--arch X86_64", up[0])
         self.assertFalse(any(c.startswith("build") or c.startswith("apply") for c in calls))   # 승인 전에는 빌드도 적용도 하지 않는다
 
+    def draft_result(self, content="FROM python:3.12-slim\nCOPY . .\nCMD [\"python\", \"app.py\"]\n"):
+        res = json.loads(json.dumps(GOOD_RESULT))
+        res["dockerfile"] = None
+        res["dockerfile_draft"] = {"path": "Dockerfile", "content": content, "port": 8000, "based_on": ["app.py"]}
+        return res
+
+    def test_dockerfile_draft_goes_into_plan_variables_for_approval(self):
+        # 소스에 Dockerfile이 없으면 분석기 초안을 계획 변수에 넣어 승인 대상(fingerprint)이 되게 함
+        res = self.draft_result()
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(res))
+        v = self.backend.created_plans[0]["variables"]
+        self.assertIsNone(v["dockerfile"])
+        self.assertEqual(v["dockerfile_draft"]["content"], res["dockerfile_draft"]["content"])
+        self.assertEqual(v["dockerfile_draft"]["sha256"], hashlib.sha256(res["dockerfile_draft"]["content"].encode()).hexdigest())
+
+    def test_draft_is_ignored_when_source_has_dockerfile_and_rejected_when_invalid(self):
+        res = self.draft_result()
+        res["dockerfile"] = "Dockerfile"
+        self.assertIsNone(worker.dockerfile_draft_from_analysis(res), "소스에 Dockerfile이 있으면 그것을 씀")
+        with self.assertRaises(worker.PlanError):
+            worker.dockerfile_draft_from_analysis(self.draft_result("RUN echo no-from\n"))
+        with self.assertRaises(worker.PlanError):
+            worker.dockerfile_draft_from_analysis(self.draft_result("FROM x\n" + "#" * worker.MAX_DRAFT_BYTES))
+        # 초안도 Dockerfile도 없으면 지금처럼 계획을 만들지 않음
+        none = self.draft_result()
+        none.pop("dockerfile_draft")
+        with self.assertRaises(worker.PlanError):
+            worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(none))
+
     def test_requested_architecture_is_passed_to_planning_and_recorded(self):
         worker.plan_project(self.api, self.cfg, PROJECT, self.analysis(), arch="ARM64")
         up = [c for c in self.calls() if c.startswith("up ")][0]
@@ -1201,6 +1230,27 @@ class ExecutorTests(Base):
         self.assertIn("--tag fake0001-r1", build)
         self.assertIn("--dockerfile sample-back/Dockerfile", build)
         self.assertIn("--arch X86_64", build)
+
+    def draft_job(self, content="FROM python:3.12-slim\n", sha=None):
+        job = self.make_job()
+        job["variables"]["dockerfile"] = None
+        job["variables"]["dockerfile_draft"] = {"content": content, "sha256": sha or hashlib.sha256(content.encode()).hexdigest()}
+        return job
+
+    def test_approved_draft_is_built_from_a_file_outside_the_source(self):
+        worker.execute_job(self.api, self.cfg, self.draft_job())
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
+        build = self.calls()[0]
+        self.assertIn("--dockerfile-file", build)
+        self.assertNotIn("--dockerfile ", build)
+        # 빌드가 끝나면 임시 초안 파일은 지움
+        path = build.split("--dockerfile-file ", 1)[1].split(" ", 1)[0]
+        self.assertFalse(Path(path).exists())
+
+    def test_draft_changed_after_approval_is_not_built(self):
+        worker.execute_job(self.api, self.cfg, self.draft_job(sha="0" * 64))
+        self.assertEqual(self.statuses(), ["failed"])
+        self.assertEqual(self.calls(), [], "지문이 다르면 빌드도 적용도 하지 않음")
 
     def test_deploying_is_reported_before_health_wait_ends_once(self):
         worker.execute_job(self.api, self.cfg, self.make_job())

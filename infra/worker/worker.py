@@ -371,7 +371,9 @@ def app_config_from_analysis(result, tier, tier_cfg=None):
     if init is not None and (not isinstance(init, list) or len(init) > 10 or not all(isinstance(x, str) and 0 < len(x) <= 200 for x in init)):
         raise PlanError("app_config.init_command는 비어 있지 않은 문자열 배열(최대 10개)이어야 합니다")
     dockerfile = result.get("dockerfile", "Dockerfile")
-    if not isinstance(dockerfile, str) or not dockerfile or dockerfile.startswith("/") or ".." in dockerfile or len(dockerfile) > 200:
+    if dockerfile is None and dockerfile_draft_from_analysis(result) is not None:
+        dockerfile = None   # 소스에 Dockerfile이 없고 초안으로 빌드함 (plan_project가 초안을 계획 변수에 넣음)
+    elif not isinstance(dockerfile, str) or not dockerfile or dockerfile.startswith("/") or ".." in dockerfile or len(dockerfile) > 200:
         raise PlanError(f"dockerfile 경로가 올바르지 않습니다: {dockerfile!r}")
     t = tier_cfg if tier_cfg is not None else cost.TIERS[tier]
     app = {"container_port": port, "health_check_path": health, "task_size": t["task_size"],
@@ -380,6 +382,28 @@ def app_config_from_analysis(result, tier, tier_cfg=None):
     if init:
         app["init_command"] = list(init)
     return app, dockerfile
+
+
+# Dockerfile 초안 상한. 분석기 템플릿은 1 KB 안팎
+MAX_DRAFT_BYTES = 20_000
+
+
+def dockerfile_draft_from_analysis(result):
+    """소스에 Dockerfile이 없을 때 분석 결과가 준 초안 {content, sha256}. 없거나 소스에 Dockerfile이 있으면 None.
+
+    초안 내용은 계획 변수에 그대로 넣어 승인 대상(fingerprint)에 포함한다. 빌드는 승인된 내용으로만 한다."""
+    if not isinstance(result, dict) or result.get("dockerfile") is not None:
+        return None
+    d = result.get("dockerfile_draft")
+    content = d.get("content") if isinstance(d, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        return None
+    data = content.encode("utf-8")
+    if len(data) > MAX_DRAFT_BYTES:
+        raise PlanError(f"Dockerfile 초안이 너무 큽니다({len(data)} bytes)")
+    if not any(line.strip().upper().startswith("FROM ") for line in content.splitlines()):
+        raise PlanError("Dockerfile 초안에 FROM 이 없습니다")
+    return {"content": content, "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def scale_from_analysis(result, project=None):
@@ -689,6 +713,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
                           "why": "부하가 늘어 태스크가 최대 개수까지 늘었을 때만 더해지는 비용(평소에는 청구되지 않음). 승인 금액과 월 예산은 이 최대 비용 기준"})
     variables = {
         "deploy_id": deploy_id, "image": image, "dockerfile": dockerfile, "app": app,
+        # 소스에 Dockerfile이 없으면 분석기가 만든 초안. 계획 변수에 넣어 승인 대상(fingerprint)이 되고, 빌드는 이 내용으로만 함
+        "dockerfile_draft": dockerfile_draft_from_analysis(result),
         # 승인된 소스(ZIP)의 SHA-256과 이미지 아키텍처: executor가 빌드 직전에 확인하고 같은 아키텍처로 빌드한다
         "source_sha256": src_sha, "cpu_architecture": arch,
         "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
@@ -783,7 +809,8 @@ def plan_local_project(api, cfg, project, analysis):
         port = local_docker.pick_host_port(deploy_id, lc.bind)
         plan = local_docker.make_plan(deploy_id=deploy_id, image=local_docker.image_ref(deploy_id, src_sha), dockerfile=dockerfile, app=app,
                                       source_sha256=src_sha, tier=tier, profile=profile, reasons=reasons + lowered, host_port=port, bind=lc.bind,
-                                      public_host=lc.public_host, docker_info=info)
+                                      public_host=lc.public_host, docker_info=info,
+                                      dockerfile_draft=dockerfile_draft_from_analysis(result))
     except local_docker.LocalError as e:
         raise PlanError(e.message) from None
     body = {"project_id": project["id"], "analysis_id": analysis.get("id"), "target": local_docker.TARGET, "module_id": local_docker.MODULE_ID,
@@ -961,10 +988,28 @@ def execute_job(api, cfg, job):
             return fail_job(api, dep, "invalid_job", f"작업의 cpu_architecture가 올바르지 않습니다: {arch!r}")
         env = child_env(cfg)
 
-        log(f"이미지 빌드: {deploy_id} ({arch})")
-        rc, out, err = run_capture(deploy(cfg, "build", "--id", deploy_id, "--source", posix(src_path),
-                                          "--dockerfile", dockerfile, "--tag", tag, "--arch", arch),
-                                   cfg.build_timeout, cwd=str(INFRA), env=env)
+        draft = v.get("dockerfile_draft")
+        build_args = ["--dockerfile", dockerfile or "Dockerfile"]
+        draft_dir = None
+        if dockerfile is None:
+            content = draft.get("content") if isinstance(draft, dict) else None
+            expected = draft.get("sha256") if isinstance(draft, dict) else None
+            if (not isinstance(content, str) or not isinstance(expected, str)
+                    or hashlib.sha256(content.encode("utf-8")).hexdigest() != expected):
+                return fail_job(api, dep, "draft_mismatch", "승인된 Dockerfile 초안을 확인하지 못했습니다(내용·지문 불일치). 빌드하지 않았습니다")
+            draft_dir = Path(tempfile.mkdtemp(prefix="pc-draft-"))
+            draft_file = draft_dir / "Dockerfile"
+            draft_file.write_text(content, encoding="utf-8", newline="\n")
+            build_args = ["--dockerfile-file", posix(draft_file)]
+
+        log(f"이미지 빌드: {deploy_id} ({arch})" + (" — 승인된 Dockerfile 초안 사용" if draft_dir else ""))
+        try:
+            rc, out, err = run_capture(deploy(cfg, "build", "--id", deploy_id, "--source", posix(src_path),
+                                              *build_args, "--tag", tag, "--arch", arch),
+                                       cfg.build_timeout, cwd=str(INFRA), env=env)
+        finally:
+            if draft_dir:
+                shutil.rmtree(draft_dir, ignore_errors=True)
         built = out.strip().splitlines()[-1] if out.strip() else ""
         if rc != 0:
             return fail_job(api, dep, "build_failed", "이미지를 빌드하거나 올리지 못했습니다", {"log_tail": tail(err)})
@@ -1066,7 +1111,7 @@ def execute_local_job(api, cfg, job):
             return fail_job(api, dep, *err)
 
         log(f"이미지 빌드(로컬 Docker): {deploy_id}")
-        local_docker.build_image(lc, src_path, v.get("dockerfile", "Dockerfile"), params["image"])
+        local_docker.build_image(lc, src_path, v.get("dockerfile", "Dockerfile"), params["image"], v.get("dockerfile_draft"))
 
         state = {"deploying": False}
 

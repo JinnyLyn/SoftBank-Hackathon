@@ -47,7 +47,7 @@
 
 - `dockerfile_draft`는 코드에서 찾은 근거로 만든 제안이다. 업로드 원본을 수정하거나 worker에 자동 적용하지 않는다.
 - 기본 흐름은 **초안 확인·다운로드 → 저장소 루트에 `Dockerfile`로 추가 → "새 배포"로 소스 재업로드 → 새 구성·비용 계획 확인·승인**이다. 초안 표시만으로 계획 생성·빌드·배포가 완료된 것은 아니다.
-- PR #29는 계획 변수에 `dockerfile_draft`가 있을 때 승인 화면에 초안을 표시하고, `VITE_DOCKERFILE_DRAFT_BUILD=true`이면 초안 앱의 계획을 기다리는 프런트 경로를 준비했다. 기본값은 `false`이며 플래그 변경만으로 worker 지원이 생기지는 않는다. 직접 빌드하려면 초안 내용·해시를 승인할 계획에 연결하고 승인된 내용 그대로 worker가 빌드하는 인프라 변경을 먼저 통합·검증한 뒤 플래그를 켠다. 그 전에는 재업로드 흐름을 사용한다.
+- 소스에 Dockerfile이 없으면 worker가 초안을 계획 변수 `dockerfile_draft {content, sha256}`에 넣어 승인 대상(fingerprint)으로 만들고, 승인 뒤 지문을 다시 확인해 소스 밖 임시 파일로 `docker build -f`(`deploy.sh build --dockerfile-file`)한다. 소스는 바꾸지 않는다. 프런트 `VITE_DOCKERFILE_DRAFT_BUILD`는 기본 켜짐이며, 초안 빌드가 없는 예전 worker와 쓸 때만 `false`로 두고 재업로드 흐름을 쓴다.
 - 이 문서 갱신은 PR #29의 코드 승인·머지나 실제 AWS 배포 검증을 대신하지 않는다. 초안 직접 빌드와 승인 경계의 후속 확인은 인프라 담당·JinnyLyn이 맡는다.
 
 ## runner (`runner.py`)
