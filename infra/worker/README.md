@@ -2,6 +2,10 @@
 
 플랫폼 백엔드(`back/`, PR #10)와 `infra/scripts/deploy.sh`를 잇는 프로그램이다. 표준 라이브러리만 쓴다(Python 3.12 이상).
 
+현재 제품 기준은 [PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`이다. 아래 AWS 자격 증명과 foundation 준비는 운영자/worker 환경용이며 사용자 계정·IAM 키 입력을 전제하지 않는다. 계정 이전은 [OPERATOR_AWS.md](../../docs/OPERATOR_AWS.md)를 따른다.
+
+이 worker의 `healthy`는 앱 배포 상태다. 도메인 신규 등록·DNS·인증서·호스트 라우팅의 제품 흐름은 아직 포함하지 않는다. 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
+
 백엔드는 ZIP·분석 결과·계획·승인·배포 대기열을 저장만 하고 Terraform·Docker·AWS를 실행하지 않는다(`back/API.md`).
 프런트는 계획이 생길 때까지 기다리기만 한다. 그 사이를 이 worker가 채운다.
 
