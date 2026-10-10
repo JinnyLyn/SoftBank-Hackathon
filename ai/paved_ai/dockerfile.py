@@ -16,7 +16,8 @@ from typing import Dict, List, Optional, Tuple
 from .source import SourceFile
 
 DEFAULT_PYTHON = "3.12"
-DEFAULT_NODE = "20"
+# 프로젝트에 버전이 없을 때. Node 20은 2026-04 지원 종료라 현재 LTS 인 22 (버전이 적혀 있으면 그것을 씀)
+DEFAULT_NODE = "22"
 
 
 @dataclass
@@ -139,8 +140,17 @@ def _node(files, framework: str, runtime: Optional[str], port: int) -> Tuple[Opt
         return None, "package.json 을 읽지 못했습니다."
     scripts = pkg.get("scripts") or {}
     based_on = ["package.json"]
+    # 패키지 매니저: lockfile 로 정함. pnpm·yarn 은 corepack 으로 package.json 의 packageManager 버전을 씀
+    if _root(files, "pnpm-lock.yaml"):
+        pm = "pnpm"
+        based_on.append("pnpm-lock.yaml")
+    elif _root(files, "yarn.lock"):
+        pm = "yarn"
+        based_on.append("yarn.lock")
+    else:
+        pm = "npm"
     if isinstance(scripts.get("start"), str):
-        cmd = ["npm", "start"]
+        cmd = [pm, "start"]
         based_on.append(f"package.json scripts.start: {scripts['start']}"[:120])
     else:
         main = pkg.get("main") if isinstance(pkg.get("main"), str) else None
@@ -150,23 +160,32 @@ def _node(files, framework: str, runtime: Optional[str], port: int) -> Tuple[Opt
         cmd = ["node", entry]
         based_on.append(entry)
     has_build = isinstance(scripts.get("build"), str)
-    lock = _root(files, "package-lock.json") is not None
-    # 빌드가 있으면 개발 의존성(TypeScript·Vite 등)도 필요함. NODE_ENV=production 이면 npm이 기본으로 빼므로
-    # --include=dev 를 명시 (PR #29 리뷰: tsc 를 못 찾아 npm run build 가 실패했음)
-    install = "npm ci" if lock else "npm install"
-    install += " --include=dev" if has_build else " --omit=dev"
+
+    # 빌드가 있으면 개발 의존성(TypeScript·Vite 등)도 필요함 (PR #29 리뷰).
+    # NODE_ENV=production 은 매니저가 개발 의존성을 빼게 하므로 빌드가 끝난 뒤에 설정함
+    if pm == "npm":
+        lock = _root(files, "package-lock.json") is not None
+        install = ("npm ci" if lock else "npm install") + (" --include=dev" if has_build else " --omit=dev")
+        copy = ["COPY package*.json ./", f"RUN {install}", "COPY . ."]
+        build = "npm run build"
+    elif pm == "pnpm":
+        # 워크스페이스(모노레포)는 하위 패키지의 package.json 이 모두 있어야 설치되므로 전체를 먼저 복사
+        install = "corepack enable && pnpm install --frozen-lockfile" + ("" if has_build else " --prod")
+        copy = ["COPY . .", f"RUN {install}"]
+        build = "pnpm run build"
+    else:
+        install = "corepack enable && yarn install" + ("" if has_build else " --production")
+        copy = ["COPY . .", f"RUN {install}"]
+        build = "yarn build"
 
     lines = _header(framework, based_on) + [
         f"FROM node:{_version(runtime, DEFAULT_NODE, major_only=True)}-slim",
-        "ENV NODE_ENV=production",
         "WORKDIR /app",
-        "COPY package*.json ./",
-        f"RUN {install}",
-        "COPY . .",
+        *copy,
     ]
     if has_build:
-        lines.append("RUN npm run build")
-    lines += [f"ENV PORT={port}", f"EXPOSE {port}", "CMD " + json.dumps(cmd)]
+        lines.append(f"RUN {build}")
+    lines += ["ENV NODE_ENV=production", f"ENV PORT={port}", f"EXPOSE {port}", "CMD " + json.dumps(cmd)]
     return Draft("\n".join(lines) + "\n", port, based_on), None
 
 

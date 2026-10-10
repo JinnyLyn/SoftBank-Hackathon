@@ -51,6 +51,8 @@ _PATTERNS: List[Tuple[re.Pattern, str]] = [
 _ENV_ASSIGN = re.compile(
     r"(?im)^(\s*(?:-\s*)?(?:export\s+)?[\"']?(" + _SECRET_NAME + r")[\"']?\s*[=:]\s*)(\"[^\"\n]*\"|'[^'\n]*'|[^\s#,\n]+)"
 )
+# 설정 파일에서 이름이 비밀스러워도 값이 이것이면 가리지 않음 (불리언·빈 값은 비밀이 아님)
+_NOT_SECRET_LITERALS = {"true", "false", "null", "none", "yes", "no", "on", "off", "~"}
 # 위 규칙을 적용할 설정 파일. 코드에는 적용하지 않음 (SECRET_KEY = os.getenv("SECRET_KEY") 같은 줄의 변수 이름을 지키려고)
 _CONFIG_FILE = re.compile(r"(?i)(^|/)(\.env(\.[\w-]+)?|[^/]+\.(ya?ml|ini|cfg|conf|toml|properties|json)|dockerfile)$")
 # 코드에서 비밀 이름 변수에 문자열 그대로 넣은 것만 (password = request.form[...] 같은 코드는 그대로 둠)
@@ -93,10 +95,30 @@ def mask_text(text: str, config_file: bool = False) -> Tuple[str, int]:
         text, n = pattern.subn(repl, text)
         count += n
     if config_file:
-        text, n = _ENV_ASSIGN.subn(lambda m: m.group(1) + MASK, text)
-        count += n
-    text, n = _CODE_ASSIGN.subn(lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{MASK}{m.group(4)}", text)
-    count += n
+        hits = [0]
+
+        def assign(m: re.Match) -> str:
+            value = m.group(3)
+            # true·false·null 같은 값은 비밀이 아님. 가리면 package.json("private": true)이 깨져 의존성을 못 읽었음
+            if value.lower() in _NOT_SECRET_LITERALS:
+                return m.group(0)
+            hits[0] += 1
+            # 따옴표 값은 따옴표를 남겨 JSON·YAML 모양을 유지
+            quote = value[0] if value[:1] in "\"'" else ""
+            return m.group(1) + quote + MASK + quote
+
+        text = _ENV_ASSIGN.sub(assign, text)
+        count += hits[0]
+    code_hits = [0]
+
+    def code_assign(m: re.Match) -> str:
+        if m.group(5) == MASK:  # 설정 파일 규칙이 이미 가림
+            return m.group(0)
+        code_hits[0] += 1
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}{MASK}{m.group(4)}"
+
+    text = _CODE_ASSIGN.sub(code_assign, text)
+    count += code_hits[0]
     return text, count
 
 

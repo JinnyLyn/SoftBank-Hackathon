@@ -360,7 +360,29 @@ def _detect_health(a: Analysis, repo: Repo) -> None:
     if unsure:
         a.unresolved["health_check_path"] = "라우터가 다른 경로 아래에 붙어 있어 헬스체크의 전체 경로를 확정하지 못했습니다."
         return
+    if a.framework == "Next.js" and _next_health(a, repo):
+        return
     a.unresolved["health_check_path"] = "헬스체크로 쓸 경로(/health 또는 /)를 찾지 못했습니다."
+
+
+# Next.js 는 파일 경로가 곧 주소 (app 라우터·pages 라우터). 헬스체크 전용 경로가 있으면 그것, 없으면 첫 화면
+_NEXT_ROUTES = [
+    ("/api/health", re.compile(r"(^|/)(src/)?(app/api/health/route|pages/api/health)\.(t|j)sx?$")),
+    ("/", re.compile(r"(^|/)(src/)?(app/page|pages/index)\.(t|j)sx?$")),
+]
+
+
+def _next_health(a: Analysis, repo: Repo) -> bool:
+    for path, pattern in _NEXT_ROUTES:
+        f = next((x for x in sorted(repo.files, key=lambda x: (x.path.count("/"), x.path)) if pattern.search(x.path)), None)
+        if f:
+            a.health_check_path = path
+            first = f.text.splitlines()[0] if f.text.strip() else f.path
+            a.evidence.append(Evidence(f.path, 1, first))
+            if path == "/":
+                a.info("헬스체크 전용 경로가 없어 / 를 씁니다", f"{f.path} 가 첫 화면입니다. 응답이 느리면 app/api/health/route.ts 같은 가벼운 경로를 추가하는 게 좋습니다.")
+            return True
+    return False
 
 
 # ORM·DATABASE_URL 만으로는 DB 종류를 모름. 주소 형식(postgresql://)·Prisma provider·ORM dialect 로 종류를 찾음

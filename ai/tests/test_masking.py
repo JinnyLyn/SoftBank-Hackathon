@@ -38,6 +38,16 @@ class MaskTextTests(unittest.TestCase):
         self.assertIn("JWT_SECRET=<가림>", out)
         self.assertIn("MYSQL_ROOT_PASSWORD=<가림>", out)
 
+    def test_json_config_stays_valid_json(self):
+        # 10/11 회귀: "private": true 를 "private": <가림> 으로 바꿔 package.json 이 깨지고 프레임워크를 못 찾았음
+        import json
+        pkg = '{\n  "name": "web",\n  "private": true,\n  "db_password": "hunter2",\n  "dependencies": {"next": "^15.1.6"}\n}\n'
+        out, n = mask_text(pkg, config_file=True)
+        data = json.loads(out)
+        self.assertIs(data["private"], True)
+        self.assertEqual(data["db_password"], "<가림>")
+        self.assertEqual(n, 1)
+
     def test_code_keeps_variable_names(self):
         code = 'SECRET_KEY = os.getenv("SECRET_KEY")\npassword = request.form["password"]\nSTRIPE_API_KEY = "sk_live_fakefake"\n'
         out, n = mask_text(code)

@@ -55,6 +55,43 @@ class DraftTests(unittest.TestCase):
         self.assertIn("ENV PORT=3000", d["content"])
         self.assertIn('CMD ["npm", "start"]', d["content"])
 
+    def test_package_manager_from_lockfile(self):
+        # pnpm 워크스페이스(모노레포): 하위 package.json 이 모두 있어야 설치되므로 전체를 먼저 복사, corepack 으로 버전 고정
+        base = {"package.json": json.dumps({"name": "root", "private": True, "scripts": {"build": "x", "start": "y"}}),
+                "apps/site/package.json": json.dumps({"name": "site", "private": True, "dependencies": {"next": "^15"}}),
+                "apps/site/app/page.tsx": "export default function Page() { return null }\n"}
+        _, d = draft_of({**base, "pnpm-lock.yaml": "lockfileVersion: '9.0'\n"})
+        self.assertIn("RUN corepack enable && pnpm install --frozen-lockfile\n", d["content"])
+        self.assertIn("RUN pnpm run build", d["content"])
+        self.assertIn('CMD ["pnpm", "start"]', d["content"])
+        self.assertLess(d["content"].index("COPY . ."), d["content"].index("pnpm install"))
+        _, d = draft_of({**base, "yarn.lock": "# yarn lockfile v1\n"})
+        self.assertIn("corepack enable && yarn install", d["content"])
+        self.assertIn('CMD ["yarn", "start"]', d["content"])
+
+    def test_node_version_default_and_from_project(self):
+        pkg = json.dumps({"dependencies": {"express": "^4"}, "scripts": {"start": "node a.js"}})
+        _, d = draft_of({"package.json": pkg})
+        self.assertIn("FROM node:22-slim", d["content"], "버전이 없으면 지원 중인 LTS")
+        _, d = draft_of({"package.json": pkg, ".nvmrc": "20.11.1\n"})
+        self.assertIn("FROM node:20-slim", d["content"], "프로젝트에 적힌 버전을 따름")
+
+    def test_node_env_is_set_after_build(self):
+        # NODE_ENV=production 이 먼저 있으면 매니저가 개발 의존성을 빼 빌드가 실패함
+        _, d = draft_of({"package.json": json.dumps({"dependencies": {"express": "^4"}, "scripts": {"build": "tsc", "start": "node dist/a.js"}}),
+                         "pnpm-lock.yaml": "x\n"})
+        c = d["content"]
+        self.assertLess(c.index("pnpm run build"), c.index("ENV NODE_ENV=production"))
+
+    def test_next_health_path_from_file_routes(self):
+        pkg = json.dumps({"private": True, "dependencies": {"next": "^15"}, "scripts": {"build": "next build", "start": "next start"}})
+        app_router = analyze_files(files(**{"package.json": pkg, "src/app/page.tsx": "export default function P() {}\n"}))
+        self.assertEqual(app_router.health_check_path, "/")
+        pages_router = analyze_files(files(**{"package.json": pkg, "pages/index.js": "export default () => null\n"}))
+        self.assertEqual(pages_router.health_check_path, "/")
+        with_api = analyze_files(files(**{"package.json": pkg, "app/page.tsx": "x\n", "app/api/health/route.ts": "export function GET() {}\n"}))
+        self.assertEqual(with_api.health_check_path, "/api/health", "헬스체크 전용 경로가 있으면 그것")
+
     def test_no_draft_when_entry_is_ambiguous_or_dockerfile_exists(self):
         # 앱 팩토리라 앱 객체를 확정할 수 없음 → 추측하지 않음
         result, d = draft_of({"requirements.txt": "flask\n", "app.py": "from flask import Flask\ndef create_app():\n    return Flask(__name__)\n"})
