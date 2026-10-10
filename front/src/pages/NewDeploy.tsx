@@ -17,7 +17,6 @@ import type {
   DeployStatus,
   DomainChoice,
   DomainPlan,
-  DomainQuote,
   Recommendation,
   ScaleInput,
   Source,
@@ -33,7 +32,7 @@ const DEPLOY = 4
 
 const STEPS = [
   { label: '앱 제출', title: '앱 제출', desc: '코드와 대략적인 사용 규모, 월 예산을 받습니다.' },
-  { label: '도메인', title: '도메인', desc: '앱에 연결할 독립 도메인을 고릅니다. 나중에 정하면 미리보기 주소로 먼저 배포합니다.' },
+  { label: '도메인', title: '도메인', desc: '앱에 접속할 주소를 고릅니다. 자동 주소를 고르면 설정 없이 바로 https 주소가 생깁니다.' },
   { label: '분석과 추천', title: '분석과 추천 구성', desc: '코드에서 찾은 내용과 구성별 비용을 비교합니다.' },
   {
     label: '비용 승인',
@@ -43,7 +42,7 @@ const STEPS = [
   { label: '진행 상태', title: '진행 상태', desc: '빌드·배포·헬스체크와 도메인 연결(DNS, 인증서) 진행 상황입니다.' },
 ]
 
-const DEFAULT_DOMAIN: DomainChoice = { mode: 'later', name: '' }
+const DEFAULT_DOMAIN: DomainChoice = { mode: 'auto', name: '' }
 
 const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '', monthlyBudgetUsd: 30 }
 
@@ -81,11 +80,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const [inflight, setInflight] = useState<Set<string>>(new Set())
   const [confirmed, setConfirmed] = useState(false)
   const [domainChoice, setDomainChoiceState] = useState<DomainChoice>(DEFAULT_DOMAIN)
-  const [domainQuote, setDomainQuote] = useState<DomainQuote | null>(null)
   // 서버가 확정한 도메인 계획. 분석(프로젝트 생성) 뒤에 저장
   const [domainPlan, setDomainPlan] = useState<DomainPlan | null>(null)
   const [domainNotice, setDomainNotice] = useState<string | null>(null)
-  const [purchaseConfirmed, setPurchaseConfirmed] = useState(false)
   const [approved, setApproved] = useState(false)
   const [deploy, setDeploy] = useState<DeployStatus | null>(null)
   // 올릴 때마다 상태 확인을 새로 시작 (새 배포, 다시 조회)
@@ -108,7 +105,6 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setConfirmed(false)
     setDomainPlan(null)
     setDomainNotice(null)
-    setPurchaseConfirmed(false)
   }
   const setSource = (s: Source | null) => {
     setSourceState(s)
@@ -123,7 +119,6 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setDomainChoiceState(c)
     setDomainPlan(null)
     setDomainNotice(null)
-    setPurchaseConfirmed(false)
   }
 
   const prefetch = (projectId: string, c: Choice) => {
@@ -276,14 +271,14 @@ export default function NewDeploy({ onShowHistory }: Props) {
     }
   }
 
-  // 도메인 계획 저장. 서버에 도메인 기능이 없으면(501) "나중에"로 진행하고 이유를 보여 줌
+  // 도메인 계획 저장. 서버에 도메인 기능이 없으면(501) 미리보기 주소로 진행하고 이유를 보여 줌
   const saveDomain = async (projectId: string) => {
     try {
       setDomainPlan(await api.saveDomain(projectId, domainChoice))
       setDomainNotice(null)
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 501)) throw e
-      setDomainPlan({ mode: 'later', name: null, oneTimeUsd: 0, monthlyUsd: 0, records: [] })
+      setDomainPlan({ mode: 'none', name: null, monthlyUsd: 0, records: [] })
       setDomainNotice(e.message)
     }
   }
@@ -314,8 +309,6 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const approve = () =>
     run('approve', async () => {
       if (!analysis || !choice) return
-      // 도메인 구매는 사용자가 본 금액으로 먼저 확정 (환불 불가라 앱 승인과 따로 동의받음)
-      if (domainPlan?.mode === 'buy') await api.confirmDomainPurchase(analysis.projectId, domainPlan)
       await api.approve(analysis.projectId, choice)
       setApproved(true)
       setDeploy(null)
@@ -342,7 +335,6 @@ export default function NewDeploy({ onShowHistory }: Props) {
     setStep(SOURCE)
     setSourceState(null)
     setDomainChoiceState(DEFAULT_DOMAIN)
-    setDomainQuote(null)
     setScaleState(DEFAULT_SCALE)
     resetResults()
     setApproved(false)
@@ -351,9 +343,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
   }
 
   const domainLabel =
-    domainChoice.mode === 'later'
-      ? '나중에 (미리보기)'
-      : `${domainChoice.name || '이름 미입력'} (${domainChoice.mode === 'buy' ? '구매' : '보유'})`
+    domainChoice.mode === 'auto' ? '자동 주소' : `${domainChoice.name || '이름 미입력'} (보유)`
 
   const railItems: RailItem[] = STEPS.map((s, i) => {
     let sub: string | undefined
@@ -387,7 +377,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
     next = {
       label: busy === 'analyze' ? '분석하고 계획 준비 중…' : analysis && domainPlan ? '다음' : '분석 시작',
       onClick: analyze,
-      disabled: !domainReady(domainChoice, domainQuote),
+      disabled: !domainReady(domainChoice),
     }
   if (step === DOMAIN && locked) next = { label: '다음', onClick: () => setStep(ANALYSIS) }
   if (step === ANALYSIS && !locked) {
@@ -405,9 +395,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
   if (step === REVIEW && !locked)
     next = {
       label:
-        busy === 'approve' ? '승인 처리 중…' : domainPlan?.mode === 'buy' ? '도메인 구매하고 배포' : '승인하고 배포',
+        busy === 'approve' ? '승인 처리 중…' : '승인하고 배포',
       onClick: approve,
-      disabled: !confirmed || (domainPlan?.mode === 'buy' && !purchaseConfirmed),
+      disabled: !confirmed,
     }
   if (step === REVIEW && locked) next = { label: '진행 상태로', onClick: () => setStep(DEPLOY) }
 
@@ -423,10 +413,9 @@ export default function NewDeploy({ onShowHistory }: Props) {
               <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
             </small>
             <small className="muted">월 예산 {usd(scale.monthlyBudgetUsd)} 안</small>
-            {domainPlan && domainPlan.mode !== 'later' && (
+            {domainPlan && domainPlan.mode !== 'none' && (
               <small>
-                도메인 {domainPlan.name}
-                {domainPlan.oneTimeUsd > 0 && ` · 1회 ${usd(domainPlan.oneTimeUsd)}`}
+                주소 {domainPlan.name}
                 {domainPlan.monthlyUsd > 0 && ` · 매달 +${usd(domainPlan.monthlyUsd)}`}
               </small>
             )}
@@ -469,10 +458,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
           {step === DOMAIN && (
             <DomainStep
               choice={domainChoice}
-              quote={domainQuote}
               locked={locked || busy === 'analyze'}
               onChange={setDomainChoice}
-              onQuote={setDomainQuote}
             />
           )}
           {step === ANALYSIS && analysis && rec && (
@@ -495,17 +482,15 @@ export default function NewDeploy({ onShowHistory }: Props) {
               target={option}
               domain={domainPlan}
               confirmed={confirmed}
-              purchaseConfirmed={purchaseConfirmed}
               locked={locked}
               onConfirm={setConfirmed}
-              onPurchaseConfirm={setPurchaseConfirmed}
             />
           )}
           {step === DEPLOY && (
             <DeployStep
               status={deploy}
               targetName={option?.name ?? ''}
-              domainMode={domainPlan?.mode ?? 'later'}
+              domainMode={domainPlan?.mode ?? 'none'}
               fixing={busy === 'fix'}
               pollIssue={pollIssue}
               repolling={busy === 'approve'}

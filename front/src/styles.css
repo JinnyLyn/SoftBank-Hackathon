@@ -831,18 +831,12 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 }
 
 /* ---------- domain ---------- */
-.domain-modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.domain-modes { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; max-width: 760px; }
 .domain-modes .kind { padding: 12px 14px; gap: 4px; }
 .domain-modes .kind strong { font-size: 14px; }
 @media (max-width: 720px) { .domain-modes { grid-template-columns: 1fr; } }
 .domain-input { display: flex; gap: 8px; max-width: 520px; }
 .domain-input .input { flex: 1; min-width: 0; }
-.domain-quote { display: flex; flex-direction: column; gap: 2px; border-radius: 8px; padding: 10px 14px; font-size: 13px; max-width: 640px; }
-.domain-quote.is-ok { background: #eef6f0; border: 1px solid #b9dcc6; }
-.domain-quote.is-ok strong { color: var(--ok); }
-.domain-quote.is-no { background: var(--fail-soft); border: 1px solid #ecc9c3; }
-.domain-quote.is-no strong { color: var(--fail); }
-.domain-suggest { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 4px; }
 
 .cost-breakdown { max-width: 560px; }
 .cost-breakdown td:not(:first-child), .cost-breakdown th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }

@@ -1,15 +1,15 @@
 import { useState } from 'react'
-import type { DnsRecord, DomainStatus } from '../types'
+import type { DnsRecord, DomainMode, DomainPlan, DomainStatus } from '../types'
 
-// 단계 순서. own은 등록이 없고 buy는 DNS 확인을 자동으로 함
-const ORDER: Record<'own' | 'buy', { state: DomainStatus['state']; label: string }[]> = {
+// 단계 순서. auto는 플랫폼이 DNS를 직접 넣으므로 사용자가 할 일이 없음
+const ORDER: Record<DomainMode, { state: DomainStatus['state']; label: string }[]> = {
+  auto: [
+    { state: 'waiting_dns', label: '주소 연결 중' },
+    { state: 'issuing_cert', label: 'HTTPS 준비 중' },
+    { state: 'active', label: '연결 완료' },
+  ],
   own: [
     { state: 'waiting_dns', label: 'DNS 확인 중' },
-    { state: 'issuing_cert', label: '인증서 발급 중' },
-    { state: 'active', label: '도메인 연결 완료' },
-  ],
-  buy: [
-    { state: 'registering', label: '도메인 등록 중' },
     { state: 'issuing_cert', label: '인증서 발급 중' },
     { state: 'active', label: '도메인 연결 완료' },
   ],
@@ -17,12 +17,12 @@ const ORDER: Record<'own' | 'buy', { state: DomainStatus['state']; label: string
 
 interface Props {
   status: DomainStatus
-  /** 사용자가 고른 방식. 서버 상태만으로는 own/buy를 알 수 없어서 받음 */
-  mode: 'own' | 'buy' | 'later'
+  /** 사용자가 고른 방식. 서버 상태만으로는 auto/own을 알 수 없어서 받음 */
+  mode: DomainPlan['mode']
 }
 
 export default function DomainProgress({ status, mode }: Props) {
-  if (mode === 'later' || status.state === 'skipped') {
+  if (mode === 'none' || status.state === 'skipped') {
     return (
       <div className="domain-progress">
         <div className="domain-head">
@@ -40,7 +40,7 @@ export default function DomainProgress({ status, mode }: Props) {
   return (
     <div className="domain-progress">
       <div className="domain-head">
-        <strong>도메인 {status.name}</strong>
+        <strong>{mode === 'auto' ? '주소' : '도메인'} {status.name}</strong>
         {status.state === 'active' && status.url ? (
           <a href={status.url} target="_blank" rel="noreferrer" className="mono">
             {status.url}

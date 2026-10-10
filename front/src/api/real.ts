@@ -10,7 +10,6 @@ import type {
   DnsRecord,
   DomainChoice,
   DomainPlan,
-  DomainQuote,
   DomainStatus,
   Finding,
   Recommendation,
@@ -403,16 +402,16 @@ export function saveConnection(input: ConnectionInput): Promise<Connection> {
 }
 
 // ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------
-// 서버에 아직 없으면 404/405가 오므로 501(미지원)로 바꿔 던짐 → 화면은 "나중에 연결"로 진행
+// 서버에 아직 없으면 404/405가 오므로 501(미지원)로 바꿔 던짐 → 화면은 미리보기 주소로 진행
 
-const DOMAIN_STATES = ['skipped', 'registering', 'waiting_dns', 'issuing_cert', 'active', 'failed']
+const DOMAIN_STATES = ['skipped', 'waiting_dns', 'issuing_cert', 'active', 'failed']
 
 async function domainReq<T>(path: string, init?: RequestInit & { timeoutMs?: number }): Promise<T> {
   try {
     return await req<T>(path, init)
   } catch (e) {
     if (e instanceof ApiError && (e.status === 404 || e.status === 405))
-      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소)로 배포합니다. 독립 도메인은 연결되지 않습니다.')
+      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소)로 배포합니다. 도메인은 연결되지 않습니다.')
     throw e
   }
 }
@@ -425,41 +424,22 @@ const toRecords = (v: unknown): DnsRecord[] =>
     purpose: str(r.purpose),
   }))
 
-/** GET /api/domains/check?name= → { name, available, price_usd_per_year, reason?, suggestions? } */
-export async function checkDomain(name: string): Promise<DomainQuote> {
-  const r = await domainReq<Record<string, unknown>>(`/domains/check?${new URLSearchParams({ name })}`)
-  const price = r.price_usd_per_year
-  return {
-    name: str(r.name) || name,
-    available: r.available === true,
-    priceUsdPerYear: typeof price === 'number' || typeof price === 'string' ? Number(price) : null,
-    reason: r.reason ? str(r.reason) : undefined,
-    suggestions: Array.isArray(r.suggestions) ? r.suggestions.map(str) : undefined,
-  }
-}
-
-/** PUT /api/projects/{id}/domain { mode, name } → { mode, name, one_time_usd, monthly_usd, records, note } */
+/**
+ * PUT /api/projects/{id}/domain { mode: auto|own, name } → { mode, name, monthly_usd, records, note }
+ * auto 는 name 을 보내지 않고, 서버가 정한 자동 주소를 name 으로 돌려받음
+ */
 export async function saveDomain(projectId: string, choice: DomainChoice): Promise<DomainPlan> {
   const r = await domainReq<Record<string, unknown>>(
     `/projects/${projectId}/domain`,
-    send('PUT', { mode: choice.mode, name: choice.mode === 'later' ? null : choice.name }),
+    send('PUT', { mode: choice.mode, name: choice.mode === 'own' ? choice.name : null }),
   )
   return {
     mode: (str(r.mode) || choice.mode) as DomainPlan['mode'],
     name: r.name ? str(r.name) : null,
-    oneTimeUsd: Number(r.one_time_usd ?? 0),
     monthlyUsd: Number(r.monthly_usd ?? 0),
     records: toRecords(r.records),
     note: r.note ? str(r.note) : undefined,
   }
-}
-
-/**
- * POST /api/projects/{id}/domain/approve { name, one_time_usd }
- * 도메인 구매는 취소·환불되지 않으므로 사용자가 본 금액을 그대로 보내 서버가 다시 확인하게 함
- */
-export async function confirmDomainPurchase(projectId: string, plan: DomainPlan): Promise<void> {
-  await domainReq(`/projects/${projectId}/domain/approve`, send('POST', { name: plan.name, one_time_usd: plan.oneTimeUsd }))
 }
 
 function toDomainStatus(v: unknown): DomainStatus | undefined {

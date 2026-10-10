@@ -1,7 +1,7 @@
 import CodeView from '../components/CodeView'
 import DomainProgress from '../components/DomainProgress'
 import { IS_MOCK } from '../api'
-import type { DeployStatus, DomainMode } from '../types'
+import type { DeployStatus, DomainPlan } from '../types'
 
 /** 배포 상태를 확인하지 못한 경우. 배포 실패와는 다름 */
 export interface PollIssue {
@@ -12,8 +12,8 @@ export interface PollIssue {
 interface Props {
   status: DeployStatus | null
   targetName: string
-  /** 사용자가 고른 도메인 방식 */
-  domainMode: DomainMode
+  /** 사용자가 고른 도메인 방식 (none: 서버에 도메인 기능이 없어 미리보기 주소만) */
+  domainMode: DomainPlan['mode']
   fixing: boolean
   pollIssue: PollIssue | null
   repolling: boolean
@@ -84,9 +84,9 @@ export default function DeployStep({
             {/* 독립 도메인이 연결되기 전 주소는 미리보기. 도메인 연결 성공으로 보이지 않게 (PRODUCT_DIRECTION §2) */}
             {status.url && status.domain?.state !== 'active' && (
               <span className="muted small">
-                {domainMode === 'later' || !status.domain || status.domain.state === 'skipped'
-                  ? '미리보기 주소입니다. 독립 도메인은 연결되지 않았습니다.'
-                  : '미리보기 주소입니다. 도메인 연결은 아래에서 진행 중입니다.'}
+                {domainMode === 'none' || !status.domain || status.domain.state === 'skipped'
+                  ? '미리보기 주소입니다. 도메인은 연결되지 않았습니다.'
+                  : '미리보기 주소입니다. 주소 연결은 아래에서 진행 중입니다.'}
               </span>
             )}
           </div>

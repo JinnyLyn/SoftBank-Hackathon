@@ -146,23 +146,13 @@ export interface TerraformBundle {
 
 // ---------- 도메인 ----------
 
-/** own: 이미 가진 도메인 연결, buy: 새로 구매, later: 나중에 (AWS 기본 주소 사용) */
-export type DomainMode = 'own' | 'buy' | 'later'
+/** auto: 플랫폼 도메인 아래 자동 주소(서버가 이름을 정함), own: 이미 가진 도메인 연결 */
+export type DomainMode = 'auto' | 'own'
 
 export interface DomainChoice {
   mode: DomainMode
-  /** later 일 때는 빈 문자열 */
+  /** own 일 때 연결할 도메인. auto 는 빈 문자열 */
   name: string
-}
-
-/** 구매 가능 여부와 가격 */
-export interface DomainQuote {
-  name: string
-  available: boolean
-  /** 1년 등록 가격. 구매를 지원하지 않는 확장자면 null */
-  priceUsdPerYear: number | null
-  reason?: string
-  suggestions?: string[]
 }
 
 export interface DnsRecord {
@@ -175,18 +165,18 @@ export interface DnsRecord {
 
 /** 서버가 확정한 도메인 계획. 비용 승인 화면에 앱 비용과 함께 보여 줌 */
 export interface DomainPlan {
-  mode: DomainMode
+  /** none: 서버에 도메인 기능이 없어 미리보기 주소(AWS 기본 주소)로만 배포 */
+  mode: DomainMode | 'none'
+  /** auto 는 서버가 정한 주소, own 은 사용자가 넣은 도메인 */
   name: string | null
-  /** 1회 비용 (구매 1년치). 구매는 취소·환불되지 않음 */
-  oneTimeUsd: number
-  /** 매달 붙는 비용 (DNS 호스팅 등) */
+  /** 매달 붙는 비용 (DNS 호스팅 등). 없으면 0 */
   monthlyUsd: number
   /** 이미 가진 도메인일 때 사용자가 도메인 업체에 넣을 레코드. 값은 배포 뒤 확정될 수 있음 */
   records: DnsRecord[]
   note?: string
 }
 
-export type DomainState = 'skipped' | 'registering' | 'waiting_dns' | 'issuing_cert' | 'active' | 'failed'
+export type DomainState = 'skipped' | 'waiting_dns' | 'issuing_cert' | 'active' | 'failed'
 
 export interface DomainStatus {
   state: DomainState

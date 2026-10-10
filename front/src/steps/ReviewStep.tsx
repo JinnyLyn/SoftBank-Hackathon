@@ -9,14 +9,11 @@ interface Props {
   bundle: TerraformBundle
   tier: Tier
   target: { name: string; provider: Provider }
-  /** 도메인 계획. null이면 도메인 없이 (나중에) */
+  /** 도메인 계획. null 이거나 mode none 이면 미리보기 주소 */
   domain: DomainPlan | null
   confirmed: boolean
-  /** 도메인 구매(환불 불가)를 따로 확인했는지 */
-  purchaseConfirmed: boolean
   locked: boolean
   onConfirm: (v: boolean) => void
-  onPurchaseConfirm: (v: boolean) => void
 }
 
 export default function ReviewStep({
@@ -25,10 +22,8 @@ export default function ReviewStep({
   target,
   domain,
   confirmed,
-  purchaseConfirmed,
   locked,
   onConfirm,
-  onPurchaseConfirm,
 }: Props) {
   const [tab, setTab] = useState('plan')
   const file = bundle.files.find((f) => f.name === tab)
@@ -103,7 +98,6 @@ export default function ReviewStep({
           <tr>
             <th>항목</th>
             <th>내용</th>
-            <th className="num">1회</th>
             <th className="num">매달</th>
           </tr>
         </thead>
@@ -111,24 +105,17 @@ export default function ReviewStep({
           <tr>
             <td>앱 ({tier.label})</td>
             <td className="muted">{target.name}</td>
-            <td className="num">-</td>
             <td className="num">{costText(cost)}</td>
           </tr>
-          {domain && domain.mode !== 'later' && (
-            <tr>
-              <td>도메인</td>
-              <td className="muted mono">
-                {domain.name} {domain.mode === 'buy' ? '(새로 구매, 1년)' : '(가지고 있는 도메인 연결)'}
-              </td>
-              <td className="num">{domain.oneTimeUsd > 0 ? usd(domain.oneTimeUsd) : '-'}</td>
-              <td className="num">{domain.monthlyUsd > 0 ? usd(domain.monthlyUsd) : '-'}</td>
-            </tr>
-          )}
+          <tr>
+            <td>주소</td>
+            <td className="muted mono">{domainDetail(domain)}</td>
+            <td className="num">{domain && domain.monthlyUsd > 0 ? usd(domain.monthlyUsd) : '-'}</td>
+          </tr>
         </tbody>
         <tfoot>
           <tr>
             <td colSpan={2}>합계</td>
-            <td className="num">{domain && domain.oneTimeUsd > 0 ? usd(domain.oneTimeUsd) : '-'}</td>
             <td className="num">{usd(cost + (domain?.monthlyUsd ?? 0))}</td>
           </tr>
         </tfoot>
@@ -200,25 +187,16 @@ export default function ReviewStep({
         </span>
       </label>
 
-      {domain?.mode === 'buy' && (
-        <label className={'confirm' + (purchaseConfirmed ? ' is-on' : '')}>
-          <input
-            type="checkbox"
-            checked={purchaseConfirmed}
-            disabled={locked}
-            onChange={(e) => onPurchaseConfirm(e.target.checked)}
-          />
-          <span>
-            도메인 {domain.name}을(를) {usd(domain.oneTimeUsd)}(1년)에 구매하는 데 동의합니다.
-            <small>도메인 구매는 승인하는 즉시 진행되고 취소·환불되지 않습니다. 다음 해부터는 갱신 비용이 따로 듭니다.</small>
-          </span>
-        </label>
-      )}
     </div>
   )
 }
 
 function domainSummary(domain: DomainPlan | null) {
-  if (!domain || domain.mode === 'later') return '나중에 (미리보기)'
-  return domain.mode === 'buy' ? `구매 ${usd(domain.oneTimeUsd)}/년` : '보유 도메인'
+  if (!domain || domain.mode === 'none') return '미리보기 주소'
+  return domain.mode === 'auto' ? '자동 주소' : '보유 도메인'
+}
+
+function domainDetail(domain: DomainPlan | null) {
+  if (!domain || domain.mode === 'none') return 'AWS 기본 주소 (미리보기, 도메인 미연결)'
+  return `${domain.name ?? '배포 뒤 확정'} (${domain.mode === 'auto' ? '자동 주소' : '가지고 있는 도메인 연결'})`
 }

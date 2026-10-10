@@ -6,7 +6,6 @@ import type {
   DnsRecord,
   DomainChoice,
   DomainPlan,
-  DomainQuote,
   DomainStatus,
   DeployRecord,
   DeployStatus,
@@ -317,36 +316,17 @@ export async function status(_projectId: string): Promise<DeployStatus> {
     state: 'success',
     log: [...log, '{"status":"ok"}', 'health check passed'],
     url: appUrl,
-    domain: domainProgress(t - end, appUrl),
+    domain: domainProgress(t - end),
   }
 }
 
 // ---------- 도메인 (mock) ----------
-// 실제 구매·DNS·인증서는 백엔드·인프라 작업이 필요함. 여기서는 화면 흐름만 흉내
+// 실제 주소 발급·DNS·인증서는 백엔드·인프라 작업이 필요함. 여기서는 화면 흐름만 흉내.
+// 자동 주소의 도메인은 예시용 예약 도메인(.example)
 
-// Route 53 등록 가격을 흉내 낸 값 (USD/년). 실제 가격은 서버가 가격표로 계산해야 함
-const TLD_PRICE: Record<string, number> = { com: 15, net: 17, org: 15, dev: 17, app: 20, io: 71, xyz: 13 }
-const TAKEN = /(google|naver|amazon|kakao|test)\./
-let domainChoice: DomainChoice = { mode: 'later', name: '' }
-
-export async function checkDomain(name: string): Promise<DomainQuote> {
-  await wait(500)
-  const tld = name.split('.').pop() ?? ''
-  const price = TLD_PRICE[tld] ?? null
-  if (price === null)
-    return { name, available: false, priceUsdPerYear: null, reason: `.${tld} 도메인은 구매를 지원하지 않습니다. .com .net .org .dev .app .io .xyz 중에서 골라 주세요.` }
-  if (TAKEN.test(name)) {
-    const base = name.slice(0, -(tld.length + 1))
-    return {
-      name,
-      available: false,
-      priceUsdPerYear: price,
-      reason: '이미 등록된 도메인입니다.',
-      suggestions: [`get${base}.${tld}`, `${base}-app.${tld}`, `${base}.dev`],
-    }
-  }
-  return { name, available: true, priceUsdPerYear: price }
-}
+const WORDS = ['quiet', 'bright', 'swift', 'calm', 'lucky', 'river', 'otter', 'maple', 'cloud', 'pebble']
+let domainChoice: DomainChoice = { mode: 'auto', name: '' }
+let autoName = ''
 
 const appRecords = (name: string): DnsRecord[] => [
   { type: 'CNAME', name, value: '배포 뒤 확정 (예: paved-alb-1203.sa-east-1.elb.amazonaws.com)', purpose: '도메인을 앱 주소로 연결' },
@@ -356,34 +336,20 @@ const appRecords = (name: string): DnsRecord[] => [
 export async function saveDomain(_projectId: string, choice: DomainChoice): Promise<DomainPlan> {
   await wait(300)
   domainChoice = choice
-  if (choice.mode === 'later')
-    return { mode: 'later', name: null, oneTimeUsd: 0, monthlyUsd: 0, records: [], note: '독립 도메인 없이 미리보기 주소(AWS 기본 주소)로 접속합니다. 도메인 연결 완료가 아닙니다. 도메인은 나중에 연결할 수 있습니다.' }
-  if (choice.mode === 'own')
-    return { mode: 'own', name: choice.name, oneTimeUsd: 0, monthlyUsd: 0, records: appRecords(choice.name) }
-  const price = TLD_PRICE[choice.name.split('.').pop() ?? ''] ?? 0
-  return {
-    mode: 'buy',
-    name: choice.name,
-    oneTimeUsd: price,
-    // Route 53 호스팅 영역 1개
-    monthlyUsd: 0.5,
-    records: [],
-    note: '구매한 도메인의 DNS와 인증서는 자동으로 설정합니다.',
-  }
-}
-
-export async function confirmDomainPurchase(_projectId: string, _plan: DomainPlan): Promise<void> {
-  await wait(200)
+  if (choice.mode === 'own') return { mode: 'own', name: choice.name, monthlyUsd: 0, records: appRecords(choice.name) }
+  const pick = () => WORDS[Math.floor(Math.random() * WORDS.length)]
+  autoName = `${pick()}-${pick()}-${Math.random().toString(16).slice(2, 6)}.apps.paved.example`
+  return { mode: 'auto', name: autoName, monthlyUsd: 0, records: [], note: '자동 주소는 추가 비용이 없습니다. HTTPS 인증서는 플랫폼이 관리합니다.' }
 }
 
 /** 앱 배포가 끝난 뒤 지난 시간(ms)에 따라 도메인 단계를 흉내 */
-function domainProgress(since: number, appUrl: string): DomainStatus {
-  const { mode, name } = domainChoice
-  if (mode === 'later') return { state: 'skipped', name: null, message: '독립 도메인 없이 미리보기 주소(AWS 기본 주소)로 접속합니다. 도메인 연결 완료가 아닙니다.', url: appUrl }
-  if (mode === 'buy' && since < 3000) return { state: 'registering', name, message: '도메인을 등록하고 있습니다. 보통 몇 분 걸립니다.' }
-  if (mode === 'own' && since < 4000)
-    return { state: 'waiting_dns', name, message: '도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.', records: appRecords(name) }
-  if (since < 7000) return { state: 'issuing_cert', name, message: 'HTTPS 인증서를 발급하고 있습니다.' }
+function domainProgress(since: number): DomainStatus {
+  const name = domainChoice.mode === 'auto' ? autoName : domainChoice.name
+  if (since < 3000)
+    return domainChoice.mode === 'auto'
+      ? { state: 'waiting_dns', name, message: '주소를 앱에 연결하고 있습니다.' }
+      : { state: 'waiting_dns', name, message: '도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.', records: appRecords(name) }
+  if (since < 5000) return { state: 'issuing_cert', name, message: 'HTTPS를 준비하고 있습니다.' }
   return { state: 'active', name, url: `https://${name}` }
 }
 
