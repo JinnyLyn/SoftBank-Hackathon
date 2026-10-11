@@ -23,7 +23,9 @@ function loadTs(relativePath, imports = {}) {
   return module.exports;
 }
 
-const format = loadTs('../../front/src/format.ts');
+// 화면 언어 모듈(기본 한국어). real.ts·format.ts 등이 t()로 문장을 만든다
+const i18n = loadTs('../../front/src/i18n/core.ts');
+const format = loadTs('../../front/src/format.ts', { './i18n/core': i18n });
 const scale = { expectedUsers: '100', pattern: 'steady', monthlyBudgetUsd: 100, purpose: '시험' };
 
 async function checkBundle(target, initCommand) {
@@ -60,7 +62,7 @@ async function checkBundle(target, initCommand) {
   };
   const api = loadTs('../../front/src/api/real.ts', {
     './http': { req, ApiError: class extends Error {} },
-    '../format': format,
+    '../format': format, '../i18n/core': i18n,
     '../providers': { isEnabled: (provider) => provider === (local ? 'onprem' : 'aws') },
   });
   const choice = { connectionId: local ? 'local-docker' : 'aws', tier: 'balanced' };
@@ -114,7 +116,7 @@ async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
   };
   const api = loadTs('../../front/src/api/real.ts', {
     './http': { req, ApiError: class extends Error {} },
-    '../format': format,
+    '../format': format, '../i18n/core': i18n,
     '../providers': { isEnabled: () => true },
   });
   const rec = await api.recommend('project-1', { ...scale, monthlyBudgetUsd });
@@ -156,7 +158,7 @@ await checkMixedRecommendation(100, 'local-docker');
     ApiError: class extends Error { constructor(status, message) { super(message); this.status = status; } },
   };
   const api = loadTs('../../front/src/api/real.ts', {
-    './http': http, '../format': format, '../providers': { isEnabled: (provider) => provider === 'aws' },
+    './http': http, '../format': format, '../i18n/core': i18n, '../providers': { isEnabled: (provider) => provider === 'aws' },
   });
   failures = [{ target: 'aws', reason, retryable: false, attempts: 1, updated_at: '2026-10-11T00:00:00Z' }];
   await assert.rejects(api.recommend('p-budget', scale), (e) => e.status === 422 && e.message.includes(reason));
@@ -182,7 +184,7 @@ await checkMixedRecommendation(100, 'local-docker');
     return { project_id: 'p-budget', target: 'aws', tier: 'roomy' };
   };
   const api2 = loadTs('../../front/src/api/real.ts', {
-    './http': { ...http, send: (method, body) => ({ method, body: JSON.stringify(body) }) }, '../format': format,
+    './http': { ...http, send: (method, body) => ({ method, body: JSON.stringify(body) }) }, '../format': format, '../i18n/core': i18n,
     '../providers': { isEnabled: (provider) => provider === 'aws' },
   });
   await api2.requestTier('p-budget', 'roomy');
@@ -203,9 +205,9 @@ const localPlan = () => ({
 function localAdapter(handler) {
   const http = { req: handler, send: (method, body) => ({ method, body: JSON.stringify(body) }), ApiError: class extends Error { constructor(status, message) { super(message); this.status = status; } } };
   const real = loadTs('../../front/src/api/real.ts', {
-    './http': http, '../format': format, '../providers': { isEnabled: (provider) => provider === 'aws' },
+    './http': http, '../format': format, '../i18n/core': i18n, '../providers': { isEnabled: (provider) => provider === 'aws' },
   });
-  return { local: loadTs('../../front/src/onprem/api.ts', { '../api/http': http, '../api/real': real }), real };
+  return { local: loadTs('../../front/src/onprem/api.ts', { '../api/http': http, '../api/real': real, '../i18n/core': i18n }), real };
 }
 {
   const calls = [];

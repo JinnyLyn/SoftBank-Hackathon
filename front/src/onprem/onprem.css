@@ -46,3 +46,6 @@
   .onprem-header > div { padding: 14px 16px; gap: 12px; flex-wrap: wrap; }
   .onprem .onprem-identity > div { grid-template-columns: 1fr; gap: 2px; }
 }
+/* 언어 스위치: 헤더 오른쪽 끝. .onprem button 의 위 여백을 받지 않게 */
+.onprem-header .onprem-lang { margin-left: auto; }
+.onprem .onprem-lang button { margin-top: 0; }

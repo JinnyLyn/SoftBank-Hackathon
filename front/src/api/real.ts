@@ -21,6 +21,7 @@ import type {
 import { ApiError, req, reqOrNull, send } from './http'
 import { sourceName, TIER_META, usd } from '../format'
 import { isEnabled } from '../providers'
+import { t } from '../i18n/core'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -36,7 +37,11 @@ async function poll<T>(
     if (Date.now() > until)
       throw new ApiError(
         408,
-        `${Math.round(opts.timeoutMs / 60000)}분 동안 기다렸지만 ${opts.what}이(가) 오지 않았습니다. ${opts.hint ?? '잠시 뒤 다시 시도해 주세요.'}`,
+        t('{n}분 동안 기다렸지만 {what}이(가) 오지 않았습니다. {hint}', {
+          n: Math.round(opts.timeoutMs / 60000),
+          what: opts.what,
+          hint: opts.hint ?? t('잠시 뒤 다시 시도해 주세요.'),
+        }),
       )
     await wait(opts.intervalMs)
   }
@@ -150,13 +155,13 @@ function blockersOf(r: Record<string, unknown>, hasDraft: boolean): string[] {
   const out: string[] = []
   if (r.supported === false) {
     const reasons = Array.isArray(r.unsupported_reasons) ? r.unsupported_reasons.map(str).filter(Boolean) : []
-    out.push(...(reasons.length ? reasons : ['지원하지 않는 형태의 앱입니다.']))
+    out.push(...(reasons.length ? reasons : [t('지원하지 않는 형태의 앱입니다.')]))
   }
   const unresolved = isObj(r.unresolved) ? r.unresolved : {}
   for (const [key, label] of Object.entries(REQUIRED_FOR_PLAN)) {
     // Dockerfile 초안이 있으면 Dockerfile·포트는 초안을 넣으면 해결됨(포트는 초안의 EXPOSE) → 오류가 아니라 남은 단계로 안내
     if (hasDraft && (key === 'dockerfile' || key === 'container_port')) continue
-    if (key in unresolved) out.push(`${label}: ${str(unresolved[key]) || '코드에서 찾지 못했습니다.'}`)
+    if (key in unresolved) out.push(`${t(label)}: ${str(unresolved[key]) || t('코드에서 찾지 못했습니다.')}`)
   }
   return out
 }
@@ -173,8 +178,8 @@ export async function analyze(source: Source, scale: ScaleInput, onUploaded?: ()
   const out = await poll(() => reqOrNull<AnalysisOut>(`/projects/${project.id}/analyses/latest`), {
     intervalMs: 2000,
     timeoutMs: 5 * 60 * 1000,
-    what: '분석 결과',
-    hint: '분석 프로그램(ai/runner.py)이 실행 중인지 확인해 주세요.',
+    what: t('분석 결과'),
+    hint: t('분석 프로그램(ai/runner.py)이 실행 중인지 확인해 주세요.'),
   })
   return toAnalysis(out)
 }
@@ -221,7 +226,7 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
     const peak = Number(o.peak_monthly)
     const usual = Number(o.total_monthly)
     const extra = {
-      rankLabel: RANK_LABEL[str(o.rank)],
+      rankLabel: RANK_LABEL[str(o.rank)] && t(RANK_LABEL[str(o.rank)]),
       usualUsd: Number.isFinite(usual) ? usual : undefined,
       suggested: o.recommended === true,
     }
@@ -230,7 +235,7 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
       out.push({ key, tier: { ...toTier(p, key), ...extra, planned: true } })
       continue
     }
-    const sizing = `${str(o.task_size)} 태스크 ${o.min_tasks}~${o.max_tasks}개`
+    const sizing = t('{size} 태스크 {min}~{max}개', { size: str(o.task_size), min: str(o.min_tasks), max: str(o.max_tasks) })
     out.push({
       key,
       tier: {
@@ -239,7 +244,7 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
         label: str(o.label) || TIER_META[key].label,
         headline: str(o.headline) || sizing,
         tradeoff: str(o.tradeoff),
-        resources: [{ service: 'ECS Fargate', spec: sizing, monthlyUsd: Number.isFinite(peak) ? peak : 0, why: '비교용 예상치 (이 안의 배포 계획은 아직 없음)' }],
+        resources: [{ service: 'ECS Fargate', spec: sizing, monthlyUsd: Number.isFinite(peak) ? peak : 0, why: t('비교용 예상치 (이 안의 배포 계획은 아직 없음)') }],
         totalUsd: Number.isFinite(peak) ? peak : undefined,
         ...extra,
         planned: false,
@@ -296,7 +301,7 @@ function toTier(p: PlanOut, key: TierKey): Tier {
 /** 소스에 Dockerfile이 없어 worker가 초안으로 빌드하는 계획이면, 초안을 코드 검토 탭 맨 앞에 보여 줌 (승인 대상) */
 function draftFile(p: PlanOut): { name: string; content: string }[] {
   const d = p.variables.dockerfile_draft
-  return isObj(d) && typeof d.content === 'string' && d.content ? [{ name: 'Dockerfile (초안)', content: d.content }] : []
+  return isObj(d) && typeof d.content === 'string' && d.content ? [{ name: t('Dockerfile (초안)'), content: d.content }] : []
 }
 
 /** 계획 금액에 넣지 않은 비용과 공용 기반 몫 (variables.cost). 없거나 형식이 다르면 비움 */
@@ -324,7 +329,7 @@ export function toComposeBundle(p: PlanOut): TerraformBundle {
       add: containers,
       change: containers === null ? null : 0,
       destroy: containers === null ? null : 0,
-      text: [`# module: ${p.module_id}`, `# compose sha256: ${p.terraform_plan_sha256 ?? '(아직 없음)'}`, '', p.summary].join('\n'),
+      text: [`# module: ${p.module_id}`, `# compose sha256: ${p.terraform_plan_sha256 ?? t('(아직 없음)')}`, '', p.summary].join('\n'),
     },
     planInfo: {
       planId: p.id,
@@ -353,7 +358,7 @@ function toBundle(p: PlanOut): TerraformBundle {
       destroy: null,
       text: [
         `# module: ${p.module_id}`,
-        `# terraform plan sha256: ${p.terraform_plan_sha256 ?? '(아직 없음)'}`,
+        `# terraform plan sha256: ${p.terraform_plan_sha256 ?? t('(아직 없음)')}`,
         '',
         p.summary,
       ].join('\n'),
@@ -418,14 +423,17 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
     if (settled && waiting.length) return waiting
     if (settled && (awsFailed || localFailed)) {
       const reasons = final.filter((f) => (f.target === 'aws' ? awsFailed : localFailed)).map((f) => f.reason)
-      throw new ApiError(422, `배포 계획을 만들지 못했습니다. ${reasons.join(' / ')} 처음 화면에서 사용 규모·월 예산을 바꿔 다시 시작해 주세요.`)
+      throw new ApiError(
+        422,
+        t('배포 계획을 만들지 못했습니다. {reasons} 처음 화면에서 사용 규모·월 예산을 바꿔 다시 시작해 주세요.', { reasons: reasons.join(' / ') }),
+      )
     }
     if (Date.now() > until)
       throw new ApiError(
         408,
-        `${Math.round(timeoutMs / 60000)}분 동안 기다렸지만 배포 계획이 오지 않았습니다. ` +
-          '월 예산이 가장 작은 구성의 비용보다 낮으면 인프라 worker가 계획을 만들지 않습니다(서버에 실패 이유를 알리는 기능은 아직 없음). ' +
-          '예산을 올려 처음부터 다시 시작하거나, 인프라 worker(infra/worker)가 실행 중인지 확인해 주세요.',
+        t('{n}분 동안 기다렸지만 배포 계획이 오지 않았습니다. ', { n: Math.round(timeoutMs / 60000) }) +
+          t('월 예산이 가장 작은 구성의 비용보다 낮으면 인프라 worker가 계획을 만들지 않습니다(서버에 실패 이유를 알리는 기능은 아직 없음). ') +
+          t('예산을 올려 처음부터 다시 시작하거나, 인프라 worker(infra/worker)가 실행 중인지 확인해 주세요.'),
       )
     await wait(2000)
   }
@@ -438,11 +446,11 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
  */
 export async function recommend(projectId: string, scale: ScaleInput): Promise<Recommendation> {
   const plans = await waitForPlans(projectId, { aws: isEnabled('aws'), local: isEnabled('onprem') })
-  const localName = str(plans.find(isLocal)?.variables.connection_name) || '이 PC (로컬 Docker)'
+  const localName = str(plans.find(isLocal)?.variables.connection_name) || t('이 PC (로컬 Docker)')
 
   // 대상마다 한 칸씩. AWS는 연결이 없으면 worker가 쓰는 운영자 AWS (관리형 배포), 온프레미스는 worker가 도는 PC의 로컬 Docker
   const groups: { connectionId: string; provider: Provider; name: string; plans: PlanOut[] }[] = [
-    { connectionId: 'aws', provider: 'aws', name: '관리형 AWS', plans: plans.filter((p) => !isLocal(p)) },
+    { connectionId: 'aws', provider: 'aws', name: t('관리형 AWS'), plans: plans.filter((p) => !isLocal(p)) },
     { connectionId: LOCAL_CONNECTION_ID, provider: 'onprem', name: localName, plans: plans.filter(isLocal) },
   ]
 
@@ -502,25 +510,30 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
   const awsPlan = plans.find((p) => !isLocal(p) && p.cost_estimate)
   const pricing = awsPlan?.cost_estimate?.pricing_as_of
   const scope = awsPlan ? costScope(awsPlan) : {}
-  const assumptions = [`월 사용자 ${scale.expectedUsers}명, 월 예산 ${usd(budget)}`]
+  const assumptions = [t('월 사용자 {users}명, 월 예산 {budget}', { users: scale.expectedUsers, budget: usd(budget) })]
   if (awsExists) {
-    assumptions.push(pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음')
+    assumptions.push(pricing ? t('가격 기준: {date}', { date: pricing }) : t('가격 기준일 정보 없음'))
     assumptions.push(
       scope.sharedMonthlyUsd !== undefined
-        ? `AWS 금액에는 공용 기반(ALB·DB 등) 몫 월 ${usd(scope.sharedMonthlyUsd)}가 들어 있음`
-        : '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인',
+        ? t('AWS 금액에는 공용 기반(ALB·DB 등) 몫 월 {usd}가 들어 있음', { usd: usd(scope.sharedMonthlyUsd) })
+        : t('공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인'),
     )
-    if (scope.excludedCosts) assumptions.push(`AWS 금액에 넣지 않은 비용: ${scope.excludedCosts.join(', ')}`)
+    if (scope.excludedCosts) assumptions.push(t('AWS 금액에 넣지 않은 비용: {items}', { items: scope.excludedCosts.join(', ') }))
   }
   if (cells.some((c) => isLocal(c.plan)))
-    assumptions.push('온프레미스(로컬 Docker)의 추가 비용 0에는 전기·회선·PC 사용 비용이 들어 있지 않고, 이 PC의 HTTP 주소로만 접속합니다(도메인·HTTPS 없음)')
+    assumptions.push(
+      t('온프레미스(로컬 Docker)의 추가 비용 0에는 전기·회선·PC 사용 비용이 들어 있지 않고, 이 PC의 HTTP 주소로만 접속합니다(도메인·HTTPS 없음)'),
+    )
   const fallback = pick && awsExists && !awsWithin.length
   return {
     recommended: pick ? pick.choice : null,
     reason: pick
-      ? (fallback ? `월 예산 ${usd(budget)} 안에 드는 AWS 계획이 없어 추가 비용이 없는 온프레미스를 추천합니다. ` : '') +
+      ? (fallback ? t('월 예산 {budget} 안에 드는 AWS 계획이 없어 추가 비용이 없는 온프레미스를 추천합니다. ', { budget: usd(budget) }) : '') +
         (str(pick.plan.variables.reason) || pick.plan.summary)
-      : `월 예산 ${usd(budget)} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 ${usd(cheapest)}입니다. 예산을 늘려 주세요.`,
+      : t('월 예산 {budget} 안에 맞는 배포 계획이 없습니다. 가장 싼 계획도 월 {cheapest}입니다. 예산을 늘려 주세요.', {
+          budget: usd(budget),
+          cheapest: usd(cheapest),
+        }),
     options,
     assumptions,
     bundles,
@@ -535,7 +548,7 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
 export async function generate(_projectId: string, choice: Choice): Promise<TerraformBundle> {
   const k = keyOf(choice)
   const p = plansByKey.get(k)
-  if (!p) throw new ApiError(404, '이 구성의 배포 계획이 없습니다. 분석부터 다시 시작해 주세요.')
+  if (!p) throw new ApiError(404, t('이 구성의 배포 계획이 없습니다. 분석부터 다시 시작해 주세요.'))
   const latest = await req<PlanOut>(`/plans/${p.id}`)
   plansByKey.set(k, latest)
   return toBundle(latest)
@@ -557,17 +570,17 @@ async function hasDeployment(projectId: string, planId: string) {
  */
 export async function approve(projectId: string, choice: Choice): Promise<void> {
   const reviewed = plansByKey.get(keyOf(choice))
-  if (!reviewed) throw new ApiError(404, '승인할 배포 계획을 찾지 못했습니다. 분석부터 다시 시작해 주세요.')
+  if (!reviewed) throw new ApiError(404, t('승인할 배포 계획을 찾지 못했습니다. 분석부터 다시 시작해 주세요.'))
 
   if (await hasDeployment(projectId, reviewed.id)) return
 
   let plan = await req<PlanOut>(`/plans/${reviewed.id}`)
   if (plan.fingerprint !== reviewed.fingerprint)
-    throw new ApiError(409, '검토한 뒤 계획 내용이 바뀌었습니다. 코드 검토 화면에서 다시 확인하고 승인해 주세요.')
+    throw new ApiError(409, t('검토한 뒤 계획 내용이 바뀌었습니다. 코드 검토 화면에서 다시 확인하고 승인해 주세요.'))
   if (plan.status === 'awaiting_approval')
     plan = await req<PlanOut>(`/plans/${plan.id}/approve`, send('POST', { expected_fingerprint: plan.fingerprint }))
   else if (plan.status !== 'approved')
-    throw new ApiError(409, `이 계획은 더 이상 승인할 수 없는 상태입니다(${plan.status}). 분석부터 다시 진행해 주세요.`)
+    throw new ApiError(409, t('이 계획은 더 이상 승인할 수 없는 상태입니다({status}). 분석부터 다시 진행해 주세요.', { status: plan.status }))
 
   try {
     await req('/deployments', send('POST', { plan_id: plan.id, expected_fingerprint: plan.fingerprint }))
@@ -580,7 +593,7 @@ export async function approve(projectId: string, choice: Choice): Promise<void> 
 
 /** 실패 진단의 수정안을 반영하는 API는 아직 백엔드에 없음 */
 export async function applyFix(_projectId: string, _choice: Choice): Promise<TerraformBundle> {
-  throw new ApiError(501, '수정안 반영 API가 아직 백엔드에 없습니다. 원인을 고친 뒤 분석부터 다시 진행해 주세요.')
+  throw new ApiError(501, t('수정안 반영 API가 아직 백엔드에 없습니다. 원인을 고친 뒤 분석부터 다시 진행해 주세요.'))
 }
 
 // ---------- 배포 상태, 이력 ----------
@@ -593,7 +606,7 @@ export async function status(projectId: string): Promise<DeployStatus> {
   const s = await reqOrNull<{ state: DeployStatus['state']; log: string[]; url: string | null; diagnosis?: unknown }>(
     `/projects/${projectId}/status`,
   )
-  if (!s) return { state: 'running', log: ['배포 대기열에 등록했습니다. worker가 가져가기를 기다리는 중입니다.'] }
+  if (!s) return { state: 'running', log: [t('배포 대기열에 등록했습니다. worker가 가져가기를 기다리는 중입니다.')] }
   const domain = toDomainStatus((s as { domain?: unknown }).domain)
   const d = s.diagnosis
   const diagnosis =
@@ -626,7 +639,7 @@ export async function requestTier(projectId: string, tier: TierKey): Promise<voi
     await req(`/projects/${projectId}/plan-requests`, send('POST', { target: 'aws', tier }))
   } catch (e) {
     if (e instanceof ApiError && (e.status === 404 || e.status === 405))
-      throw new ApiError(501, '서버가 아직 다른 안으로 다시 계획하는 기능을 지원하지 않습니다.')
+      throw new ApiError(501, t('서버가 아직 다른 안으로 다시 계획하는 기능을 지원하지 않습니다.'))
     throw e
   }
 }
@@ -641,7 +654,10 @@ async function domainReq<T>(path: string, init?: RequestInit & { timeoutMs?: num
     return await req<T>(path, init)
   } catch (e) {
     if (e instanceof ApiError && (e.status === 404 || e.status === 405))
-      throw new ApiError(501, '서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소 또는 이 PC의 로컬 주소)로 배포합니다. 도메인은 연결되지 않습니다.')
+      throw new ApiError(
+        501,
+        t('서버에 도메인 기능이 아직 없어 미리보기 주소(AWS 기본 주소 또는 이 PC의 로컬 주소)로 배포합니다. 도메인은 연결되지 않습니다.'),
+      )
     throw e
   }
 }

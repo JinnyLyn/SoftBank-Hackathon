@@ -7,6 +7,7 @@ import { STAGE_SIZE } from '../progress'
 import { PROVIDERS } from '../providers'
 import { costText, TIER_META, tierTotal, usd } from '../format'
 import type { Analysis, Choice, Recommendation, TierKey } from '../types'
+import { useT } from '../i18n'
 
 export type CodeState = 'idle' | 'loading' | 'ready' | 'error'
 
@@ -59,24 +60,25 @@ function useSlow(startedAt: number | null, afterMs: number) {
 }
 
 export default function AnalysisStep({ analysis, rec, recError, recStartedAt, onRetryRec, ...plans }: Props) {
+  const t = useT()
   const blockers = analysis.blockers ?? []
   const slowPlan = useSlow(rec || recError ? null : recStartedAt, PLAN_SLOW_MS)
   return (
     <div className="stack-lg">
       {blockers.length > 0 && (
         <div className="error" role="alert">
-          <strong>이 앱은 지금 배포할 수 없습니다.</strong>
+          <strong>{t('이 앱은 지금 배포할 수 없습니다.')}</strong>
           <ul className="blockers">
             {blockers.map((b) => (
               <li key={b}>{b}</li>
             ))}
           </ul>
-          <span>코드를 고친 뒤 처음 화면에서 다시 올려 주세요.</span>
+          <span>{t('코드를 고친 뒤 처음 화면에서 다시 올려 주세요.')}</span>
         </div>
       )}
       {analysis.dockerfileDraft && <DockerfileDraft draft={analysis.dockerfileDraft} />}
       <section>
-        <h3 className="sub-title">코드에서 찾은 것</h3>
+        <h3 className="sub-title">{t('코드에서 찾은 것')}</h3>
         <dl className="kv">
           {analysis.stack.map((s, i) => (
             <div key={s.label} className="reveal" style={{ animationDelay: `${i * 90}ms` }}>
@@ -98,7 +100,7 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
           ))}
         </ul>
         <details className="evidence">
-          <summary>판단 근거 {analysis.evidence.length}개</summary>
+          <summary>{t('판단 근거 {n}개', { n: analysis.evidence.length })}</summary>
           <ul>
             {analysis.evidence.map((e) => (
               <li key={e} className="mono">{e}</li>
@@ -111,33 +113,31 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
         <Plans rec={rec} {...plans} />
       ) : (
         <section>
-          <h3 className="sub-title">어디에, 어떤 크기로</h3>
+          <h3 className="sub-title">{t('어디에, 어떤 크기로')}</h3>
           {recError ? (
             <div className="rec-wait is-error" role="alert">
-              <span>구성·비용 계획을 받지 못했습니다. {recError}</span>
+              <span>{t('구성·비용 계획을 받지 못했습니다.')} {recError}</span>
               <button className="btn btn-ghost btn-sm" onClick={onRetryRec}>
-                다시 기다리기
+                {t('다시 기다리기')}
               </button>
             </div>
           ) : (
             <WorkProgress
-              title="구성과 비용 계획을 만들고 있습니다"
+              title={t('구성과 비용 계획을 만들고 있습니다')}
               startedAt={recStartedAt ?? Date.now()}
               stageStartedAt={recStartedAt ?? Date.now()}
               stages={[
-                { label: '코드 올리기', state: 'done', ...STAGE_SIZE.upload },
-                { label: '코드 분석', state: 'done', ...STAGE_SIZE.analyze },
-                { label: '구성·비용 계획', state: 'current', ...STAGE_SIZE.plan },
+                { label: t('코드 올리기'), state: 'done', ...STAGE_SIZE.upload },
+                { label: t('코드 분석'), state: 'done', ...STAGE_SIZE.analyze },
+                { label: t('구성·비용 계획'), state: 'current', ...STAGE_SIZE.plan },
               ]}
-              hints={PLAN_HINTS}
-              note="보통 1~4분 걸립니다. 위의 분석 결과를 먼저 확인해 주세요. 승인하기 전에는 아무것도 만들지 않습니다."
+              hints={PLAN_HINTS.map((h) => t(h))}
+              note={t('보통 1~4분 걸립니다. 위의 분석 결과를 먼저 확인해 주세요. 승인하기 전에는 아무것도 만들지 않습니다.')}
             />
           )}
           {!recError && slowPlan && (
             <p className="hint" role="status">
-              계획이 늦어지고 있습니다. 가장 흔한 이유는 <strong>월 예산 {usd(plans.budget)}</strong>이 가장 작은 AWS 구성보다
-              낮은 경우입니다(공용 로드밸런서·DB 몫이 포함돼 소규모 앱도 월 수십 달러부터). 이때는 계획이 만들어지지 않으니, 처음 화면에서
-              예산을 올려 다시 시작해 주세요.
+              {t('계획이 늦어지고 있습니다. 가장 흔한 이유는 월 예산 {budget}이 가장 작은 AWS 구성보다 낮은 경우입니다(공용 로드밸런서·DB 몫이 포함돼 소규모 앱도 월 수십 달러부터). 이때는 계획이 만들어지지 않으니, 처음 화면에서 예산을 올려 다시 시작해 주세요.', { budget: usd(plans.budget) })}
             </p>
           )}
         </section>
@@ -157,6 +157,7 @@ const PLAN_HINTS = [
 type PlansProps = Omit<Props, 'analysis' | 'rec' | 'recError' | 'recStartedAt' | 'onRetryRec'> & { rec: Recommendation }
 
 function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, onRequestTier }: PlansProps) {
+  const tr = useT()
   const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
   const selected = option?.tiers.find((t) => t.key === choice?.tier)
   const isRec = (id: string, t: TierKey) => rec.recommended?.connectionId === id && rec.recommended?.tier === t
@@ -178,21 +179,21 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
 
   return (
       <section>
-        <h3 className="sub-title">어디에, 어떤 크기로</h3>
+        <h3 className="sub-title">{tr('어디에, 어떤 크기로')}</h3>
         <p className={'rec-reason' + (rec.recommended ? '' : ' is-blocked')}>{rec.reason}</p>
 
         {rec.options.length === 0 ? (
-          <p className="muted">비교할 배포 대상이 없습니다. 첫 화면이나 연결 관리 탭에서 하나 이상 연결해 주세요.</p>
+          <p className="muted">{tr('비교할 배포 대상이 없습니다. 첫 화면이나 연결 관리 탭에서 하나 이상 연결해 주세요.')}</p>
         ) : (
           <div className="matrix-wrap">
             <table className="matrix">
               <thead>
                 <tr>
-                  <th>배포 대상</th>
+                  <th>{tr('배포 대상')}</th>
                   {columns.map((k) => (
                     <th key={k}>
-                      {TIER_META[k].label}
-                      <small>{TIER_META[k].fit}</small>
+                      {tr(TIER_META[k].label)}
+                      <small>{tr(TIER_META[k].fit)}</small>
                     </th>
                   ))}
                 </tr>
@@ -203,8 +204,8 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
                     <th scope="row">
                       <ProviderMark provider={o.provider} />
                       <span>
-                        {o.name}
-                        <small>{PROVIDERS[o.provider].label}</small>
+                        {tr(o.name)}
+                        <small>{tr(PROVIDERS[o.provider].label)}</small>
                       </span>
                     </th>
                     {columns.map((k) => {
@@ -215,7 +216,7 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
                             <button className="cell is-empty" disabled>
                               <span className="cell-tags" />
                               <strong>-</strong>
-                              <small>이 크기의 계획 없음</small>
+                              <small>{tr('이 크기의 계획 없음')}</small>
                             </button>
                           </td>
                         )
@@ -231,9 +232,9 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
                             disabled={locked || over}
                             title={
                               over
-                                ? `월 예산 $${budget}을 넘습니다`
+                                ? tr('월 예산 ${budget}을 넘습니다', { budget })
                                 : compareOnly
-                                  ? '누르면 이 안으로 배포 계획을 다시 만듭니다(약 1분).'
+                                  ? tr('누르면 이 안으로 배포 계획을 다시 만듭니다(약 1분).')
                                   : undefined
                             }
                             aria-pressed={on}
@@ -242,19 +243,19 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
                             }
                           >
                             <span className="cell-tags">
-                              {recommended && <span className="badge">추천</span>}
+                              {recommended && <span className="badge">{tr('추천')}</span>}
                               {cheapest[t.key] === o.connectionId && rec.options.length > 1 && !over && (
-                                <span className="tag-low">최저</span>
+                                <span className="tag-low">{tr('최저')}</span>
                               )}
-                              {over && <span className="tag-over">예산 초과</span>}
-                              {t.rankLabel && <span className="tag-rank">{t.rankLabel}</span>}
+                              {over && <span className="tag-over">{tr('예산 초과')}</span>}
+                              {t.rankLabel && <span className="tag-rank">{tr(t.rankLabel)}</span>}
                             </span>
                             <strong>{costText(tierTotal(t))}</strong>
                             {t.usualUsd !== undefined && t.usualUsd !== tierTotal(t) && (
-                              <small className="cell-usual">평소 {usd(t.usualUsd)} · 부하 최대 기준</small>
+                              <small className="cell-usual">{tr('평소 {usd} · 부하 최대 기준', { usd: usd(t.usualUsd) })}</small>
                             )}
                             <small>{t.headline}</small>
-                            {compareOnly && !over && <small className="cell-note">누르면 이 안으로 계획을 다시 만듭니다(약 1분)</small>}
+                            {compareOnly && !over && <small className="cell-note">{tr('누르면 이 안으로 계획을 다시 만듭니다(약 1분)')}</small>}
                           </button>
                         </td>
                       )
@@ -267,27 +268,27 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
         )}
         {rec.options.some((o) => o.tiers.some((t) => t.planned === false)) && (
           <p className="hint">
-            배포 계획은 고른 안 하나로 만듭니다. 다른 안을 누르면 그 안으로 계획을 다시 만들고, 바뀐 계획으로 다시 승인합니다.
+            {tr('배포 계획은 고른 안 하나로 만듭니다. 다른 안을 누르면 그 안으로 계획을 다시 만들고, 바뀐 계획으로 다시 승인합니다.')}
           </p>
         )}
 
         {option && selected && (
           <div className="tier-detail">
             <h4>
-              <ProviderMark provider={option.provider} /> {option.name} · {selected.label} — {selected.headline}
+              <ProviderMark provider={option.provider} /> {tr(option.name)} · {tr(selected.label)} — {selected.headline}
               {codeState !== 'idle' && (
                 <span className={'code-state is-' + codeState} title={codeError}>
-                  {CODE_TEXT[codeState]}
+                  {tr(CODE_TEXT[codeState])}
                 </span>
               )}
             </h4>
             <table className="table">
               <thead>
                 <tr>
-                  <th>리소스</th>
-                  <th>사양</th>
-                  <th>이렇게 고른 이유</th>
-                  <th className="num">월</th>
+                  <th>{tr('리소스')}</th>
+                  <th>{tr('사양')}</th>
+                  <th>{tr('이렇게 고른 이유')}</th>
+                  <th className="num">{tr('월')}</th>
                 </tr>
               </thead>
               <tbody>
@@ -304,13 +305,13 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
               </tbody>
               <tfoot>
                 <tr>
-                  <td colSpan={3}>합계{selected.usageNote && <span className="muted"> · 서버 자원 {selected.usageNote}</span>}</td>
+                  <td colSpan={3}>{tr('합계')}{selected.usageNote && <span className="muted"> · {tr('서버 자원 {note}', { note: selected.usageNote })}</span>}</td>
                   <td className="num">{costText(tierTotal(selected))}</td>
                 </tr>
               </tfoot>
             </table>
             <p className="tradeoff">
-              <span>감수할 점</span> {selected.tradeoff}
+              <span>{tr('감수할 점')}</span> {selected.tradeoff}
             </p>
             <ul className="assumptions">
               {rec.assumptions.map((a) => (

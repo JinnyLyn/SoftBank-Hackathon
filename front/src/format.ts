@@ -1,4 +1,5 @@
 import type { Source, Tier, TierKey } from './types'
+import { t } from './i18n/core'
 
 /** 소스에서 앱 이름을 뽑음 (zip 파일 이름, 저장소 이름) */
 export const sourceName = (s: Source) =>
@@ -22,7 +23,7 @@ export const TIER_META: Record<TierKey, { label: string; fit: string }> = {
 export const tierTotal = (t: Tier) => t.totalUsd ?? t.resources.reduce((s, r) => s + r.monthlyUsd, 0)
 
 /** 비용이 0이면(온프레미스) 금액 대신 문구 */
-export const costText = (n: number) => (n > 0 ? usd(n) : '추가 비용 없음')
+export const costText = (n: number) => (n > 0 ? usd(n) : t('추가 비용 없음'))
 
 /**
  * 화면용 짧은 시각 "MM-DD HH:mm". 백엔드는 UTC ISO 8601, mock은 "YYYY-MM-DD HH:mm"을 주므로 둘 다 받음
