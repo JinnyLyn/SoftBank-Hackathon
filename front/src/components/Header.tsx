@@ -45,6 +45,9 @@ export default function Header({ page, onChange }: Props) {
               {t.label}
             </button>
           ))}
+          <button type="button" className="tab" onClick={() => window.location.assign('/onprem')}>
+            On-prem 배포
+          </button>
         </nav>
         {/* 배포는 운영자가 준비한 관리형 AWS. 사용자 계정 연결은 없음 */}
         <span className="account">
