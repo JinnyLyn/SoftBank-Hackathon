@@ -1,5 +1,6 @@
 # 플랫폼은 배포마다 이 값을 platform.auto.tfvars.json의 platform.foundation에 그대로 넣는다.
 #   terraform output -json deploy_inputs > foundation.json
+# app_domain과 https_listener_arn이 둘 다 있으면 deploy.sh up --domain이 포트 리스너 대신 443 리스너의 호스트 규칙을 쓴다(dns.tf)
 output "deploy_inputs" {
   description = "배포 루트 모듈에 넘길 사전 생성 리소스 정보 (비밀 값 없음)"
   value = {
@@ -7,6 +8,7 @@ output "deploy_inputs" {
     alb_dns_name                      = aws_lb.this.dns_name
     alb_security_group_id             = aws_security_group.alb.id
     allowed_listener_ports            = var.listener_port_range
+    app_domain                        = var.app_domain
     assign_public_ip                  = local.assign_public_ip
     certificate_arn                   = var.certificate_arn
     cluster_name                      = aws_ecs_cluster.this.name
@@ -23,6 +25,7 @@ output "deploy_inputs" {
     db_security_group_id              = aws_security_group.db.id
     ecr_repository_url                = aws_ecr_repository.apps.repository_url
     execution_role_arn                = aws_iam_role.task_execution.arn
+    https_listener_arn                = try(aws_lb_listener.https_default[0].arn, "")
     listener_protocol                 = local.https_enabled ? "HTTPS" : "HTTP"
     nat_instance_count                = local.nat_count
     task_subnet_ids                   = local.task_subnet_ids

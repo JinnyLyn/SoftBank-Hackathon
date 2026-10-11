@@ -54,8 +54,31 @@ variable "cpu_architecture" {
 }
 
 variable "listener_port" {
-  description = "이 배포에 할당한 공유 ALB 리스너 포트"
+  description = "포트 방식(domain_name이 비어 있을 때)에서 이 배포에 할당한 공유 ALB 리스너 포트. 도메인 방식에서는 쓰지 않는다(0)"
   type        = number
+  default     = 0
+}
+
+variable "domain_name" {
+  description = "도메인 방식의 접속 호스트 이름(<deploy_id>.<foundation.app_domain>). 지정하면 전용 포트 리스너 대신 공유 443 리스너에 이 호스트의 규칙을 하나 만든다. 비우면(기본) 포트 방식"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.domain_name == "" || (length(var.domain_name) <= 253 && can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$", var.domain_name)))
+    error_message = "domain_name은 소문자 호스트 이름이어야 합니다(예: abcd1234.totorosi.cloud)."
+  }
+}
+
+variable "listener_rule_priority" {
+  description = "도메인 방식에서 공유 443 리스너에 붙일 호스트 규칙의 우선순위(1~50000). 리스너 안에서 겹칠 수 없어 deploy.sh가 빈 번호를 골라 예약한다. 포트 방식에서는 쓰지 않는다(0)"
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.listener_rule_priority == floor(var.listener_rule_priority) && var.listener_rule_priority >= 0 && var.listener_rule_priority <= 50000
+    error_message = "listener_rule_priority는 0~50000의 정수여야 합니다(0은 포트 방식)."
+  }
 }
 
 variable "log_retention_days" {
@@ -80,6 +103,7 @@ variable "foundation" {
       to   = number
     })
     alb_security_group_id      = string
+    app_domain                 = optional(string, "")
     assign_public_ip           = bool
     certificate_arn            = optional(string, "")
     cluster_name               = string
@@ -87,6 +111,7 @@ variable "foundation" {
     db_security_group_id       = string
     ecr_repository_url         = string
     execution_role_arn         = string
+    https_listener_arn         = optional(string, "")
     listener_protocol          = optional(string, "HTTP")
     task_subnet_ids            = list(string)
     vpc_id                     = string

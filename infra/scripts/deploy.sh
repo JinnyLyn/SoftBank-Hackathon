@@ -11,6 +11,7 @@
 #   deploy.sh up       (--id a1b2c3d4 | --name "프로젝트 이름") --image <ecr_url>:a1b2c3d4-r1 --app app.json [--port 8001|auto] [--yes]
 #                      [--plan-only] [--shared-db] [--grace 초] [--skip-nat-check] [--arch ARM64]   # 아키텍처 기본값은 이 PC의 docker
 #                      [--secret 이름]...   # 환경 변수 <이름>을 SSM SecureString /<프로젝트>/apps/<id>/secrets/<이름> 에서 비밀로 주입(미리 만들어 둔다)
+#                      [--domain <id>.<app_domain>]   # 포트 리스너 대신 foundation의 443 리스너에 이 호스트 규칙을 붙인다(foundation에 app_domain 필요)
 #   deploy.sh update   a1b2c3d4 [--image <ecr_url>:tag] [--app app.json] [--yes] [--plan-only]
 #   deploy.sh rollback a1b2c3d4 --plan-only [--to <이미지>]   # 저수준 계획 생성. 제품 롤백은 아래 승인·연동 조건 필요
 #   deploy.sh apply    a1b2c3d4            # 위 명령을 --plan-only 로 만든, 승인된 저장 계획만 적용한다
@@ -212,32 +213,37 @@ nat_preflight() {
 # (2)는 배포 폴더가 있는 동안 예약이다. 폴더가 지워지거나(계획 폐기, 만들다 만 폴더 정리) destroy 표식이 생기면 풀린다.
 # 승인된 계획의 포트는 계획에 고정돼 있어서, 바꾸려면 새 계획과 새 승인이 필요하다.
 local_reserved_ports() {  # local_reserved_ports <제외할 배포 ID>
-  "$(pick_python)" - "$ROOT/deployments" "${1:-}" <<'PYEOF'
+  local_reserved listener_port port.reserved "${1:-}"
+}
+
+# 입력 파일의 platform.<필드> 값과 예약 파일의 값을 모은다(포트와 규칙 우선순위가 같이 쓴다). 0(그 방식을 쓰지 않는 배포)은 세지 않는다
+local_reserved() {  # local_reserved <platform 필드> <예약 파일 이름> <제외할 배포 ID>
+  "$(pick_python)" - "$ROOT/deployments" "$1" "$2" "${3:-}" <<'PYEOF'
 import json, os, sys
-root, skip = sys.argv[1], sys.argv[2]
-ports = set()
+root, field, rfile, skip = sys.argv[1:5]
+values = set()
 try:
     names = os.listdir(root)
 except OSError:
     names = []
 for n in names:
     d = os.path.join(root, n)
-    # _template, _destroyed 같은 보관 폴더와 숨김 폴더(.port.lock)는 배포가 아니다. 삭제된 배포(destroyed 표식)는 포트를 놓는다
+    # _template, _destroyed 같은 보관 폴더와 숨김 폴더(.port.lock)는 배포가 아니다. 삭제된 배포(destroyed 표식)는 값을 놓는다
     if n == skip or n.startswith(("_", ".")) or not os.path.isdir(d) or os.path.exists(os.path.join(d, "destroyed")):
         continue
     try:
         with open(os.path.join(d, "platform.auto.tfvars.json"), encoding="utf-8") as f:
-            p = json.load(f)["platform"]["listener_port"]
-        if isinstance(p, int) and not isinstance(p, bool):
-            ports.add(p)
+            v = json.load(f)["platform"][field]
+        if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            values.add(v)
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    try:   # 포트를 고른 직후(입력 파일을 쓰기 전)의 예약
-        with open(os.path.join(d, "port.reserved"), encoding="utf-8") as f:
-            ports.add(int(f.read().strip()))
+    try:   # 값을 고른 직후(입력 파일을 쓰기 전)의 예약
+        with open(os.path.join(d, rfile), encoding="utf-8") as f:
+            values.add(int(f.read().strip()))
     except (OSError, ValueError):
         pass
-print(*sorted(ports))
+print(*sorted(values))
 PYEOF
 }
 
@@ -282,6 +288,56 @@ reserve_port() {  # reserve_port <배포 ID> <배포 폴더>
   printf '%s\n' "$p" > "$d/port.reserved"
   port_unlock
   echo "$p"
+}
+
+# --- 호스트 규칙 우선순위 자동 할당 (도메인 방식) ---------------------------------------------------
+# 도메인 방식(up --domain)의 배포는 포트 리스너 대신 foundation의 공유 443 리스너에 호스트 규칙 하나를 붙인다.
+# 규칙 우선순위는 한 리스너 안에서 겹칠 수 없어서 포트와 같은 방법으로 고른다: AWS에 이미 있는 규칙(콘솔에서 만든 플랫폼 주소 규칙 포함)과
+# 이 PC의 미적용 계획이 예약한 번호(priority.reserved, 입력 파일의 listener_rule_priority)를 뺀 가장 작은 번호.
+# 범위는 RULE_PRIORITY_FROM~RULE_PRIORITY_TO(기본 1000~49999). 1~999는 운영자가 손으로 만드는 규칙에 남겨 둔다.
+# 잠금은 포트 예약과 같은 것을 쓴다
+local_reserved_priorities() {  # local_reserved_priorities <제외할 배포 ID>
+  local_reserved listener_rule_priority priority.reserved "${1:-}"
+}
+
+pick_priority() {  # pick_priority [제외할 배포 ID]: 범위 안에서 443 리스너의 규칙과 로컬 예약을 뺀 가장 작은 빈 우선순위
+  local rgn listener used reserved
+  rgn="$(region)"; listener="$(fjson https_listener_arn)"
+  # 조회가 실패하면 중단한다. 빈 값으로 넘어가면 이미 쓰는 번호를 골라 apply에서야 PriorityInUse로 실패한다
+  used="$(aws elbv2 describe-rules --region "$rgn" --listener-arn "$listener" --query 'Rules[].Priority' --output text)" \
+    || die "443 리스너의 규칙 목록을 조회하지 못했습니다. 자격증명과 권한을 확인하세요"
+  reserved="$(local_reserved_priorities "${1:-}")" || die "배포 폴더의 규칙 우선순위 예약을 읽지 못했습니다"
+  "$(pick_python)" - "${RULE_PRIORITY_FROM:-1000}" "${RULE_PRIORITY_TO:-49999}" "$used $reserved" <<'PYEOF'
+import sys
+lo, hi = int(sys.argv[1]), int(sys.argv[2])
+used = {int(x) for x in sys.argv[3].split() if x.isdigit()}   # 기본 규칙의 우선순위는 "default"다
+for p in range(lo, hi + 1):
+    if p not in used:
+        print(p); break
+else:
+    sys.exit(1)
+PYEOF
+}
+
+# 빈 우선순위를 고르고 곧바로 이 배포 폴더에 예약으로 기록한다(잠금 안에서). 우선순위를 출력한다
+reserve_priority() {  # reserve_priority <배포 ID> <배포 폴더>
+  local id="$1" d="$2" p
+  port_lock
+  if ! p="$(pick_priority "$id")"; then port_unlock; return 1; fi
+  printf '%s\n' "$p" > "$d/priority.reserved"
+  port_unlock
+  echo "$p"
+}
+
+# up --domain의 값을 확인한다. foundation의 app_domain 아래 한 단계 이름 <배포 ID>.<app_domain>만 허용한다.
+# 와일드카드 DNS·인증서가 덮는 범위이고, 배포 ID는 겹치지 않으므로 다른 앱의 주소를 가로챌 수 없다(모듈도 같은 조건을 다시 확인한다)
+check_domain() {  # check_domain <배포 ID> <호스트 이름>
+  local id="$1" host="$2" base listener
+  base="$(fjson app_domain 2>/dev/null || true)"
+  listener="$(fjson https_listener_arn 2>/dev/null || true)"
+  [ -n "$base" ] && [ -n "$listener" ] \
+    || die "foundation에 app_domain과 HTTPS 리스너가 없어 도메인 방식을 쓸 수 없습니다. foundation을 certificate_arn·app_domain과 함께 apply하거나 --domain 없이 포트 방식으로 배포하세요"
+  [ "$host" = "$id.$base" ] || die "--domain은 $id.$base 이어야 합니다(받은 값: $host)"
 }
 
 # --- state 위치 ----------------------------------------------------------------------------------
@@ -1176,13 +1232,14 @@ cmd_apply() {
 }
 
 cmd_up() {
-  local id="" name="" image="" port="auto" app="" grace="" shared_db=0 secret_names=()
+  local id="" name="" image="" port="auto" app="" grace="" shared_db=0 secret_names=() domain="" priority=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --id) id="$2"; shift 2 ;;
       --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --port) port="$2"; shift 2 ;;
+      --domain) domain="$2"; shift 2 ;;
       --app) app="$2"; shift 2 ;;
       --arch) ARCH="$2"; shift 2 ;;
       --grace) grace="$2"; shift 2 ;;
@@ -1201,6 +1258,7 @@ cmd_up() {
   [ -n "${ARCH:-}" ] || ARCH="$(detect_arch)"
   [ "$ARCH" = "X86_64" ] || [ "$ARCH" = "ARM64" ] || die "--arch는 X86_64 또는 ARM64여야 합니다: $ARCH"
   [ "$port" = "auto" ] || [[ "$port" =~ ^[0-9]+$ ]] || die "--port는 숫자 또는 auto여야 합니다"
+  [ -z "$domain" ] || [ "$port" = "auto" ] || die "--domain과 --port는 함께 쓸 수 없습니다(도메인 방식은 포트 리스너를 만들지 않습니다)"
   [ -z "$grace" ] || [[ "$grace" =~ ^[0-9]+$ ]] || die "--grace는 숫자(초)여야 합니다"
   [ -f "$app" ] || die "app 파일이 없습니다: $app"
   need terraform; need aws
@@ -1212,6 +1270,7 @@ cmd_up() {
   log "배포 $id 준비 (리전 $rgn)"
 
   export_foundation
+  [ -z "$domain" ] || check_domain "$id" "$domain"
   # 비밀로 주입할 SSM 파라미터는 NAT 점검(최대 90초)보다 먼저 확인한다. 없거나 SecureString이 아니면 폴더를 만들기 전에 멈춘다
   local secret_json; secret_json="$(secret_arns_json "$id" "${secret_names[@]+"${secret_names[@]}"}")" || exit 1
   nat_preflight
@@ -1223,7 +1282,12 @@ cmd_up() {
   UP_DIR="$d"; UP_PHASE=prep
   trap cleanup_failed_up EXIT
   mkdir -p "$d"
-  if [ "$port" = "auto" ]; then
+  if [ -n "$domain" ]; then
+    # 도메인 방식: 포트 리스너를 만들지 않으므로 포트를 예약하지 않는다. 대신 443 리스너의 규칙 우선순위를 예약한다
+    priority="$(reserve_priority "$id" "$d")" || die "443 리스너에 쓸 수 있는 규칙 우선순위가 없습니다"
+    port=0
+    log "도메인 방식: https://$domain (443 리스너 규칙 우선순위 $priority)"
+  elif [ "$port" = "auto" ]; then
     port="$(reserve_port "$id" "$d")" || die "허용 범위에 빈 포트가 없습니다"
     log "리스너 포트 자동 할당: $port"
   else
@@ -1261,6 +1325,8 @@ cmd_up() {
   "image": "$image",
   "cpu_architecture": "${ARCH:-X86_64}",
   "listener_port": $port,
+  "domain_name": "$domain",
+  "listener_rule_priority": $priority,
   "database_url_parameter_arn": "$param_arn",
   "health_check_grace_seconds": ${grace:-90},
   "secret_parameter_arns": $secret_json,

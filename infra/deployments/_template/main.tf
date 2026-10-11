@@ -8,6 +8,9 @@ module "app" {
   listener_port    = var.platform.listener_port
   foundation       = var.platform.foundation
 
+  domain_name            = var.platform.domain_name
+  listener_rule_priority = var.platform.listener_rule_priority
+
   database_url_parameter_arn   = var.platform.database_url_parameter_arn
   health_check_grace_seconds   = var.platform.health_check_grace_seconds
   deregistration_delay_seconds = var.platform.deregistration_delay_seconds

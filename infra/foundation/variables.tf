@@ -145,6 +145,45 @@ variable "certificate_arn" {
   }
 }
 
+variable "app_domain" {
+  description = "앱 자동 주소의 기반 도메인(예: totorosi.cloud). 지정하면 *.<app_domain>을 ALB로 향하는 와일드카드 레코드를 만들고(dns.tf), 배포는 포트 리스너 대신 공유 443 리스너에 <deploy_id>.<app_domain> 호스트 규칙을 붙인다. certificate_arn의 인증서가 *.<app_domain>을 포함해야 한다. 비우면(기본) 기존 포트 리스너 방식만 쓴다"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_domain == "" || (length(var.app_domain) <= 200 && can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$", var.app_domain)))
+    error_message = "app_domain은 소문자 도메인 이름이어야 합니다(예: totorosi.cloud). 끝의 점과 와일드카드(*)는 넣지 않습니다."
+  }
+}
+
+variable "app_domain_zone_id" {
+  description = "app_domain의 Route 53 공개 호스팅 영역 ID(예: Z0123456789ABCDEFGHIJ). 비우면 app_domain 이름으로 같은 계정의 공개 호스팅 영역을 찾는다"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.app_domain_zone_id == "" || can(regex("^Z[A-Z0-9]{5,31}$", var.app_domain_zone_id))
+    error_message = "app_domain_zone_id는 Z로 시작하는 Route 53 호스팅 영역 ID여야 합니다(/hostedzone/ 접두사 없이)."
+  }
+}
+
+variable "certificate_validation_records" {
+  description = "certificate_arn 인증서의 ACM DNS 검증 CNAME 목록 [{name, value}]. ACM은 자동 갱신 때 이 레코드를 다시 확인하므로 지워지면 만료일에 갱신이 실패한다. 값은 aws acm describe-certificate의 DomainValidationOptions[].ResourceRecord에서 읽는다(비밀 아님). app_domain의 호스팅 영역에 만들며, app_domain이 비어 있으면 쓰지 않는다"
+  type = list(object({
+    name  = string
+    value = string
+  }))
+  default = []
+
+  validation {
+    condition = alltrue([
+      for r in var.certificate_validation_records :
+      can(regex("^_[a-z0-9]+\\.([a-z0-9-]+\\.)+[a-z]{2,63}\\.?$", r.name)) && can(regex("^_[a-z0-9]+\\.([a-z0-9-]+\\.)+acm-validations\\.aws\\.?$", r.value))
+    ])
+    error_message = "certificate_validation_records는 ACM이 준 검증 CNAME(_로 시작하는 이름, 값은 .acm-validations.aws로 끝남)이어야 합니다."
+  }
+}
+
 variable "az_count" {
   description = "사용할 가용 영역 수. 서브넷과 NAT 인스턴스(고가용성일 때)가 이 수만큼 만들어진다. ALB와 RDS 서브넷 그룹은 최소 2개가 필요하다"
   type        = number

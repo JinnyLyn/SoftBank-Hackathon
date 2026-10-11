@@ -2,7 +2,7 @@
 
 output "url" {
   description = "외부 접속 URL"
-  value       = "${lower(var.foundation.listener_protocol)}://${var.foundation.alb_dns_name}:${var.listener_port}"
+  value       = local.use_domain ? "https://${var.domain_name}" : "${lower(var.foundation.listener_protocol)}://${var.foundation.alb_dns_name}:${var.listener_port}"
 }
 
 output "cluster_name" {
