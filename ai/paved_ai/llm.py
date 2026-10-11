@@ -14,10 +14,12 @@ client를 밖에서 넘겨받으므로 테스트는 가짜 client로 돈다.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import cache
 from .analysis import Analysis, Evidence, suggest_dockerfile
@@ -29,11 +31,22 @@ DEFAULT_MODEL = "claude-opus-5-5"  # Anthropic client일 때 (Ollama 기본 모�
 # 안전 분류기가 거절하면 서버가 권장 모델로 다시 돌림 (Claude API 전용 베타)
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 EFFORT = "medium"
-MAX_TOKENS = 16000
-MAX_PROMPT_CHARS = 120_000  # 보낼 파일 내용 상한 (대략 3만 토큰)
+# 답은 값 4개·메모 5개의 작은 JSON(실측 출력 200토큰 안팎). 상한이 크면 모델이 길게 늘어질 때 그만큼 오래 기다림
+MAX_TOKENS = 4096
+MAX_PROMPT_CHARS = 60_000  # 보낼 파일 내용 상한 (대략 1.5만 토큰)
+# 이보다 큰 파일은 단서(포트·경로·listen 등) 주변 줄만 보냄. 줄 번호는 원래 번호 그대로라 근거 검증은 같음
+MAX_FILE_CHARS = 12_000
+EXCERPT_CONTEXT = 3
 MAX_NOTES = 5
+# LLM 단계 전체 시간 상한(초, 재시도 포함). 넘으면 규칙 결과로 진행. 화면은 분석을 5분까지 기다리므로 그보다 훨씬 짧게
+LLM_BUDGET_SECONDS = 60.0
+MIN_ATTEMPT_SECONDS = 8.0   # 남은 시간이 이보다 적으면 다시 시도하지 않음
+RETRY_BACKOFF_SECONDS = 2.0
+MAX_ATTEMPTS = 2
 # 프롬프트·검증 규칙을 바꾸면 올림 → 캐시 키가 바뀌어 예전 답을 다시 쓰지 않음
-PROMPT_VERSION = "2026-10-11-schema-validation-v2"
+PROMPT_VERSION = "2026-10-11-excerpt-v3"
+
+log = logging.getLogger(__name__)
 
 # LLM에 물어볼 수 있는 값. 금액·크기는 여기 없음
 FILLABLE = {
@@ -94,7 +107,22 @@ SYSTEM = """당신은 웹 앱 소스 코드를 읽고 AWS ECS Fargate 배포에 
 
 
 class LlmUnavailable(Exception):
-    """키가 없거나, SDK가 없거나, API 호출이 실패함. 호출하는 쪽은 규칙 결과만 쓰면 됨"""
+    """키가 없거나, SDK가 없거나, API 호출이 실패함. 호출하는 쪽은 규칙 결과만 쓰면 됨.
+    transient: 시간 초과·연결·한도·서버 오류처럼 다시 하면 될 수 있는 실패"""
+
+    def __init__(self, message: str, transient: bool = False):
+        super().__init__(message)
+        self.transient = transient
+
+
+def budget_seconds() -> float:
+    """LLM 단계 시간 상한. PAVED_AI_LLM_TIMEOUT(초, 5~600)로 바꿀 수 있고, 잘못된 값이면 기본값"""
+    raw = os.environ.get("PAVED_AI_LLM_TIMEOUT", "").strip()
+    try:
+        v = float(raw) if raw else LLM_BUDGET_SECONDS
+    except ValueError:
+        return LLM_BUDGET_SECONDS
+    return v if 5 <= v <= 600 else LLM_BUDGET_SECONDS
 
 
 @dataclass
@@ -111,10 +139,11 @@ class LlmOutcome:
     output_tokens: Optional[int] = None
     elapsed_ms: Optional[int] = None
     cached: bool = False
+    attempts: int = 0
 
     def usage(self) -> dict:
         return {"input_tokens": self.input_tokens, "output_tokens": self.output_tokens,
-                "elapsed_ms": self.elapsed_ms, "cached": self.cached}
+                "elapsed_ms": self.elapsed_ms, "cached": self.cached, "attempts": self.attempts}
 
 
 # ---------- 보낼 파일 고르기 ----------
@@ -149,11 +178,37 @@ def _rank(f: SourceFile) -> int:
 def select_files(files: List[SourceFile]) -> List[SourceFile]:
     picked, total = [], 0
     for f in sorted((f for f in files if _rank(f) < 9), key=lambda f: (_rank(f), f.path.count("/"), f.path)):
-        if total + len(f.text) > MAX_PROMPT_CHARS:
+        size = min(len(f.text), MAX_FILE_CHARS)  # 큰 파일은 발췌만 보냄
+        if total + size > MAX_PROMPT_CHARS:
             continue
         picked.append(f)
-        total += len(f.text)
+        total += size
     return picked
+
+
+def _excerpt(text: str) -> List[Tuple[Optional[int], str]]:
+    """(원래 줄 번호, 내용) 목록. 작은 파일은 전부, 큰 파일은 단서 줄 앞뒤만. 건너뛴 자리는 (None, "…")"""
+    lines = text.splitlines()
+    if len(text) <= MAX_FILE_CHARS:
+        return list(enumerate(lines, 1))
+    keep = set()
+    for i, line in enumerate(lines):
+        if _HINTS.search(line) or _CONFIG_HINTS.search(line):
+            keep.update(range(max(0, i - EXCERPT_CONTEXT), min(len(lines), i + EXCERPT_CONTEXT + 1)))
+    if not keep:  # 단서가 없으면 앞부분만
+        keep = set(range(min(len(lines), 60)))
+    out: List[Tuple[Optional[int], str]] = []
+    prev, size = -1, 0
+    for i in sorted(keep):
+        if size > MAX_FILE_CHARS:
+            out.append((None, "… (이하 생략)"))
+            break
+        if i != prev + 1:
+            out.append((None, "…"))
+        out.append((i + 1, lines[i]))
+        size += len(lines[i]) + 8
+        prev = i
+    return out
 
 
 def build_prompt(analysis: Analysis, files: List[SourceFile], targets: List[str]) -> str:
@@ -169,7 +224,7 @@ def build_prompt(analysis: Analysis, files: List[SourceFile], targets: List[str]
     asks = "\n".join(f"- {t}: {FILLABLE[t]} / 규칙이 못 찾은 이유: {analysis.unresolved.get(t, '')}" for t in targets)
     blocks = []
     for f in files:
-        numbered = "\n".join(f"{i:>4}| {line}" for i, line in enumerate(f.text.splitlines(), 1))
+        numbered = "\n".join(f"{i:>4}| {line}" if i else f"    | {line}" for i, line in _excerpt(f.text))
         # 업로드 내용이 파일 블록을 일찍 닫고 뒤를 지시처럼 놓지 못하게 구분자를 바꿔 씀 (PR #25 리뷰)
         numbered = re.sub(r"(?i)</?file\b", lambda m: m.group(0).replace("<", "‹"), numbered)
         path = f.path.replace('"', "'").replace("<", "‹").replace(">", "›")
@@ -227,7 +282,7 @@ def _check(field_name: str, value: str, file: str, line: int, files: Dict[str, L
 def _as_unavailable(exc: Exception) -> Exception:
     """API 오류를 사람이 읽을 이유로 바꿈. SDK가 없는 환경(가짜 client 테스트)에서는 그대로 둠"""
     if isinstance(exc, OllamaError):
-        return LlmUnavailable(str(exc))
+        return LlmUnavailable(str(exc), transient=exc.transient)
     try:
         import anthropic
     except ImportError:
@@ -237,14 +292,18 @@ def _as_unavailable(exc: Exception) -> Exception:
     if isinstance(exc, anthropic.PermissionDeniedError):
         return LlmUnavailable("이 키로는 모델을 쓸 권한이 없습니다.")
     if isinstance(exc, anthropic.RateLimitError):
-        return LlmUnavailable("Anthropic 사용 한도에 걸렸습니다. 잠시 뒤 다시 시도합니다.")
+        return LlmUnavailable("Anthropic 사용 한도에 걸렸습니다. 잠시 뒤 다시 시도합니다.", transient=True)
     if isinstance(exc, anthropic.APIStatusError):
         # API가 알려 준 이유를 그대로 (요청 형식·키 설정 문제를 바로 알 수 있게). 우리 요청 내용은 담기지 않음
         body = exc.body if isinstance(exc.body, dict) else {}
-        detail = (body.get("error") or {}).get("message") or ""
-        return LlmUnavailable(f"Anthropic API 오류 {exc.status_code}: {detail[:200]}".rstrip(": "))
+        error = body.get("error") if isinstance(body.get("error"), dict) else {}
+        detail = str(error.get("message") or "")
+        return LlmUnavailable(f"Anthropic API 오류 {exc.status_code}: {detail[:200]}".rstrip(": "),
+                              transient=exc.status_code >= 500 or exc.status_code == 429)
+    if isinstance(exc, anthropic.APITimeoutError):
+        return LlmUnavailable("Anthropic API 응답이 시간 안에 오지 않았습니다.", transient=True)
     if isinstance(exc, anthropic.APIConnectionError):
-        return LlmUnavailable("Anthropic API에 연결하지 못했습니다.")
+        return LlmUnavailable("Anthropic API에 연결하지 못했습니다.", transient=True)
     return exc
 
 
@@ -313,12 +372,14 @@ def _well_formed(data: dict) -> bool:
     return True
 
 
-def _ask(client, model: str, prompt: str):
-    """(답 텍스트, stop_reason, 응답 모델, request_id, 입력 토큰, 출력 토큰)"""
+def _ask(client, model: str, prompt: str, timeout: Optional[float] = None):
+    """(답 텍스트, stop_reason, 응답 모델, request_id, 입력 토큰, 출력 토큰). timeout은 이 호출의 상한(초)"""
     if isinstance(client, OllamaClient):
-        reply = client.chat(model, _system(client), prompt, OUTPUT_SCHEMA, MAX_TOKENS)
+        reply = client.chat(model, _system(client), prompt, OUTPUT_SCHEMA, MAX_TOKENS, timeout=timeout)
         return reply.text, reply.stop_reason, reply.model, reply.request_id, reply.input_tokens, reply.output_tokens
+    extra = {"timeout": timeout} if timeout else {}
     response = client.beta.messages.create(
+        **extra,
         model=model,
         max_tokens=MAX_TOKENS,
         betas=[FALLBACK_BETA],
@@ -330,6 +391,35 @@ def _ask(client, model: str, prompt: str):
     usage = getattr(response, "usage", None)
     return (_response_text(response), response.stop_reason, getattr(response, "model", model), getattr(response, "_request_id", None),
             getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None))
+
+
+def _ask_within_budget(client, model: str, prompt: str, outcome: "LlmOutcome", started: float):
+    """시간 상한 안에서 묻는다. 다시 하면 될 수 있는 실패(시간 초과·연결·한도·서버 오류)는 남은 시간이 있으면 한 번 더.
+    끝내 실패하면 LlmUnavailable(호출하는 쪽은 규칙 결과로 진행). API 오류가 아닌 예외(코드 버그)는 그대로 올린다."""
+    budget = budget_seconds()
+    last: Optional[LlmUnavailable] = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        remaining = budget - (time.monotonic() - started)
+        if attempt > 1:
+            if remaining < MIN_ATTEMPT_SECONDS + RETRY_BACKOFF_SECONDS:
+                break
+            time.sleep(RETRY_BACKOFF_SECONDS)
+            remaining -= RETRY_BACKOFF_SECONDS
+        outcome.attempts = attempt
+        try:
+            text, stop_reason, outcome.model, outcome.request_id, outcome.input_tokens, outcome.output_tokens = _ask(
+                client, model, prompt, timeout=max(remaining, 1.0))
+            return text, stop_reason
+        except Exception as exc:
+            mapped = _as_unavailable(exc)
+            if not isinstance(mapped, LlmUnavailable):
+                raise mapped from exc
+            last = mapped
+            if not mapped.transient:
+                break
+            log.warning("LLM 호출 실패(%d/%d회): %s", attempt, MAX_ATTEMPTS, mapped)
+    elapsed = time.monotonic() - started
+    raise LlmUnavailable(f"{last} (LLM 단계 {elapsed:.0f}초, {outcome.attempts}회 시도)", transient=last.transient) from last
 
 
 def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: str = DEFAULT_MODEL) -> LlmOutcome:
@@ -358,10 +448,7 @@ def fill_unresolved(analysis: Analysis, files: List[SourceFile], client, model: 
         text, stop_reason, outcome.model = hit["text"], str(hit.get("stop_reason") or "end_turn"), hit.get("model") or model
         outcome.cached, outcome.input_tokens, outcome.output_tokens = True, 0, 0
     else:
-        try:
-            text, stop_reason, outcome.model, outcome.request_id, outcome.input_tokens, outcome.output_tokens = _ask(client, model, prompt)
-        except Exception as exc:  # API 오류만 LlmUnavailable로 바꾸고 나머지(코드 버그)는 그대로 올림
-            raise _as_unavailable(exc) from exc
+        text, stop_reason = _ask_within_budget(client, model, prompt, outcome, started)
     outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
     analysis.ai_usage = outcome.usage()
 
