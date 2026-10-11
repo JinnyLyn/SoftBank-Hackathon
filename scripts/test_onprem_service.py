@@ -196,6 +196,7 @@ class LauncherTests(unittest.TestCase):
                 instance.children[name].poll.return_value = None
             instance.spawn = spawn
             instance.start()
+            self.assertEqual(calls['web'][1]['VITE_ONPREM_ONLY'], 'true')
             command, env = calls['analyzer']
             path = Path(command[command.index('--upload-dir') + 1])
             self.assertNotEqual(path, private_uploads)

@@ -21,6 +21,8 @@ bash scripts/run_onprem.sh
 
 현재 Docker endpoint를 실행 시작 때 고정하며 SSH/TCP 원격 context는 자원을 만들기 전에 거부한다. 전역 Docker context나 기존 `.env`는 수정하지 않는다. `ai/.env`를 읽지 않고 `--no-llm`을 사용한다. AWS/유료 LLM 키는 이 경로에 필요하지 않다.
 
+이 실행기는 로컬 배포 worker만 실행하므로 `VITE_ONPREM_ONLY=true`를 주입해 `/onprem`의 Home 버튼을 숨긴다. 지원하지 않는 AWS 기본 화면으로 이동시켜 계획 타임아웃을 기다리게 하지 않기 위함이다. 일반 실행에서는 Home 버튼을 유지한다. 실행기 환경 변경은 다음 서비스 시작부터 적용된다.
+
 ## 배포
 
 1. 준비 상태에서 API·DB·Docker·분석기·worker가 모두 준비됨인지 확인한다.

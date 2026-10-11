@@ -124,7 +124,7 @@ export default function OnPremDeploy() {
   return <div className="onprem">
     <header className="onprem-header"><div>
       <strong>Paved Clouds</strong>
-      <button type="button" className="tab" onClick={() => window.location.assign('/')}>Home</button>
+      {import.meta.env.VITE_ONPREM_ONLY !== 'true' && <button type="button" className="tab" onClick={() => window.location.assign('/')}>Home</button>}
       <span>로컬 Docker 배포</span>
     </div></header>
     <main className="onprem-main">

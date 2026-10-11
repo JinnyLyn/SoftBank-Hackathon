@@ -259,7 +259,7 @@ class Service:
                        str(self.state / 'progress' / f'{name}.json'), '--run-id', self.run_id] + options, ROOT, self.env)
         web_env = clean_env()
         web_env.update(API_TARGET=api, VITE_USE_MOCK='false', VITE_API_BASE_URL='/api',
-                       VITE_PROVIDERS='aws', VITE_DOCKERFILE_DRAFT_BUILD='false')
+                       VITE_PROVIDERS='aws', VITE_ONPREM_ONLY='true', VITE_DOCKERFILE_DRAFT_BUILD='false')
         self.spawn('web', ['node', str(ROOT / 'front/node_modules/vite/bin/vite.js'), '--host', '127.0.0.1',
                           '--port', str(self.args.web_port), '--strictPort'], ROOT / 'front', web_env)
         print(f'플랫폼 PC의 Docker · 규칙 분석 · HTTP 전용: http://127.0.0.1:{self.args.web_port}/onprem\n'
