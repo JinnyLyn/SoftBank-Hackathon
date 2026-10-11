@@ -4,6 +4,7 @@ import ProviderMark from '../components/ProviderMark'
 import LoadError from '../components/LoadError'
 import { costText, shortTime, usd } from '../format'
 import type { DeployRecord } from '../types'
+import { useT } from '../i18n'
 
 const STATUS_TEXT: Record<DeployRecord['status'], string> = {
   success: '성공',
@@ -12,6 +13,7 @@ const STATUS_TEXT: Record<DeployRecord['status'], string> = {
 }
 
 export default function History() {
+  const t = useT()
   const [records, setRecords] = useState<DeployRecord[] | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -43,17 +45,17 @@ export default function History() {
     <div className="page">
       <div className="page-head">
         <div>
-          <h1>배포 이력</h1>
+          <h1>{t('배포 이력')}</h1>
           <p>
-            앱별 배포 기록입니다.
-            {records && !error && ` 지금 떠 있는 앱 기준 월 예상 비용은 ${costText(monthly)}입니다.`}
+            {t('앱별 배포 기록입니다.')}
+            {records && !error && ' ' + t('지금 떠 있는 앱 기준 월 예상 비용은 {cost}입니다.', { cost: costText(monthly) })}
           </p>
         </div>
       </div>
 
       {error && <LoadError what="배포 이력" message={error} onRetry={load} />}
-      {!error && records === null && <p className="muted">불러오는 중…</p>}
-      {records !== null && groups.length === 0 && <p className="muted">아직 배포한 앱이 없습니다.</p>}
+      {!error && records === null && <p className="muted">{t('불러오는 중…')}</p>}
+      {records !== null && groups.length === 0 && <p className="muted">{t('아직 배포한 앱이 없습니다.')}</p>}
 
       {groups.map(([app, rs]) => {
         const live = rs.find((r) => r.status === 'success')
@@ -70,7 +72,7 @@ export default function History() {
               </div>
               {live && (
                 <span className="app-cost">
-                  {live.tier} · {live.monthlyUsd > 0 ? `${usd(live.monthlyUsd)}/월` : '추가 비용 없음'}
+                  {t(live.tier)} · {live.monthlyUsd > 0 ? t('{cost}/월', { cost: usd(live.monthlyUsd) }) : t('추가 비용 없음')}
                 </span>
               )}
             </header>
@@ -80,12 +82,12 @@ export default function History() {
                   <span className="t-ver">{r.version}</span>
                   <span className="t-main">
                     <span className="with-mark">
-                      <ProviderMark provider={r.provider} /> {r.target} · {r.tier} 구성
+                      <ProviderMark provider={r.provider} /> {t(r.target)} · {t('{tier} 구성', { tier: t(r.tier) })}
                     </span>
                     {r.note && <small>{r.note}</small>}
                   </span>
                   <span className="t-time mono">{shortTime(r.createdAt)}</span>
-                  <span className={'t-status rs-' + r.status}>{STATUS_TEXT[r.status]}</span>
+                  <span className={'t-status rs-' + r.status}>{t(STATUS_TEXT[r.status])}</span>
                 </li>
               ))}
             </ol>

@@ -1,5 +1,6 @@
 import { useRef, useState, type DragEvent } from 'react'
 import type { Source } from '../types'
+import { useT } from '../i18n'
 
 const MAX_ZIP_BYTES = 200 * 1024 * 1024
 const GITHUB_RE = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+?(\.git)?\/?$/
@@ -20,14 +21,16 @@ export default function SourceStep({ source, locked, onSource }: Props) {
   const [url, setUrl] = useState(source?.kind === 'github' ? source.url : '')
   const [branch, setBranch] = useState(source?.kind === 'github' ? source.branch : 'main')
   const [dragging, setDragging] = useState(false)
-  const [fileError, setFileError] = useState<string | null>(null)
+  // 번역 전 원문과 값만 저장하고 그릴 때 번역함(오류가 난 뒤 언어를 바꿔도 지금 언어로 보이게, PR #47 리뷰)
+  const [fileError, setFileError] = useState<{ key: string; vars?: Record<string, string> } | null>(null)
   const input = useRef<HTMLInputElement>(null)
+  const t = useT()
 
   // 형식과 크기는 서버에서도 다시 검사함. 여기서는 빨리 알려 주는 용도
   const takeFile = (f: File | undefined) => {
     if (!f) return
-    if (!f.name.toLowerCase().endsWith('.zip')) return setFileError('zip 파일만 올릴 수 있습니다.')
-    if (f.size > MAX_ZIP_BYTES) return setFileError(`200MB를 넘습니다 (${formatSize(f.size)}). node_modules 같은 폴더를 빼고 다시 압축해 주세요.`)
+    if (!f.name.toLowerCase().endsWith('.zip')) return setFileError({ key: 'zip 파일만 올릴 수 있습니다.' })
+    if (f.size > MAX_ZIP_BYTES) return setFileError({ key: '200MB를 넘습니다 ({size}). node_modules 같은 폴더를 빼고 다시 압축해 주세요.', vars: { size: formatSize(f.size) } })
     setFileError(null)
     onSource({ kind: 'zip', file: f })
   }
@@ -55,13 +58,13 @@ export default function SourceStep({ source, locked, onSource }: Props) {
             ) : (
               <>
                 <strong className="mono">{source.url.replace('https://github.com/', '')}</strong>
-                <span>브랜치 {source.branch}</span>
+                <span>{t('브랜치 {branch}', { branch: source.branch })}</span>
               </>
             )}
           </div>
           {!locked && (
             <button className="btn btn-ghost" onClick={() => onSource(null)}>
-              바꾸기
+              {t('바꾸기')}
             </button>
           )}
         </div>
@@ -74,10 +77,10 @@ export default function SourceStep({ source, locked, onSource }: Props) {
     <div className="stack">
       <div className="switch" role="tablist">
         <button role="tab" aria-selected={mode === 'zip'} className={mode === 'zip' ? 'is-on' : ''} onClick={() => setMode('zip')}>
-          zip 파일
+          {t('zip 파일')}
         </button>
         <button role="tab" aria-selected={mode === 'github'} className={mode === 'github' ? 'is-on' : ''} onClick={() => setMode('github')}>
-          GitHub 저장소
+          {t('GitHub 저장소')}
         </button>
       </div>
 
@@ -106,10 +109,10 @@ export default function SourceStep({ source, locked, onSource }: Props) {
             tabIndex={0}
             onKeyDown={(e) => e.key === 'Enter' && pick()}
           >
-            <strong>zip 파일을 여기에 놓기</strong>
-            <span>또는 클릭해서 선택 · 최대 200MB</span>
+            <strong>{t('zip 파일을 여기에 놓기')}</strong>
+            <span>{t('또는 클릭해서 선택 · 최대 200MB')}</span>
           </div>
-          {fileError && <p className="conn-error">{fileError}</p>}
+          {fileError && <p className="conn-error">{t(fileError.key, fileError.vars)}</p>}
         </>
       ) : (
         <form
@@ -120,7 +123,7 @@ export default function SourceStep({ source, locked, onSource }: Props) {
           }}
         >
           <div className="field grow">
-            <label htmlFor="repo">저장소 주소</label>
+            <label htmlFor="repo">{t('저장소 주소')}</label>
             <input
               id="repo"
               className="input mono"
@@ -132,14 +135,14 @@ export default function SourceStep({ source, locked, onSource }: Props) {
             />
           </div>
           <div className="field branch">
-            <label htmlFor="branch">브랜치</label>
+            <label htmlFor="branch">{t('브랜치')}</label>
             <input id="branch" className="input mono" value={branch} onChange={(e) => setBranch(e.target.value)} />
           </div>
           <button className="btn" type="submit" disabled={!urlValid}>
-            가져오기
+            {t('가져오기')}
           </button>
           <p className="hint full">
-            {url && !urlValid ? 'github.com/소유자/저장소 형식의 주소를 넣어 주세요.' : 'public 저장소만 가져올 수 있습니다.'}
+            {url && !urlValid ? t('github.com/소유자/저장소 형식의 주소를 넣어 주세요.') : t('public 저장소만 가져올 수 있습니다.')}
           </p>
         </form>
       )}
@@ -150,21 +153,22 @@ export default function SourceStep({ source, locked, onSource }: Props) {
 }
 
 function Checklist() {
+  const t = useT()
   return (
     <div className="checklist">
-      <h3>같이 들어 있으면 분석이 정확해집니다</h3>
+      <h3>{t('같이 들어 있으면 분석이 정확해집니다')}</h3>
       <ul>
         <li>
-          <code>requirements.txt</code>, <code>package.json</code> 같은 의존성 파일
+          <code>requirements.txt</code>, <code>package.json</code> {t('같은 의존성 파일')}
         </li>
         <li>
-          <code>.env.example</code> — 실제 값 말고 변수 이름만
+          <code>.env.example</code> — {t('실제 값 말고 변수 이름만')}
         </li>
         <li>
-          <code>Dockerfile</code> — 없으면 새로 만들어 드립니다
+          <code>Dockerfile</code> — {t('없으면 새로 만들어 드립니다')}
         </li>
       </ul>
-      <p className="hint">node_modules, .venv, .env 는 빼고 올려 주세요.</p>
+      <p className="hint">{t('node_modules, .venv, .env 는 빼고 올려 주세요.')}</p>
     </div>
   )
 }

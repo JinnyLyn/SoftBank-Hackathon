@@ -111,6 +111,18 @@ class PlanError(Exception):
         self.retryable = retryable
 
 
+# 플랫폼 운영자의 자격 증명·실행 환경 문제. worker 혼자서는 회복할 수 없고, 운영자가 조치하면 같은 입력으로 성공한다
+OPERATOR_ERROR_RE = re.compile(
+    r"(?i)session has expired|reauthenticate|expiredtoken|token (?:has|is) expired|invalidclienttokenid|unrecognizedclient"
+    r"|unable to locate credentials|security token included in the request is invalid|signaturedoesnotmatch"
+    r"|cannot connect to the docker daemon|docker daemon is not running")
+
+
+def needs_operator(e):
+    """운영자가 조치해야 하는 실패인지(AWS 로그인 만료·자격 증명 없음, Docker 데몬 꺼짐). 오류 문장으로 판단한다"""
+    return bool(OPERATOR_ERROR_RE.search(str(e)))
+
+
 class CapacityWait(PlanError):
     """다른 계획이 예약한 Fargate vCPU 때문에 지금은 계획을 만들 수 없다. 그 계획이 처리되면 만들 수 있어서 실패로 세지 않고 기다린다."""
 
@@ -1433,13 +1445,13 @@ def list_projects(api, max_pages=10):
     return items
 
 
-def report_plan_failure(api, project_id, target, reason, retryable, attempts):
+def report_plan_failure(api, project_id, target, reason, retryable, attempts, kind=None):
     """계획 실패 이유를 백엔드에 남긴다(화면이 5분을 기다리지 않고 바로 보여 줌). 보고 실패는 계획 처리에 영향을 주지 않는다.
     이 API가 없는 예전 백엔드(404·405)면 조용히 넘어간다."""
     try:
         api.post(f"/api/worker/projects/{project_id}/plan-failures",
                  {"target": target, "reason": redact(reason)[:1000] or "알 수 없는 오류", "retryable": bool(retryable),
-                  "attempts": int(attempts)})
+                  "attempts": int(attempts), **({"kind": kind} if kind else {})})
     except ApiError as e:
         if e.status not in (404, 405):
             log(f"계획 실패 보고 실패(프로젝트 {project_id}): {e}")
@@ -1484,6 +1496,13 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
                 log(f"계획 대기(프로젝트 {pid}): {redact(str(e))[:300]}")
             state.waiting[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(잘못된 분석 결과 등)가 worker 전체를 멈추지 않게 한다
+            if needs_operator(e):
+                # 로그인 만료 등: 실패 횟수에 세지 않고 retry_after마다 다시 확인한다(운영자가 다시 로그인하면 이어서 계획). 화면에는 바로 알린다
+                if pid not in state.waiting:
+                    log(f"운영자 조치 필요(프로젝트 {pid}): {redact(str(e))[:300]}")
+                state.waiting[pid] = time.time()
+                report_plan_failure(api, pid, "aws", str(e), True, tries + 1, kind="operator")
+                continue
             # 다시 해도 같은 실패(예산 부족 등)는 바로 멈춘다. 같은 입력으로 몇 분씩 다시 시도하지 않게
             # 다시 해도 같은 실패인지는 오류의 성격으로만 정한다. 재시도 횟수를 다 쓴 일시 오류를 "입력 문제"로 보고하지 않게 (PR #45 리뷰)
             retryable = getattr(e, "retryable", True)
@@ -1491,7 +1510,7 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             expected = isinstance(e, (PlanError, ApiError, subprocess.TimeoutExpired, OSError))
             kind = "" if expected else f"{type(e).__name__}: "   # 예상한 오류가 아니면 종류를 남겨 원인을 찾게 한다
             log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {kind}{redact(str(e))[:300]}")
-            report_plan_failure(api, pid, "aws", f"{kind}{e}", retryable, tries + 1)
+            report_plan_failure(api, pid, "aws", f"{kind}{e}", retryable, tries + 1, kind=None if retryable else "input")
 
 
 def claim_path(cfg):

@@ -3,6 +3,7 @@ import CodeView from '../components/CodeView'
 import DomainProgress from '../components/DomainProgress'
 import { IS_MOCK } from '../api'
 import type { DeployStatus, DomainPlan } from '../types'
+import { t as tr, useT } from '../i18n'
 
 /** 배포 상태를 확인하지 못한 경우. 배포 실패와는 다름 */
 export interface PollIssue {
@@ -34,7 +35,7 @@ const LONG_STAGE_MS = 10 * 60_000
 function clock(ms: number): string {
   const sec = Math.max(0, Math.floor(ms / 1000))
   const m = Math.floor(sec / 60)
-  return m ? `${m}분 ${sec % 60}초` : `${sec}초`
+  return m ? tr('{m}분 {s}초', { m, s: sec % 60 }) : tr('{s}초', { s: sec })
 }
 
 /**
@@ -80,22 +81,23 @@ export default function DeployStep({
   onRestart,
   onHistory,
 }: Props) {
+  const t = useT()
+  const shownTarget = t(targetName)
   const issue = pollIssue && (
     <div className="poll-issue" role="alert">
       <div>
-        <strong>{pollIssue.kind === 'timeout' ? '배포 상태 확인이 늦어지고 있습니다' : '배포 상태를 확인하지 못했습니다'}</strong>
+        <strong>{pollIssue.kind === 'timeout' ? t('배포 상태 확인이 늦어지고 있습니다') : t('배포 상태를 확인하지 못했습니다')}</strong>
         <span>{pollIssue.message}</span>
         <span>
-          배포가 실패했다는 뜻은 아닙니다. 중복 배포를 막기 위해 자동으로 다시 배포하지 않으니, 상태를 다시 조회하거나 배포
-          이력에서 확인해 주세요.
+          {t('배포가 실패했다는 뜻은 아닙니다. 중복 배포를 막기 위해 자동으로 다시 배포하지 않으니, 상태를 다시 조회하거나 배포 이력에서 확인해 주세요.')}
         </span>
       </div>
       <div className="poll-actions">
         <button className="btn btn-ghost" onClick={onHistory}>
-          이력 보기
+          {t('이력 보기')}
         </button>
         <button className="btn btn-primary" onClick={onRepoll} disabled={repolling}>
-          {repolling ? '조회 중…' : '상태 다시 조회'}
+          {repolling ? t('조회 중…') : t('상태 다시 조회')}
         </button>
       </div>
     </div>
@@ -103,7 +105,7 @@ export default function DeployStep({
 
   const elapsed = useElapsed(status?.state === 'running', status?.log.length ?? 0)
 
-  if (!status) return issue || <p className="muted">배포를 시작하는 중…</p>
+  if (!status) return issue || <p className="muted">{t('배포를 시작하는 중…')}</p>
   const slow = elapsed && (elapsed.total > LONG_TOTAL_MS || elapsed.stage > LONG_STAGE_MS)
 
   return (
@@ -112,52 +114,51 @@ export default function DeployStep({
 
       {status.state === 'running' && !pollIssue && (
         <div className="state-line">
-          <span className="pulse" /> 이미지를 빌드하고 {targetName}에 올리는 중입니다. 보통 10분 안팎 걸려요.
-          {elapsed && <span className="muted small">경과 {clock(elapsed.total)}</span>}
+          <span className="pulse" /> {t('이미지를 빌드하고 {target}에 올리는 중입니다. 보통 10분 안팎 걸려요.', { target: shownTarget })}
+          {elapsed && <span className="muted small">{t('경과 {time}', { time: clock(elapsed.total) })}</span>}
         </div>
       )}
 
       {status.state === 'running' && !pollIssue && slow && elapsed && (
         <p className="hint" role="status">
           {elapsed.stage > LONG_STAGE_MS
-            ? `같은 단계가 ${clock(elapsed.stage)}째 이어지고 있어요. `
-            : '평소보다 오래 걸리고 있어요. '}
-          이미지를 받거나 올리는 중에 네트워크가 느리거나 끊기면 이렇게 될 수 있습니다. 작업에는 시간 한도가 있어서, 멈춘 경우 잠시 뒤 실패로
-          바뀌고 아래 로그에 이유가 남습니다. 그때 &lsquo;새 배포&rsquo;로 다시 시도해 주세요.
+            ? t('같은 단계가 {time}째 이어지고 있어요.', { time: clock(elapsed.stage) })
+            : t('평소보다 오래 걸리고 있어요.')}{' '}
+          {t('이미지를 받거나 올리는 중에 네트워크가 느리거나 끊기면 이렇게 될 수 있습니다. 작업에는 시간 한도가 있어서, 멈춘 경우 잠시 뒤 실패로 바뀌고 아래 로그에 이유가 남습니다. 그때 ‘새 배포’로 다시 시도해 주세요.')}
         </p>
       )}
 
       {status.state === 'success' && (
         <div className="done-card">
           <div>
-            <span className="done-label">{IS_MOCK ? 'MOCK: 앱 배포 완료 (예시, 실제로 배포되지 않음)' : '앱 배포 완료'}</span>
+            <span className="done-label">{IS_MOCK ? t('MOCK: 앱 배포 완료 (예시, 실제로 배포되지 않음)') : t('앱 배포 완료')}</span>
             {status.url ? (
               <a href={status.url} target="_blank" rel="noreferrer" className="mono">
                 {status.url}
               </a>
             ) : (
-              <span className="muted small">접속 주소를 아직 받지 못했습니다.</span>
+              <span className="muted small">{t('접속 주소를 아직 받지 못했습니다.')}</span>
             )}
             {/* 독립 도메인이 연결되기 전 주소는 미리보기. 도메인 연결 성공으로 보이지 않게 (PRODUCT_DIRECTION §2) */}
             {status.url && status.domain?.state !== 'active' && (
               <span className="muted small">
                 {domainMode === 'none' || !status.domain || status.domain.state === 'skipped'
-                  ? '미리보기 주소입니다. 도메인은 연결되지 않았습니다.'
-                  : '미리보기 주소입니다. 주소 연결은 아래에서 진행 중입니다.'}
+                  ? t('미리보기 주소입니다. 도메인은 연결되지 않았습니다.')
+                  : t('미리보기 주소입니다. 주소 연결은 아래에서 진행 중입니다.')}
               </span>
             )}
             {status.url && isAwsDefaultHttps(status.url) && (
               <span className="muted small">
-                AWS 기본 주소에는 이 주소용 HTTPS 인증서가 없어 브라우저가 &lsquo;안전하지 않음&rsquo; 경고를 띄울 수 있습니다. 앱은 정상이며, 경고 없는 주소는 도메인 연결 뒤에 생깁니다.
+                {t('AWS 기본 주소에는 이 주소용 HTTPS 인증서가 없어 브라우저가 ‘안전하지 않음’ 경고를 띄울 수 있습니다. 앱은 정상이며, 경고 없는 주소는 도메인 연결 뒤에 생깁니다.')}
               </span>
             )}
           </div>
           <div className="done-actions">
             <button className="btn btn-ghost" onClick={onHistory}>
-              이력 보기
+              {t('이력 보기')}
             </button>
             <button className="btn" onClick={onRestart}>
-              새 배포
+              {t('새 배포')}
             </button>
           </div>
         </div>
@@ -168,14 +169,14 @@ export default function DeployStep({
       {status.state === 'failed' && (
         <div className="diagnosis">
           <div className="diag-head">
-            <span className="diag-label">{status.diagnosis ? '배포 실패 · AI 진단' : '배포 실패'}</span>
+            <span className="diag-label">{status.diagnosis ? t('배포 실패 · AI 진단') : t('배포 실패')}</span>
           </div>
           {status.diagnosis ? (
             <>
               <dl>
-                <dt>원인</dt>
+                <dt>{t('원인')}</dt>
                 <dd>{status.diagnosis.cause}</dd>
-                <dt>수정안</dt>
+                <dt>{t('수정안')}</dt>
                 <dd>{status.diagnosis.fix}</dd>
               </dl>
               <div className="diff">
@@ -189,20 +190,20 @@ export default function DeployStep({
               </div>
             </>
           ) : (
-            <p className="fail-note">원인 진단이 아직 없습니다. 아래 배포 로그를 확인하고 원인을 고친 뒤 새로 배포해 주세요.</p>
+            <p className="fail-note">{t('원인 진단이 아직 없습니다. 아래 배포 로그를 확인하고 원인을 고친 뒤 새로 배포해 주세요.')}</p>
           )}
           <div className="diag-actions">
             <div className="done-actions">
               <button className="btn btn-ghost" onClick={onHistory}>
-                이력 보기
+                {t('이력 보기')}
               </button>
               <button className="btn" onClick={onRestart}>
-                새 배포
+                {t('새 배포')}
               </button>
             </div>
             {status.diagnosis && (
               <button className="btn btn-primary" onClick={onFix} disabled={fixing}>
-                {fixing ? '수정안 반영하는 중…' : '수정안 반영하고 다시 검토'}
+                {fixing ? t('수정안 반영하는 중…') : t('수정안 반영하고 다시 검토')}
               </button>
             )}
           </div>
@@ -211,9 +212,9 @@ export default function DeployStep({
 
       <div className="code-box">
         <div className="code-tabs">
-          <button className="is-on">배포 로그</button>
+          <button className="is-on">{t('배포 로그')}</button>
         </div>
-        <CodeView kind="log" text={status.log.length ? status.log : ['(아직 로그가 없습니다)']} follow />
+        <CodeView kind="log" text={status.log.length ? status.log : [t('(아직 로그가 없습니다)')]} follow />
       </div>
     </div>
   )

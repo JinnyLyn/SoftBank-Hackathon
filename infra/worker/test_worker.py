@@ -32,7 +32,7 @@ cmd="$1"; shift
 case "$cmd" in
   foundation-info)
     # 최신 foundation 출력(compact JSON, 마지막 줄). FAIL이면 실패, FAKE_FOUNDATION_JSON이 있으면 그 값, 없으면 캐시 파일, 아무것도 없으면 {}
-    [ "${FAKE_FOUNDATION_FAIL:-0}" = "0" ] || { echo "foundation 출력을 읽지 못했습니다" >&2; exit 1; }
+    [ "${FAKE_FOUNDATION_FAIL:-0}" = "0" ] || { echo "${FAKE_FOUNDATION_ERR:-foundation 출력을 읽지 못했습니다}" >&2; exit 1; }
     if [ -n "${FAKE_FOUNDATION_JSON:-}" ]; then echo "$FAKE_FOUNDATION_JSON"
     elif [ -f "$FAKE_DEPLOYMENTS/foundation.json" ]; then tr -d '\n' < "$FAKE_DEPLOYMENTS/foundation.json"; echo
     else echo '{}'; fi ;;
@@ -290,7 +290,7 @@ class Base(unittest.TestCase):
         self.log_file = self.tmp / "calls.log"
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
-        for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL",
+        for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL", "FAKE_FOUNDATION_ERR",
                   "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC",
                   "FAKE_BUILD_SRC_LOG", "FAKE_APPLY_URL"):
             os.environ.pop(k, None)
@@ -976,6 +976,30 @@ class PlannerTests(Base):
         pid, body = self.backend.plan_failures[0]
         self.assertEqual((pid, body["target"], body["retryable"], body["attempts"]), (p1["id"], "aws", False, 1))
         self.assertIn("월 예산 $10.00", body["reason"])
+
+    def test_expired_login_is_reported_as_operator_action_and_not_counted(self):
+        # AWS 로그인 만료: worker 혼자서는 회복할 수 없다. 실패 횟수에 세지 않고 기다리며 화면에는 바로 알린다
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        os.environ.update(FAKE_FOUNDATION_FAIL="1", FAKE_FOUNDATION_ERR="aws: [ERROR]: Your session has expired. Please reauthenticate using 'aws login'.")
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        for _ in range(state.max_tries + 1):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertNotIn(p1["id"], state.failures, "운영자 조치 필요는 실패로 세지 않아 다시 로그인하면 이어서 계획")
+        self.assertIn(p1["id"], state.waiting)
+        body = self.backend.plan_failures[-1][1]
+        self.assertEqual((body["kind"], body["retryable"]), ("operator", True))
+        self.assertIn("session has expired", body["reason"])
+        # 다시 로그인하면 같은 프로젝트를 이어서 계획한다
+        os.environ["FAKE_FOUNDATION_FAIL"] = "0"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)
+
+    def test_budget_failure_is_reported_as_input(self):
+        p1, _ = self.two_projects(budget="10.0000")
+        self.backend.projects = [p1]
+        worker.plan_pending(self.api, self.cfg, worker.State(retry_after=0.0, recheck_after=0.0))
+        self.assertEqual(self.backend.plan_failures[0][1]["kind"], "input")
 
     def test_plan_failure_report_tolerates_old_backend(self):
         p1, _ = self.two_projects(budget="10.0000")
