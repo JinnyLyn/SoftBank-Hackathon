@@ -74,10 +74,11 @@ export interface Tier {
   /** worker가 매긴 금액 순위: 최저·평균·최대 */
   rankLabel?: string
   /**
-   * 이 안의 Terraform 계획이 있는지. false 면 비교용(예상 비용만 있음)이라 고를 수 없음.
-   * 다른 안으로 다시 계획하는 경로가 생기면 고를 수 있게 바꿈
+   * 이 안의 Terraform 계획이 있는지. false 면 비교용(예상 비용만 있음): 누르면 이 안으로 다시 계획을 요청함
    */
   planned?: boolean
+  /** 코드(비용 계산)가 추천한 안인지. 사용자가 다른 안을 골라 다시 계획해도 추천 표시는 이 안에 남음 */
+  suggested?: boolean
 }
 
 /** 연결된 배포 대상 하나에서 가능한 구성들 */

@@ -68,7 +68,7 @@ python ai/runner.py --once    # 한 번만 점검
 1. `GET /api/projects` 로 프로젝트를 읽고(`next_cursor` 따라 최대 10페이지), `GET /analyses/latest` 가 404인 것만 처리
 2. `{UPLOAD_DIR}/{project_id}.zip` 을 읽고(없으면 `WORKER_API_TOKEN`으로 `GET /api/worker/projects/{id}/source`에서 받음) **SHA-256이 프로젝트에 기록된 값과 같을 때만** 분석 (다르면 멈춤)
 3. 분석 결과에 비밀값이 남지 않았는지 확인한 뒤 `POST /api/projects/{id}/analyses`
-4. 실패하면 2분 뒤 다시, 3번 실패하면 그 프로젝트는 멈춤. 지문 불일치·삭제·형식 오류처럼 다시 보내도 같은 실패는 바로 멈춤
+4. 실패하면 30초 뒤 다시(화면의 5분 대기 안에 끝나도록), 3번 실패하면 그 프로젝트는 멈춤. 지문 불일치·삭제·형식 오류처럼 다시 보내도 같은 실패는 바로 멈춤
 5. 로그에는 프로젝트 ID·이름·결과 요약만 남긴다
 
 LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 못 찾은 값만 LLM에 묻는다. 없거나 실패하면 규칙 결과만 기록한다.
@@ -87,7 +87,9 @@ LLM 키(`OLLAMA_API_KEY`, 없으면 `ANTHROPIC_API_KEY`)가 있으면 규칙이 
 | 검증 | 근거 파일·줄이 실제로 있고 그 줄에 값이 들어 있어야 받아들임. 아니면 버리고 `unresolved` 유지 |
 | 비밀값 | 보내기 직전에 다시 가림. 업로드 코드 속 문장은 지시가 아니라 데이터라고 프롬프트에 밝힘 |
 | 표시 | 결과의 `ai.filled` 에 LLM이 채운 값 이름, `findings` 에 "AI가 채운 값" 안내 |
-| 실패 | 키 없음·인증·한도·연결 오류는 규칙 결과만 기록 (`findings` 에 이유) |
+| 실패 | 키 없음·인증·한도·연결 오류는 규칙 결과만 기록 (`findings` 에 이유). 프로젝트 하나의 예상 못 한 오류는 그 프로젝트만 다시 시도하고 분석기는 계속 돈다 |
+| 시간 상한 | LLM 단계 전체 60초(재시도 포함, `PAVED_AI_LLM_TIMEOUT` 5~600). 시간 초과·연결·429·5xx만 남은 시간이 있으면 한 번 더 묻고, 인증·요청 오류는 바로 규칙 결과로. Anthropic SDK 자체 재시도는 끔 |
+| 크기 상한 | 출력 4096토큰(실제 답은 200토큰 안팎), 프롬프트 6만 자, 1.2만 자를 넘는 파일은 포트·경로·listen 같은 단서 줄 앞뒤만 보냄(원래 줄 번호 유지, 근거 검증은 전체 파일로) |
 | 사용량 | 호출마다 입력·출력 토큰과 걸린 시간을 runner 로그와 결과 `ai.usage` 에 기록 (AGENTS.md §7) |
 | 캐시 | 가린 뒤의 프롬프트·프롬프트/스키마 버전(`PROMPT_VERSION`)·제공자·모델이 같으면 예전 답을 다시 씀. 꺼낸 답도 근거 검증을 다시 함. 정상 종료한 답만 저장. 저장소 밖 `~/.cache/paved-ai/llm` (`PAVED_AI_CACHE_DIR`), `PAVED_AI_CACHE=off` 로 끔 |
 | Dockerfile 초안 | Dockerfile이 없으면 규칙 템플릿으로 초안을 만들어 `dockerfile_draft` 로 전달 (LLM 미사용, `paved_ai/dockerfile.py`). 진입점을 확정 못 하면 만들지 않음 |

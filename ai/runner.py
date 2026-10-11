@@ -54,7 +54,9 @@ DEFAULT_UPLOAD_DIR = Path(__file__).resolve().parents[1] / "back" / "data" / "up
 DOTENV = Path(__file__).resolve().parent / ".env"
 REQUEST_TIMEOUT = 20
 MAX_FAILURES = 3  # 같은 프로젝트가 이만큼 실패하면 멈춤
-RETRY_AFTER = 120  # 실패한 프로젝트는 2분 뒤에 다시
+# 실패한 프로젝트는 30초 뒤에 다시. 화면은 분석을 5분까지 기다리므로, 세 번 시도해도 그 안에 끝나도록 짧게
+RETRY_AFTER = 30
+DOWNLOAD_TIMEOUT = 60  # 소스 ZIP 다운로드 상한(초)
 MAX_PAGES = 10
 
 log = logging.getLogger("ai-runner")
@@ -95,7 +97,7 @@ class Api:
         req = urllib.request.Request(f"{self.base}/api/worker/projects/{urllib.parse.quote(project_id)}/source")
         req.add_header("X-Worker-Token", self._worker_token or "")
         try:
-            with urllib.request.urlopen(req, timeout=max(self.timeout, 120)) as res:
+            with urllib.request.urlopen(req, timeout=max(self.timeout, DOWNLOAD_TIMEOUT)) as res:
                 data = res.read(MAX_SOURCE_BYTES + 1)
         except urllib.error.HTTPError as e:
             raise ApiError(e.code, "소스를 내려받지 못했습니다" + (" (worker 토큰 확인)" if e.code in (401, 403) else "")) from None
@@ -237,7 +239,8 @@ def _make_anthropic():
     # 워크스페이스에 묶이지 않은 키는 요청마다 워크스페이스 ID가 필요함 (없으면 400)
     workspace = os.environ.get("ANTHROPIC_WORKSPACE_ID")
     headers = {"anthropic-workspace-id": workspace} if workspace else None
-    return anthropic.Anthropic(timeout=120.0, max_retries=2, default_headers=headers)
+    # 재시도·시간 상한은 llm.py가 LLM 단계 전체 예산 안에서 직접 한다(SDK 재시도가 겹치면 예산을 넘김)
+    return anthropic.Anthropic(timeout=60.0, max_retries=0, default_headers=headers)
 
 
 def analyze_project(
@@ -263,6 +266,7 @@ def analyze_project(
     except SourceError as e:
         raise RunnerError(str(e), permanent=True) from None
 
+    started = time.monotonic()
     analysis = analyze_files(files)
     if llm is not None and analysis.unresolved:
         try:
@@ -276,6 +280,7 @@ def analyze_project(
         except LlmUnavailable as e:
             log.warning("프로젝트 %s LLM 보조를 건너뜁니다: %s", project["id"], e)
             analysis.info("AI 보조 분석을 하지 못했습니다", f"{e} 규칙으로 찾은 값만 기록합니다.")
+    log.info("프로젝트 %s 분석 %.1f초 (파일 %d개)", project["id"], time.monotonic() - started, len(files))
     result = analysis.to_result(scale=scale_from_project(project))
     unsafe = backend_unsafe_paths(result)
     if unsafe:
@@ -343,6 +348,13 @@ def run_once(
                 # 404(프로젝트 삭제), 409(ZIP 변경), 422(형식) 등은 다시 보내도 같음
                 _fail(state, pid, f"{e.status} {e.message}", permanent=True, now=now)
             continue
+        except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(코드 버그 등)로 분석기 전체가 멈추지 않게
+            if progress:
+                progress.error()
+            counts["failed"] += 1
+            log.exception("프로젝트 %s 분석 중 예상하지 못한 오류", pid)
+            _fail(state, pid, f"예상하지 못한 오류 {type(e).__name__}", permanent=False, now=now)
+            continue
 
         finally:
             if progress:
@@ -363,7 +375,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="분석 결과가 없는 프로젝트를 분석해 백엔드에 기록")
     parser.add_argument("--api-url", default=os.getenv("PLATFORM_API_URL", DEFAULT_API))
     parser.add_argument("--upload-dir", type=Path, default=Path(os.getenv("UPLOAD_DIR", DEFAULT_UPLOAD_DIR)))
-    parser.add_argument("--poll", type=float, default=5.0, help="점검 간격(초)")
+    parser.add_argument("--poll", type=float, default=2.0, help="점검 간격(초)")
     parser.add_argument("--once", action="store_true", help="한 번만 점검")
     parser.add_argument("--model", default=None, help="비우면 PAVED_AI_MODEL, 그다음 고른 LLM의 기본 모델")
     parser.add_argument("--no-llm", action="store_true", help="LLM을 부르지 않고 규칙 분석만")

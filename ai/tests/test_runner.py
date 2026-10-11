@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -267,6 +268,24 @@ class RunnerTests(unittest.TestCase):
         for i in range(5):
             self.add_project(f"p{i}")
         self.assertEqual(self.run_once()["recorded"], 5)
+
+    def test_unexpected_error_in_one_project_does_not_stop_others(self):
+        self.add_project("bad")
+        self.add_project("good")
+        real = runner.analyze_project
+
+        def flaky(project, *args, **kwargs):
+            if project["id"] == "bad":
+                raise KeyError("code bug")
+            return real(project, *args, **kwargs)
+
+        with mock.patch.object(runner, "analyze_project", flaky):
+            counts = self.run_once()
+        self.assertEqual((counts["recorded"], counts["failed"]), (1, 1))
+        self.assertIn("good", self.backend.analyses)
+        self.assertNotIn("bad", self.state.stopped, "한 번의 예상 밖 오류로 멈추지 않고 다시 시도")
+        self.assertEqual(self.state.retry_at["bad"], self.now + runner.RETRY_AFTER)
+        self.assertLessEqual(runner.RETRY_AFTER * runner.MAX_FAILURES, 120, "재시도가 화면의 5분 대기 안에 끝남")
 
     def test_backend_down_does_not_crash(self):
         down = runner.Api("http://127.0.0.1:9", timeout=1)

@@ -223,8 +223,10 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
     const extra = {
       rankLabel: RANK_LABEL[str(o.rank)],
       usualUsd: Number.isFinite(usual) ? usual : undefined,
+      suggested: o.recommended === true,
     }
-    if (o.recommended === true || key === p.variables.tier) {
+    // 계획이 있는 안은 계획 변수의 tier 하나. 사용자가 다른 안을 고르면 worker가 그 안으로 계획하고 추천 표시(o.recommended)는 그대로
+    if (key === p.variables.tier) {
       out.push({ key, tier: { ...toTier(p, key), ...extra, planned: true } })
       continue
     }
@@ -373,6 +375,25 @@ function toBundle(p: PlanOut): TerraformBundle {
  * OTHER_TARGET_GRACE_MS 동안 더 기다린 뒤 있는 것만으로 진행 (한 대상의 계획 생성이 막혀도 다른 대상으로 배포할 수 있게)
  * AWS만 켠 기본 설정은 예전처럼 AWS 계획이 오면 바로 끝남
  */
+interface PlanFailureOut {
+  target: string
+  reason: string
+  /** false면 같은 입력으로는 다시 해도 실패(예: 예산 안에 드는 구성이 없음) → 더 기다리지 않음 */
+  retryable: boolean
+  attempts: number
+  updated_at: string
+}
+
+/** worker가 계획을 만들지 못한 이유(대상별 최신). 이 API가 없는 예전 백엔드면 빈 목록 */
+async function planFailures(projectId: string): Promise<PlanFailureOut[]> {
+  try {
+    return await req<PlanFailureOut[]>(`/projects/${projectId}/plan-failures`)
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405)) return []
+    throw e
+  }
+}
+
 async function waitForPlans(projectId: string, want: { aws: boolean; local: boolean }): Promise<PlanOut[]> {
   const timeoutMs = 5 * 60 * 1000
   const until = Date.now() + timeoutMs
@@ -382,15 +403,29 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
     const waiting = list.filter(
       (p) => p.status === 'awaiting_approval' && (isLocal(p) ? want.local : want.aws && p.target === 'aws'),
     )
+    const hasAws = waiting.some((p) => !isLocal(p))
+    const hasLocal = waiting.some(isLocal)
     if (waiting.length) {
       if (!firstSeen) firstSeen = Date.now()
-      const complete = (!want.aws || waiting.some((p) => !isLocal(p))) && (!want.local || waiting.some(isLocal))
+      const complete = (!want.aws || hasAws) && (!want.local || hasLocal)
       if (complete || Date.now() - firstSeen > OTHER_TARGET_GRACE_MS) return waiting
+    }
+    // 다시 해도 같은 실패(예산 부족 등)를 worker가 알렸으면 그 대상은 더 기다리지 않음
+    const final = (await planFailures(projectId)).filter((f) => !f.retryable)
+    const awsFailed = want.aws && !hasAws && final.some((f) => f.target === 'aws')
+    const localFailed = want.local && !hasLocal && final.some((f) => f.target === LOCAL)
+    const settled = (!want.aws || hasAws || awsFailed) && (!want.local || hasLocal || localFailed)
+    if (settled && waiting.length) return waiting
+    if (settled && (awsFailed || localFailed)) {
+      const reasons = final.filter((f) => (f.target === 'aws' ? awsFailed : localFailed)).map((f) => f.reason)
+      throw new ApiError(422, `배포 계획을 만들지 못했습니다. ${reasons.join(' / ')} 처음 화면에서 사용 규모·월 예산을 바꿔 다시 시작해 주세요.`)
     }
     if (Date.now() > until)
       throw new ApiError(
         408,
-        `${Math.round(timeoutMs / 60000)}분 동안 기다렸지만 배포 계획이(가) 오지 않았습니다. 배포 계획은 인프라 worker(infra/worker)가 만듭니다. worker가 실행 중인지 확인한 뒤 다시 기다려 주세요.`,
+        `${Math.round(timeoutMs / 60000)}분 동안 기다렸지만 배포 계획이 오지 않았습니다. ` +
+          '월 예산이 가장 작은 구성의 비용보다 낮으면 인프라 worker가 계획을 만들지 않습니다(서버에 실패 이유를 알리는 기능은 아직 없음). ' +
+          '예산을 올려 처음부터 다시 시작하거나, 인프라 worker(infra/worker)가 실행 중인지 확인해 주세요.',
       )
     await wait(2000)
   }
@@ -583,6 +618,17 @@ export async function history(): Promise<DeployRecord[]> {
     url: r.url ?? undefined,
     createdAt: r.createdAt,
   }))
+}
+
+/** 비교표의 다른 안으로 다시 계획해 달라고 요청. 승인 대기 계획은 대체되고 worker가 그 안으로 새 계획을 만듦(새로 승인 필요) */
+export async function requestTier(projectId: string, tier: TierKey): Promise<void> {
+  try {
+    await req(`/projects/${projectId}/plan-requests`, send('POST', { target: 'aws', tier }))
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405))
+      throw new ApiError(501, '서버가 아직 다른 안으로 다시 계획하는 기능을 지원하지 않습니다.')
+    throw e
+  }
 }
 
 // ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------

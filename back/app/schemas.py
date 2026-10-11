@@ -26,7 +26,21 @@ class ProjectOut(APIModel):
     traffic_pattern: Literal["steady", "peak", "unknown"] | None = None
     monthly_budget_usd: Decimal | None = None
     purpose: str | None = None
+    # 사용자가 비교표에서 고른 구성 단계(없으면 worker가 추천 안으로 계획)
+    requested_tier: Literal["lean", "balanced", "roomy"] | None = None
     created_at: datetime
+
+
+class PlanRequestIn(APIModel):
+    """비교표의 다른 안으로 다시 계획해 달라는 요청. 지금은 AWS만(로컬 Docker는 안이 하나)"""
+    target: Literal["aws"] = "aws"
+    tier: Literal["lean", "balanced", "roomy"]
+
+
+class PlanRequestOut(APIModel):
+    project_id: UUID
+    target: Literal["aws"]
+    tier: Literal["lean", "balanced", "roomy"]
 
 
 class GitHubProjectIn(APIModel):
@@ -115,6 +129,22 @@ class ConnectionCompleteIn(APIModel):
 
 class ConnectionFailIn(APIModel):
     error: str = Field(min_length=1, max_length=2000)
+
+
+class PlanFailureIn(APIModel):
+    """worker가 계획을 만들지 못한 이유. retryable=False면 같은 입력으로는 다시 해도 실패(예: 예산 부족)"""
+    target: Literal["aws", "local_docker"]
+    reason: str = Field(min_length=1, max_length=1000)
+    retryable: bool
+    attempts: int = Field(ge=1, le=1000)
+
+
+class PlanFailureOut(APIModel):
+    target: Literal["aws", "local_docker"]
+    reason: str
+    retryable: bool
+    attempts: int
+    updated_at: datetime
 
 
 class FrontDeployStatus(APIModel):

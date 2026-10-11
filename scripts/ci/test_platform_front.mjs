@@ -137,6 +137,59 @@ await checkBundle('local_docker');
 await checkBundle('aws', ['python', '-m', 'app.initialize_database']);
 await checkMixedRecommendation(150, 'aws');
 await checkMixedRecommendation(100, 'local-docker');
+
+// worker가 "다시 해도 같은 실패"(예산 부족)를 알리면 5분을 기다리지 않고 그 이유로 바로 끝난다. 예전 백엔드(404)는 계속 기다린다
+{
+  const reason = '월 예산 $30.00 안에 들어가는 구성이 없습니다.';
+  let failures = [];
+  const calls = [];
+  const http = {
+    req: async (path) => {
+      calls.push(path);
+      if (path === '/projects/p-budget/plans') return [];
+      if (path === '/projects/p-budget/plan-failures') {
+        if (failures === 404) throw new http.ApiError(404, 'Not Found');
+        return failures;
+      }
+      throw new Error(`Unexpected HTTP request: ${path}`);
+    },
+    ApiError: class extends Error { constructor(status, message) { super(message); this.status = status; } },
+  };
+  const api = loadTs('../../front/src/api/real.ts', {
+    './http': http, '../format': format, '../providers': { isEnabled: (provider) => provider === 'aws' },
+  });
+  failures = [{ target: 'aws', reason, retryable: false, attempts: 1, updated_at: '2026-10-11T00:00:00Z' }];
+  await assert.rejects(api.recommend('p-budget', scale), (e) => e.status === 422 && e.message.includes(reason));
+  assert.deepEqual(calls, ['/projects/p-budget/plans', '/projects/p-budget/plan-failures']);
+  // 다시 시도할 수 있는 실패(retryable)나 예전 백엔드(404)면 바로 끝내지 않는다: 첫 확인 뒤 대기 상태로 남는지만 본다
+  const final = failures;
+  for (const pending of [[{ ...final[0], retryable: true }], 404]) {
+    failures = pending;
+    calls.length = 0;
+    let settled = false;
+    const run = api.recommend('p-budget', scale).then(() => { settled = true; }, (e) => { settled = true; throw e; });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(settled, false);
+    assert.deepEqual(calls, ['/projects/p-budget/plans', '/projects/p-budget/plan-failures']);
+    failures = final;   // 다음 확인(2초 뒤)에서 최종 실패가 보이면 끝난다
+    await assert.rejects(run, (e) => e.status === 422);
+  }
+  // 다른 안으로 다시 계획 요청: 본문과 예전 백엔드(404) 안내
+  const posts = [];
+  http.req = async (path, init) => {
+    posts.push([path, JSON.parse(init.body)]);
+    if (posts.length > 1) throw new http.ApiError(404, 'Not Found');
+    return { project_id: 'p-budget', target: 'aws', tier: 'roomy' };
+  };
+  const api2 = loadTs('../../front/src/api/real.ts', {
+    './http': { ...http, send: (method, body) => ({ method, body: JSON.stringify(body) }) }, '../format': format,
+    '../providers': { isEnabled: (provider) => provider === 'aws' },
+  });
+  await api2.requestTier('p-budget', 'roomy');
+  assert.deepEqual(posts[0], ['/projects/p-budget/plan-requests', { target: 'aws', tier: 'roomy' }]);
+  await assert.rejects(api2.requestTier('p-budget', 'lean'), (e) => e.status === 501);
+  console.log('PASS: 계획 실패 보고 — 다시 해도 같은 실패는 즉시 이유 표시, 재시도 가능·예전 백엔드는 계속 대기');
+}
 console.log('PASS: 공개 recommend/generate 어댑터 회귀 5개 (로컬 초기화 있음·없음, AWS, 혼합 대상의 예산 내·초과)');
 
 // Dedicated local service: immutable identity, no global provider/connection/domain requests.
