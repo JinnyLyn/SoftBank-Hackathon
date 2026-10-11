@@ -98,6 +98,13 @@ code { font-family: var(--mono); font-size: 12px; background: var(--sunken); bor
 .lang-switch button.is-on { background: var(--marking); color: var(--asphalt); font-weight: 700; }
 .lang-switch button:focus-visible { outline: 2px solid var(--marking); outline-offset: 1px; }
 
+/* ---------- 운영 알림 띠 (SSE) ---------- */
+.alert-bar { background: var(--marking-soft); border-bottom: 1px solid var(--marking); }
+.alert-item { max-width: 1120px; margin: 0 auto; padding: 10px 24px; display: flex; align-items: flex-start; gap: 10px; font-size: 13.5px; color: var(--ink); }
+.alert-item > span:nth-child(2) { flex: 1; }
+.alert-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fail); margin-top: 5px; flex-shrink: 0; }
+@media (max-width: 640px) { .alert-item { padding: 10px 16px; } }
+
 /* ---------- layout ---------- */
 .container { max-width: 1120px; margin: 0 auto; padding: 32px 24px 72px; }
 .page { display: flex; flex-direction: column; gap: 16px; }

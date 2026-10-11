@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import Header, { type Page } from './components/Header'
+import AlertBar from './components/AlertBar'
 import NewDeploy from './pages/NewDeploy'
 import History from './pages/History'
 import { IS_MOCK } from './api'
@@ -12,6 +13,7 @@ export default function App() {
   return (
     <>
       <Header page={page} onChange={setPage} />
+      <AlertBar />
       {IS_MOCK && (
         <div className="mock-banner" role="note">
           <strong>MOCK</strong> {t('백엔드 없이 예시 데이터로 동작합니다. 분석, 비용, 배포 결과는 실제가 아닙니다.')}

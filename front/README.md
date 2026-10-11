@@ -71,6 +71,11 @@ npm run build
 - **plan 요약 개수**: 추가/변경/삭제 개수를 주는 필드가 없어 `-` 로 표시.
 - **실패 후 수정**: 수정안 반영 API(`/fix`)가 없어 안내 문구로 실패 처리. `status` 의 `diagnosis` 는 `{cause, fix, patch: {file, before, after}}` 형태일 때 화면에 나옴.
 
+## 운영 알림 (SSE)
+
+- 화면 위 알림 띠(`components/AlertBar.tsx`)가 `GET /api/alerts/stream`을 `EventSource`로 받는다(`api/alerts.ts`). 서버→브라우저 한 방향이라 WebSocket 없이 SSE를 쓰고, 끊기면 브라우저가 이어 받는다. MOCK 모드에서는 구독하지 않는다.
+- 지금 알림은 서버 용량 하나다: 자동 확장이 최대 대수를 다 쓰고도 CPU가 80% 이상인 앱. 알림일 뿐 구성은 바뀌지 않고, 더 큰 안으로 다시 계획·승인하도록 안내한다.
+
 ## 화면 언어 (한국어·일본어)
 
 - 상단 바 오른쪽 끝(온프레미스 화면은 헤더 오른쪽)의 `한국어 | 日本語` 스위치로 바꾼다. 고른 언어는 브라우저에 저장(`localStorage` `paved-lang`)하고 `<html lang>`도 바꾼다.
