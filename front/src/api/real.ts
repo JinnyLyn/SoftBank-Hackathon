@@ -389,6 +389,9 @@ interface PlanFailureOut {
   reason: string
   /** false면 같은 입력으로는 다시 해도 실패(예: 예산 안에 드는 구성이 없음) → 더 기다리지 않음 */
   retryable: boolean
+  /** input: 다시 해도 같은 실패, operator: 운영자 조치 필요(AWS 로그인 만료 등), transient: 일시 오류. 예전 백엔드는 없음 */
+  kind?: 'input' | 'operator' | 'transient'
+
   attempts: number
   updated_at: string
 }
@@ -403,9 +406,15 @@ async function planFailures(projectId: string): Promise<PlanFailureOut[]> {
   }
 }
 
+/** 서버 시각(UTC, 시간대 표시 없을 수 있음) → ms */
+const serverTime = (s: string) => Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(s) ? s : s + 'Z')
+/** 서버·브라우저 시계 차이 허용(ms) */
+const CLOCK_SLACK_MS = 10 * 1000
+
 async function waitForPlans(projectId: string, want: { aws: boolean; local: boolean }): Promise<PlanOut[]> {
   const timeoutMs = 5 * 60 * 1000
-  const until = Date.now() + timeoutMs
+  const startedAt = Date.now()
+  const until = startedAt + timeoutMs
   let firstSeen = 0
   for (;;) {
     const list = await req<PlanOut[]>(`/projects/${projectId}/plans`)
@@ -420,7 +429,20 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
       if (complete || Date.now() - firstSeen > OTHER_TARGET_GRACE_MS) return waiting
     }
     // 다시 해도 같은 실패(예산 부족 등)를 worker가 알렸으면 그 대상은 더 기다리지 않음
-    const final = (await planFailures(projectId)).filter((f) => !f.retryable)
+    const failures = await planFailures(projectId)
+    // 운영자 조치 필요(AWS 로그인 만료 등): 기다려도 운영자가 조치하기 전에는 오지 않으므로 바로 알림.
+    // 다시 기다리기를 눌렀을 때 조치 전의 옛 기록으로 곧바로 끝나지 않게, 기다리기 시작한 뒤의 보고만 봄
+    const operator = failures.find(
+      (f) => f.kind === 'operator' && f.target === 'aws' && want.aws && !hasAws && serverTime(f.updated_at) >= startedAt - CLOCK_SLACK_MS,
+    )
+    if (operator && !waiting.length)
+      throw new ApiError(
+        503,
+        t("플랫폼의 AWS 로그인이 만료됐거나 자격 증명이 없어 배포 계획을 만들 수 없습니다. 운영자가 다시 로그인한 뒤 '다시 기다리기'를 눌러 주세요. ({reason})", {
+          reason: operator.reason,
+        }),
+      )
+    const final = failures.filter((f) => (f.kind ? f.kind === 'input' : !f.retryable))
     const awsFailed = want.aws && !hasAws && final.some((f) => f.target === 'aws')
     const localFailed = want.local && !hasLocal && final.some((f) => f.target === LOCAL)
     const settled = (!want.aws || hasAws || awsFailed) && (!want.local || hasLocal || localFailed)
@@ -436,7 +458,7 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
       throw new ApiError(
         408,
         t('{n}분 동안 기다렸지만 배포 계획이 오지 않았습니다. ', { n: Math.round(timeoutMs / 60000) }) +
-          t('월 예산이 가장 작은 구성의 비용보다 낮으면 인프라 worker가 계획을 만들지 않습니다(서버에 실패 이유를 알리는 기능은 아직 없음). ') +
+          t('실패 이유가 오지 않았으니 인프라 worker가 멈췄거나 아직 앞선 작업을 처리 중일 수 있습니다. ') +
           t('예산을 올려 처음부터 다시 시작하거나, 인프라 worker(infra/worker)가 실행 중인지 확인해 주세요.'),
       )
     await wait(2000)
