@@ -32,6 +32,9 @@ export default function ReviewStep({
   const { plan } = bundle
   const cost = tierTotal(tier)
   const isServer = PROVIDERS[target.provider].kind === 'server'
+  // 실제 백엔드 계획이면 주소는 계획이 정함(MOCK에는 planInfo가 없어 고른 도메인 계획을 그대로 보여 줌)
+  const real = !!bundle.planInfo
+  const planned = bundle.planInfo?.domain
   const planLabel = bundle.tool === 'terraform' ? 'terraform plan' : t('compose 변경 사항')
   const targetName = t(target.name)
 
@@ -93,7 +96,7 @@ export default function ReviewStep({
         </div>
         <div>
           <span>{t('도메인')}</span>
-          <strong>{domainSummary(domain)}</strong>
+          <strong>{domainSummary(domain, real, planned)}</strong>
         </div>
       </div>
 
@@ -113,7 +116,7 @@ export default function ReviewStep({
           </tr>
           <tr>
             <td>{t('주소')}</td>
-            <td className="muted mono">{domainDetail(domain, isServer)}</td>
+            <td className="muted mono">{domainDetail(domain, isServer, real, planned)}</td>
             <td className="num">{domain && domain.monthlyUsd > 0 ? usd(domain.monthlyUsd) : '-'}</td>
           </tr>
         </tbody>
@@ -203,13 +206,21 @@ export default function ReviewStep({
   )
 }
 
-function domainSummary(domain: DomainPlan | null) {
-  if (!domain || domain.mode === 'none') return tr('미리보기 주소')
-  return domain.mode === 'auto' ? tr('자동 주소 (플랫폼)') : tr('보유 도메인')
+/**
+ * 자동 주소를 골랐어도 실제 주소는 계획(planned = variables.domain)이 정함. 실제 백엔드 계획(planInfo)인데 주소가 없으면
+ * 운영 환경에 자동 주소가 준비되지 않았거나 로컬 Docker 대상이라 미리보기 주소로 배포됨
+ */
+const previewOnly = (domain: DomainPlan | null, real: boolean, planned?: string) =>
+  !domain || domain.mode === 'none' || (domain.mode === 'auto' && real && !planned)
+
+function domainSummary(domain: DomainPlan | null, real: boolean, planned?: string) {
+  if (previewOnly(domain, real, planned)) return tr('미리보기 주소')
+  return domain?.mode === 'auto' ? tr('자동 주소 (플랫폼)') : tr('보유 도메인')
 }
 
-function domainDetail(domain: DomainPlan | null, isServer: boolean) {
-  if (!domain || domain.mode === 'none')
+function domainDetail(domain: DomainPlan | null, isServer: boolean, real: boolean, planned?: string) {
+  if (previewOnly(domain, real, planned))
     return isServer ? tr('이 PC의 로컬 주소 (HTTP, 도메인·HTTPS 없음)') : tr('AWS 기본 주소 (미리보기, 도메인 미연결)')
-  return `${domain.name ?? tr('배포 뒤 확정')} (${domain.mode === 'auto' ? tr('플랫폼 도메인의 자동 주소') : tr('가지고 있는 도메인 연결')})`
+  if (planned) return `https://${planned} (${tr('플랫폼 도메인의 자동 주소')})`
+  return `${domain?.name ?? tr('배포 뒤 확정')} (${domain?.mode === 'auto' ? tr('플랫폼 도메인의 자동 주소') : tr('가지고 있는 도메인 연결')})`
 }

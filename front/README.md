@@ -13,6 +13,7 @@ React + TypeScript + Vite.
 - 기존 확보 도메인 연결 시연(A)과 신규 구매부터의 자동화(B)는 별개다. 이번 시연의 최종 선택은 [남은 결정](../docs/OPEN_QUESTIONS.md)에서 확인하며, 구매 UI를 만들었다는 이유로 B 전체를 확정하지 않는다.
 - 10/10 확인한 개인 브랜치 `JinVibe:f169d27`에는 보유/구매/나중에 화면·MOCK·제안 API가 있다. 그 README는 백엔드·인프라 미구현, 진행 상태는 MOCK이라고 명시한다. 이 문서 수정으로 해당 코드가 main에 통합되지는 않는다.
 - 실제 지원한 경로만 사용자에게 완료로 보여준다. API 미지원으로 AWS 기본 주소를 쓰는 경우는 미리보기/도메인 미연결 상태이며, 독립 도메인 연결 성공으로 표시하지 않는다. 수동 DNS 입력 안내는 자동화 완료가 아니다.
+- 실제 연동된 것은 **자동 주소(auto)**뿐이다. 서버는 `PUT /domain`(auto)에 주소 없이(`name: null`) 답하고, worker가 계획 때 정한 `https://<배포 ID>.<플랫폼 도메인>`을 계획 변수 `domain`으로 준다. 승인 화면은 이 값을 보여 주고, 계획에 없으면(운영 환경에 자동 주소 미설정·로컬 Docker) 미리보기 주소로 표시한다. worker가 `healthy` 전에 그 주소의 HTTPS 응답을 확인하므로, 성공한 배포의 `status.domain`은 `active`이고 주소가 열리지 않으면 배포 자체가 `failed`로 끝난다(도메인 없는 배포는 `skipped`). 자동 주소도 운영자 도메인 아래 주소라 사용자 독립 도메인 연결 완료가 아니다.
 
 ## 실행
 
@@ -65,7 +66,7 @@ npm run build
 
 - **분석 결과(`result`) 형태**: 백엔드가 고정하지 않음. 화면은 `stack`(`[{label, value}]`), `findings`(`[{level: info|warn, title, detail}]`), `evidence`(문자열 또는 `{file, line, text}`)를 읽고, 없으면 최상위 값들을 스택 표로 보여 줌. LLM 담당과 합의 필요.
 - **계획 변수 중 화면용 키**: `tier`(lean/balanced/roomy), `recommended`(true면 추천), `headline`, `tradeoff`, `reason`, `resources`(`[{service, spec, monthlyUsd, why}]`). 없으면 비용 순서로 크기를 정하고 계획 전체를 한 줄로 보여 줌.
-- **도메인(제안 API, 백엔드·인프라 미구현)**: 선택지는 **자동 주소**(플랫폼 도메인 아래 서버가 정한 주소, Vercel 방식, 기본)와 **가지고 있는 도메인**(후순위). `PUT /api/projects/{id}/domain` `{mode: auto|own, name}`(auto는 `name: null`) → `{mode, name(auto면 서버가 정한 주소), monthly_usd, records, note?}`, `status.domain` = `{state: skipped|waiting_dns|issuing_cert|active|failed, name, message?, records?, url?}`. 404/405면 미리보기 주소(AWS 기본 주소)로 진행하고 안내함. 도메인 연결 전 주소는 항상 "미리보기"로 표시. 신규 구매·"나중에"는 10/10 대책안에 따라 뺌. 주소 발급·DNS·인증서 진행은 mock에서만 동작.
+- **도메인(auto만 서버 구현, own은 서버가 501)**: 선택지는 **자동 주소**(플랫폼 도메인 아래 서버가 정한 주소, Vercel 방식, 기본)와 **가지고 있는 도메인**(후순위). `PUT /api/projects/{id}/domain` `{mode: auto|own, name}`(auto는 `name: null`) → `{mode, name(auto면 서버가 정한 주소), monthly_usd, records, note?}`, `status.domain` = `{state: skipped|waiting_dns|issuing_cert|active|failed, name, message?, records?, url?}`. 404/405면 미리보기 주소(AWS 기본 주소)로 진행하고 안내함. 도메인 연결 전 주소는 항상 "미리보기"로 표시. 신규 구매·"나중에"는 10/10 대책안에 따라 뺌. auto의 주소 확인 결과(`active`, 실패 시 배포 `failed`)는 실제 서버와 연동된다. own의 DNS 레코드·인증서 진행은 mock에서만 동작.
 - **분석·계획 생성 시작**: 화면은 결과가 생길 때까지 기다림. 분석은 `ai/runner.py` 가 결과를 등록하고, PR #12의 worker(main `891fd9b`)가 저장된 분석 결과를 읽어 계획을 만듦(`infra/worker/README.md`). 셋을 한 번에 돌린 실제 통합 검증은 별도.
 - **plan 요약 개수**: 추가/변경/삭제 개수를 주는 필드가 없어 `-` 로 표시.
 - **실패 후 수정**: 수정안 반영 API(`/fix`)가 없어 안내 문구로 실패 처리. `status` 의 `diagnosis` 는 `{cause, fix, patch: {file, before, after}}` 형태일 때 화면에 나옴.

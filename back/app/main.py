@@ -44,7 +44,10 @@ from app.schemas import (
     DeploymentDetailOut,
     DeploymentEventOut,
     DeploymentOut,
+    DomainIn,
+    DomainOut,
     FrontDeployStatus,
+    FrontDomainStatus,
     GitHubProjectIn,
     PlanFailureIn,
     PlanFailureOut,
@@ -1026,14 +1029,63 @@ def project_deployment_status(project_id: UUID) -> FrontDeployStatus:
         if deployment is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "배포 이력이 아직 없습니다.")
         cursor.execute(
-            "SELECT message FROM deployment_events WHERE deployment_id = %s ORDER BY created_at, id",
+            "SELECT event_type, message FROM deployment_events WHERE deployment_id = %s ORDER BY created_at, id",
             (deployment["id"],),
         )
-        log = [_redact(row["message"]) for row in cursor.fetchall()]
+        events = cursor.fetchall()
+        variables: Any = {}
+        if deployment["status"] == "healthy":
+            cursor.execute("SELECT variables FROM deployment_plans WHERE id = %s", (deployment["plan_id"],))
+            plan = cursor.fetchone()
+            variables = _json_value(plan["variables"]) if plan else {}
+    log = [_redact(row["message"]) for row in events]
     state = "running" if deployment["status"] in {"queued", "provisioning", "deploying", "rolling_back"} else (
         "success" if deployment["status"] == "healthy" else "failed"
     )
-    return FrontDeployStatus(state=state, log=log, url=deployment["url"])
+    return FrontDeployStatus(state=state, log=log, url=deployment["url"],
+                             domain=_front_domain_status(deployment["status"], variables, events))
+
+
+AUTO_DOMAIN_NOTE = ("주소는 배포 계획을 만들 때 https://<배포 ID>.<플랫폼 도메인>으로 정해지고 승인 화면에 표시됩니다. "
+                    "운영 환경에 자동 주소가 준비되지 않았거나 이 PC(로컬 Docker)로 배포하면 미리보기 주소로 배포됩니다.")
+
+
+@app.put("/api/projects/{project_id}/domain", response_model=DomainOut, tags=["projects"])
+def save_project_domain(project_id: UUID, body: DomainIn) -> DomainOut:
+    """도메인 선택을 받는다. auto는 플랫폼 자동 주소이며, 이름은 worker가 계획 때 <배포 ID>.<운영자 도메인>으로 정해
+    계획 변수 domain(승인 대상)에 고정한다(infra/README.md 앱 자동 주소). 지금 고를 수 있는 것이 auto뿐이고 실제 주소는
+    계획에 남으므로 선택을 따로 저장하지 않는다. own(가지고 있는 도메인 연결)은 인증서·소유권 확인이 필요해 아직 지원하지 않는다(501)."""
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM projects WHERE id = %s", (str(project_id),))
+        if cursor.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+    if body.mode == "own":
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED,
+                            "가지고 있는 도메인 연결은 아직 지원하지 않습니다. 자동 주소나 미리보기 주소로 배포합니다.")
+    return DomainOut(mode="auto", name=None, monthly_usd=0, records=[], note=AUTO_DOMAIN_NOTE)
+
+
+DOMAIN_EVENTS = {"domain_verified", "domain_failed"}
+
+
+def _front_domain_status(deployment_status: str, variables: Any, events: list[dict[str, Any]]) -> FrontDomainStatus | None:
+    """앱 배포가 healthy일 때의 주소 연결 상태. 앱 헬스와 따로 본다(AGENTS.md 5장 10).
+
+    worker가 자동 주소로 계획한 배포는 계획 변수 domain(<배포 ID>.<운영자 도메인>)이 있다. worker는 healthy를 보고하기 전에 그 주소의
+    HTTPS 응답을 확인해 domain_verified를 남기고, 응답하지 않으면 healthy 없이 domain_failed로 failed를 보고한다(infra/worker/README.md executor 5).
+    그래서 지금 worker에서는 healthy면 active다. 확인 기록이 없거나(waiting_dns) healthy에 domain_failed가 붙은 경우(failed)는
+    확인을 healthy 뒤에 하던 이전 worker의 배포다. 도메인이 없는 배포(포트 방식·로컬 Docker)는 skipped. 배포가 실패하면 domain은 없다(로그에 사유)."""
+    if deployment_status != "healthy":
+        return None
+    host = variables.get("domain") if isinstance(variables, dict) else None
+    if not isinstance(host, str) or not host:
+        return FrontDomainStatus(state="skipped", message="이 배포에는 도메인이 연결되지 않아 미리보기 주소로 접속합니다.")
+    last = next((e for e in reversed(events) if e["event_type"] in DOMAIN_EVENTS), None)
+    if last is None:
+        return FrontDomainStatus(state="waiting_dns", name=host, message="이 주소의 HTTPS 응답을 확인하고 있습니다.")
+    if last["event_type"] == "domain_verified":
+        return FrontDomainStatus(state="active", name=host, url=f"https://{host}")
+    return FrontDomainStatus(state="failed", name=host, message=_redact(last["message"]))
 
 
 @app.post("/api/worker/deployments/claim", status_code=status.HTTP_200_OK, tags=["worker"])

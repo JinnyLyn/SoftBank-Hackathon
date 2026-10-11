@@ -191,6 +191,8 @@ def check_approval_and_claim() -> None:
 
     status = request(f"/api/projects/{pid}/status", expected=200)
     require(status["state"] == "success" and status["url"] == "http://localhost:18123", f"bad status: {status}")
+    # 로컬 Docker 계획에는 자동 주소(variables.domain)가 없다: 도메인 없이 미리보기 주소로 끝났다고 알려 프런트 폴링이 멈추게 한다
+    require((status.get("domain") or {}).get("state") == "skipped", f"local deploy must report domain skipped: {status}")
     history = [row for row in request(f"/api/deployments?project_id={pid}", expected=200) if row["id"] == deployment["id"]]
     require(len(history) == 1, "deployment missing from history")
     row = history[0]

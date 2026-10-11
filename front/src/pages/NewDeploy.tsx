@@ -499,7 +499,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
             <small className="muted">{t('월 예산 {budget} 안', { budget: usd(scale.monthlyBudgetUsd) })}</small>
             {domainPlan && domainPlan.mode !== 'none' && (
               <small>
-                {t('주소 {name}', { name: domainPlan.name ?? '' })}
+                {t('주소 {name}', { name: domainPlan.name ?? t('계획 때 확정') })}
                 {domainPlan.monthlyUsd > 0 && ' · ' + t('매달 +{cost}', { cost: usd(domainPlan.monthlyUsd) })}
               </small>
             )}

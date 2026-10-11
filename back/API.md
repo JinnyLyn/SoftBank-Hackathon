@@ -2,7 +2,7 @@
 
 프런트엔드와 백엔드 연동을 위한 현재 API 계약입니다. 구현의 상세 스키마는 실행 중인 FastAPI 문서(`/docs`)와 OpenAPI JSON(`/openapi.json`)을 기준으로 합니다.
 
-제품 방향은 [PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`을 따릅니다. 운영자 관리형 AWS와 사용자 독립 도메인이 목표지만, **도메인 조회·신규 등록·연결·상태 API는 현재 이 문서의 구현 계약에 포함되지 않습니다.** 프런트 `JinVibe:f169d27`의 `/api/domains/check`, `/api/projects/{id}/domain`, `/api/projects/{id}/domain/approve`, `status.domain`은 제안입니다. 이번 시연의 A/B 범위와 파트 간 계약을 먼저 확인하며 구매 자동화를 필수 구현으로 가정하지 않습니다. 기존 연결 API의 존재가 사용자 AWS 연결을 필수로 요구하는 근거는 아닙니다.
+제품 방향은 [PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`을 따릅니다. 운영자 관리형 AWS와 사용자 독립 도메인이 목표지만, **사용자 독립 도메인의 조회·신규 등록·연결 API는 현재 이 문서의 구현 계약에 포함되지 않습니다.** 구현된 것은 운영자 도메인 아래의 플랫폼 자동 주소(`https://<배포 ID>.<플랫폼 도메인>`)를 고르는 `PUT /api/projects/{id}/domain`(auto만)과 상태 응답의 `domain`뿐입니다(아래 "도메인"). 프런트의 `/api/domains/check`, `/api/projects/{id}/domain/approve`는 제안입니다. 이번 시연의 A/B 범위와 파트 간 계약을 먼저 확인하며 구매 자동화를 필수 구현으로 가정하지 않습니다. 기존 연결 API의 존재가 사용자 AWS 연결을 필수로 요구하는 근거는 아닙니다.
 
 ## 접속 및 공통 규칙
 
@@ -156,11 +156,26 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 
 #### 상태 및 이력
 
-- `GET /api/projects/{project_id}/status`: 프런트용 최근 상태 `{ "state": "running|success|failed", "log": [...], "url": null }`. 배포 이력이 아직 없으면 404.
+- `GET /api/projects/{project_id}/status`: 프런트용 최근 상태 `{ "state": "running|success|failed", "log": [...], "url": null, "domain": null }`. 배포 이력이 아직 없으면 404. `domain`은 아래 "도메인"을 따른다.
 - `GET /api/deployments?project_id={UUID}&limit=50`: 전체 또는 프로젝트별 프런트 요약 이력 목록. `limit`은 1~100입니다. 각 항목에는 리소스 식별자와 함께 `app`, `version`, `tier`, `provider`, `target`, `monthlyUsd`, `status`(`running/success/failed`), `createdAt`이 포함됩니다. 여기서 `status`는 요약 상태입니다.
 - `GET /api/deployments/{deployment_id}`: 배포 상세와 이벤트 목록. `operation_type`은 일반 배포 `deploy` 또는 사용자 승인 롤백 `rollback`이며, 롤백 이력에는 `rollback_from_deployment_id`, `rollback_to_deployment_id`가 포함됩니다.
 
 상세 응답과 배포 생성 응답의 내부 상태는 `queued`, `provisioning`, `deploying`, `healthy`, `failed`입니다. 이전 구현과의 호환을 위해 `rolling_back`, `rolled_back` 값은 읽을 수 있지만 새 롤백 작업에는 사용하지 않습니다. 프로젝트 status endpoint와 목록의 프런트 요약 상태 `running/success/failed`는 내부 상태를 단순화한 값입니다. 성공 시 공개 URL은 `url`에 들어갑니다.
+
+#### 도메인 (플랫폼 자동 주소)
+
+- `PUT /api/projects/{project_id}/domain` `{ "mode": "auto" | "own", "name": null }`
+  - `auto`: `200 { "mode": "auto", "name": null, "monthly_usd": 0, "records": [], "note": "..." }`.
+  - 주소는 이 요청이 아니라 worker가 계획을 만들 때 `<배포 ID>.<플랫폼 도메인>`으로 정해 계획 변수 `variables.domain`에 고정합니다(승인 대상, [infra/README.md](../infra/README.md#앱-자동-주소-deploy_idapp_domain)). 그래서 `name`은 `null`이고, 선택은 따로 저장하지 않습니다.
+  - 운영 환경(foundation)에 자동 주소가 준비되지 않았거나 로컬 Docker 대상이면 계획에 `domain`이 없고 미리보기 주소로 배포됩니다.
+  - `own`(가지고 있는 도메인)은 인증서·소유권 확인이 필요해 아직 지원하지 않습니다(`501`). 없는 프로젝트는 `404`, 형식 오류는 `422`.
+- 상태 응답의 `domain`은 배포가 `healthy`일 때만 채워지고, 앱 상태와 따로 봅니다.
+  - 계획 변수 `domain`이 없으면 `{ "state": "skipped", "message": ... }`(미리보기 주소).
+  - 있으면 worker의 HTTPS 확인 이벤트로 정합니다. worker는 `healthy`를 보고하기 **전에** 그 주소를 확인합니다.
+    - 응답하면 `domain_verified`(`deploying` 이벤트) 뒤에 `healthy`가 오므로 `{ "state": "active", "name": "<호스트>", "url": "https://<호스트>" }`.
+    - 응답하지 않으면 `healthy` 없이 `domain_failed`와 함께 배포가 `failed`가 됩니다. 이때 `domain`은 없고 사유는 `log`에 있습니다.
+    - 확인을 `healthy` 뒤에 하던 이전 worker의 배포는 확인 기록이 없으면 `waiting_dns`, `domain_failed`가 붙었으면 `failed`로 보입니다.
+  - `issuing_cert`는 지금 쓰지 않습니다(인증서는 운영자가 미리 발급).
 
 #### 실패 후 사용자 승인 롤백
 

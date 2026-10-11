@@ -347,6 +347,9 @@ export function toComposeBundle(p: PlanOut): TerraformBundle {
   }
 }
 
+/** worker가 플랫폼 자동 주소로 계획했으면 그 호스트(<배포 ID>.<플랫폼 도메인>). 포트 방식·로컬 Docker·옛 계획은 없음 */
+const planDomain = (p: PlanOut) => (typeof p.variables.domain === 'string' && p.variables.domain) || undefined
+
 function toBundle(p: PlanOut): TerraformBundle {
   if (isLocal(p)) return toComposeBundle(p)
   return {
@@ -375,6 +378,7 @@ function toBundle(p: PlanOut): TerraformBundle {
       ready: p.terraform_plan_ready,
       pricingAsOf: p.cost_estimate?.pricing_as_of,
       ...costScope(p),
+      domain: planDomain(p),
     },
   }
 }
@@ -674,8 +678,9 @@ export async function requestTier(projectId: string, tier: TierKey): Promise<voi
   }
 }
 
-// ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------
-// 서버에 아직 없으면 404/405가 오므로 501(미지원)로 바꿔 던짐 → 화면은 미리보기 주소로 진행
+// ---------- 도메인 ----------
+// 백엔드는 auto(플랫폼 자동 주소)만 받고 own은 501. 주소는 worker가 계획 때 정해 계획 변수 domain에 고정함(planDomain)
+// 옛 서버에는 이 API가 없어 404/405가 오므로 501(미지원)로 바꿔 던짐 → 화면은 미리보기 주소로 진행
 
 const DOMAIN_STATES = ['skipped', 'waiting_dns', 'issuing_cert', 'active', 'failed']
 
