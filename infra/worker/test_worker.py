@@ -916,6 +916,12 @@ class PlannerTests(Base):
         worker.plan_pending(self.api, self.cfg, state)
         self.assertEqual(state.failures[p1["id"]][0], 1)   # 예약 때문이 아니면 기다려도 풀리지 않으므로 실패로 센다
         self.assertTrue(self.backend.plan_failures[0][1]["retryable"], "할당량은 늘거나 풀릴 수 있어 다시 시도 대상")
+        # 재시도를 다 써도 일시적인 실패는 "다시 해도 같은 실패"로 보고하지 않는다 (PR #45 리뷰)
+        for _ in range(state.max_tries + 1):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(state.failures[p1["id"]][0], state.max_tries)
+        self.assertTrue(all(body["retryable"] for _, body in self.backend.plan_failures))
+        self.assertEqual(self.backend.plan_failures[-1][1]["attempts"], state.max_tries)
         self.assertEqual(state.waiting, {})
         self.assertEqual(self.backend.created_plans, [])
 

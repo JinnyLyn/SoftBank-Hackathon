@@ -886,7 +886,7 @@ def plan_pending_local(api, cfg, state):
             plan_local_project(api, cfg, project, analysis)
             state.local_done[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 오류가 worker 전체를 멈추지 않게 한다
-            retryable = getattr(e, "retryable", True) and tries + 1 < state.max_tries
+            retryable = getattr(e, "retryable", True)
             state.local_failures[pid] = (tries + 1 if retryable else state.max_tries, time.time())
             expected = isinstance(e, (PlanError, ApiError, OSError))
             kind = "" if expected else f"{type(e).__name__}: "
@@ -1412,7 +1412,8 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             state.waiting[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(잘못된 분석 결과 등)가 worker 전체를 멈추지 않게 한다
             # 다시 해도 같은 실패(예산 부족 등)는 바로 멈춘다. 같은 입력으로 몇 분씩 다시 시도하지 않게
-            retryable = getattr(e, "retryable", True) and tries + 1 < state.max_tries
+            # 다시 해도 같은 실패인지는 오류의 성격으로만 정한다. 재시도 횟수를 다 쓴 일시 오류를 "입력 문제"로 보고하지 않게 (PR #45 리뷰)
+            retryable = getattr(e, "retryable", True)
             state.failures[pid] = (tries + 1 if retryable else state.max_tries, time.time())
             expected = isinstance(e, (PlanError, ApiError, subprocess.TimeoutExpired, OSError))
             kind = "" if expected else f"{type(e).__name__}: "   # 예상한 오류가 아니면 종류를 남겨 원인을 찾게 한다
