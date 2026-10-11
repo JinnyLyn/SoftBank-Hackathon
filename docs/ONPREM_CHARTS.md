@@ -14,9 +14,8 @@ infra/worker/local_docker.py, infra/worker/worker.py, front/src/onprem/.
 ```mermaid
 %%{init: {"theme":"base","htmlLabels":false,"themeVariables":{"background":"#FFFFFF","fontFamily":"Malgun Gothic, Noto Sans KR, Apple SD Gothic Neo, sans-serif","fontSize":"24px","primaryColor":"#EFF6FF","primaryTextColor":"#0F172A","primaryBorderColor":"#2563EB","lineColor":"#475569","edgeLabelBackground":"#FFFFFF","clusterBkg":"#F8FAFC","clusterBorder":"#94A3B8"},"themeCSS":".edgeLabel { font-size: 22px; } .cluster-label { font-weight: 700; }","flowchart":{"htmlLabels":false,"curve":"linear","nodeSpacing":36,"rankSpacing":52,"padding":20}}}%%
 flowchart LR
-    USER["사용자<br/>브라우저"]
-
     subgraph PC["플랫폼 실행 PC"]
+        USER["사용자 브라우저<br/>로컬 전용"]
         WEB["플랫폼 화면<br/>React"]
         API["플랫폼 API<br/>FastAPI"]
         DB[("플랫폼 DB<br/>MySQL")]
@@ -29,10 +28,9 @@ flowchart LR
         API <--> ANALYZER
         API <--> WORKER
         WORKER --> APP
+        USER --> WEB
+        USER -. HTTP 접속 .-> APP
     end
-
-    USER --> WEB
-    USER -. HTTP 접속 .-> APP
 
     classDef person fill:#FFF7ED,stroke:#C2410C,color:#0F172A,stroke-width:2px;
     classDef app fill:#ECFDF5,stroke:#047857,color:#0F172A,stroke-width:2px;
