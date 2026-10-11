@@ -3,16 +3,18 @@ import Header, { type Page } from './components/Header'
 import NewDeploy from './pages/NewDeploy'
 import History from './pages/History'
 import { IS_MOCK } from './api'
+import { useT } from './i18n'
 
 export default function App() {
   const [page, setPage] = useState<Page>('new')
+  const t = useT()
 
   return (
     <>
       <Header page={page} onChange={setPage} />
       {IS_MOCK && (
         <div className="mock-banner" role="note">
-          <strong>MOCK</strong> 백엔드 없이 예시 데이터로 동작합니다. 분석, 비용, 배포 결과는 실제가 아닙니다.
+          <strong>MOCK</strong> {t('백엔드 없이 예시 데이터로 동작합니다. 분석, 비용, 배포 결과는 실제가 아닙니다.')}
         </div>
       )}
       <main className="container">

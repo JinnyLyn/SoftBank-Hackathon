@@ -137,11 +137,14 @@ class PlanFailureIn(APIModel):
     reason: str = Field(min_length=1, max_length=1000)
     retryable: bool
     attempts: int = Field(ge=1, le=1000)
+    # input: 다시 해도 같은 실패, operator: 운영자 조치 필요(로그인 만료 등), transient: 일시 오류. 없으면 retryable로 정함
+    kind: Literal["input", "operator", "transient"] | None = None
 
 
 class PlanFailureOut(APIModel):
     target: Literal["aws", "local_docker"]
     reason: str
+    kind: Literal["input", "operator", "transient"]
     retryable: bool
     attempts: int
     updated_at: datetime

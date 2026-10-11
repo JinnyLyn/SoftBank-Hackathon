@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { isEnabled } from '../providers'
+import { useT } from '../i18n'
 import type { DnsRecord, DomainMode, DomainPlan, DomainStatus } from '../types'
 
 /** 도메인 없이 접속하는 미리보기 주소가 어디 것인지. 켜 둔 배포 대상을 따름 */
@@ -26,12 +27,13 @@ interface Props {
 }
 
 export default function DomainProgress({ status, mode }: Props) {
+  const t = useT()
   if (mode === 'none' || status.state === 'skipped') {
     return (
       <div className="domain-progress">
         <div className="domain-head">
-          <strong>도메인 미연결 · 미리보기</strong>
-          <span className="muted small">{status.message ?? `독립 도메인 없이 미리보기 주소(${PREVIEW_ADDRESS})로 접속합니다. 도메인 연결 완료가 아닙니다.`}</span>
+          <strong>{t('도메인 미연결 · 미리보기')}</strong>
+          <span className="muted small">{status.message ?? t('독립 도메인 없이 미리보기 주소({address})로 접속합니다. 도메인 연결 완료가 아닙니다.', { address: t(PREVIEW_ADDRESS) })}</span>
         </div>
       </div>
     )
@@ -44,7 +46,7 @@ export default function DomainProgress({ status, mode }: Props) {
   return (
     <div className="domain-progress">
       <div className="domain-head">
-        <strong>{mode === 'auto' ? '플랫폼 주소' : '도메인'} {status.name}</strong>
+        <strong>{mode === 'auto' ? t('플랫폼 주소') : t('도메인')} {status.name}</strong>
         {status.state === 'active' && status.url ? (
           <a href={status.url} target="_blank" rel="noreferrer" className="mono">
             {status.url}
@@ -59,7 +61,7 @@ export default function DomainProgress({ status, mode }: Props) {
           return (
             <li key={s.state} className={state}>
               <span className="dot" aria-hidden />
-              {s.label}
+              {t(s.label)}
               {state === 'is-current' && <span className="pulse" aria-hidden />}
             </li>
           )
@@ -71,6 +73,7 @@ export default function DomainProgress({ status, mode }: Props) {
 }
 
 function RecordTable({ records }: { records: DnsRecord[] }) {
+  const t = useT()
   const [copied, setCopied] = useState<string | null>(null)
   const copy = async (text: string) => {
     try {
@@ -83,14 +86,14 @@ function RecordTable({ records }: { records: DnsRecord[] }) {
   }
   return (
     <div className="record-box">
-      <p className="hint">도메인을 산 곳(가비아, Cloudflare 등)의 DNS 설정에 아래 레코드를 추가해 주세요. 반영까지 몇 분에서 몇 시간 걸릴 수 있습니다.</p>
+      <p className="hint">{t('도메인을 산 곳(가비아, Cloudflare 등)의 DNS 설정에 아래 레코드를 추가해 주세요. 반영까지 몇 분에서 몇 시간 걸릴 수 있습니다.')}</p>
       <table className="table">
         <thead>
           <tr>
-            <th>종류</th>
-            <th>이름</th>
-            <th>값</th>
-            <th>용도</th>
+            <th>{t('종류')}</th>
+            <th>{t('이름')}</th>
+            <th>{t('값')}</th>
+            <th>{t('용도')}</th>
           </tr>
         </thead>
         <tbody>
@@ -100,13 +103,13 @@ function RecordTable({ records }: { records: DnsRecord[] }) {
               <td className="mono small">
                 {r.name}{' '}
                 <button className="link-btn" onClick={() => copy(r.name)}>
-                  {copied === r.name ? '복사됨' : '복사'}
+                  {copied === r.name ? t('복사됨') : t('복사')}
                 </button>
               </td>
               <td className="mono small record-value">
                 {r.value}{' '}
                 <button className="link-btn" onClick={() => copy(r.value)}>
-                  {copied === r.value ? '복사됨' : '복사'}
+                  {copied === r.value ? t('복사됨') : t('복사')}
                 </button>
               </td>
               <td className="muted small">{r.purpose}</td>

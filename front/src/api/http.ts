@@ -1,4 +1,5 @@
 // 백엔드 호출 공통 처리
+import { t } from '../i18n/core'
 
 export class ApiError extends Error {
   constructor(
@@ -29,7 +30,7 @@ async function toApiError(res: Response): Promise<ApiError> {
   } catch {
     // JSON이 아니면 본문 그대로
   }
-  if (res.status === 503) message = `서버가 DB에 연결하지 못했습니다. ${message}`
+  if (res.status === 503) message = t('서버가 DB에 연결하지 못했습니다. {message}', { message })
   return new ApiError(res.status, message)
 }
 
@@ -43,8 +44,8 @@ export async function req<T>(path: string, init: RequestInit & { timeoutMs?: num
     res = await fetch('/api' + path, { ...rest, credentials: 'same-origin', signal: AbortSignal.timeout(timeoutMs) })
   } catch (e) {
     if (e instanceof DOMException && (e.name === 'TimeoutError' || e.name === 'AbortError'))
-      throw new ApiError(408, `서버 응답이 ${Math.round(timeoutMs / 1000)}초 안에 오지 않았습니다.`)
-    throw new ApiError(0, '서버에 연결하지 못했습니다. 네트워크나 백엔드 실행 상태를 확인해 주세요.')
+      throw new ApiError(408, t('서버 응답이 {s}초 안에 오지 않았습니다.', { s: Math.round(timeoutMs / 1000) }))
+    throw new ApiError(0, t('서버에 연결하지 못했습니다. 네트워크나 백엔드 실행 상태를 확인해 주세요.'))
   }
   if (!res.ok) throw await toApiError(res)
   const text = await res.text()
