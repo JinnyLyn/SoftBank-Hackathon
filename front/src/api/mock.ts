@@ -16,6 +16,7 @@ import type {
 } from '../types'
 import { buildFiles, buildPlan, CATALOG, findTier, logScript, publicUrl } from './catalog'
 import { isEnabled, PROVIDERS } from '../providers'
+import { t as tr } from '../i18n/core'
 export { sourceName } from '../format'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -55,21 +56,21 @@ export async function analyze(source: Source, _scale: ScaleInput, onUploaded?: (
   return {
     projectId: 'p_' + Math.random().toString(36).slice(2, 8),
     stack: [
-      { label: '프레임워크', value: 'FastAPI 0.111' },
-      { label: '런타임', value: 'Python 3.12' },
-      { label: '포트', value: '8000' },
+      { label: tr('프레임워크'), value: 'FastAPI 0.111' },
+      { label: tr('런타임'), value: 'Python 3.12' },
+      { label: tr('포트'), value: '8000' },
       { label: 'DB', value: 'SQLite' },
-      { label: '정적 파일', value: '없음' },
-      { label: '환경 변수', value: 'SECRET_KEY 외 2개' },
+      { label: tr('정적 파일'), value: tr('없음') },
+      { label: tr('환경 변수'), value: tr('SECRET_KEY 외 2개') },
     ],
     findings: [
       {
         level: 'warn',
-        title: 'SQLite 파일에 데이터를 저장하고 있습니다',
-        detail: '서버 한 대 구성이면 디스크에 그대로 두면 되지만, 컨테이너 구성에서는 재시작할 때 지워지므로 PostgreSQL로 옮깁니다.',
+        title: tr('SQLite 파일에 데이터를 저장하고 있습니다'),
+        detail: tr('서버 한 대 구성이면 디스크에 그대로 두면 되지만, 컨테이너 구성에서는 재시작할 때 지워지므로 PostgreSQL로 옮깁니다.'),
       },
-      { level: 'info', title: 'Dockerfile이 없어서 새로 만듭니다', detail: 'python:3.12-slim 기반, uvicorn으로 8000번 포트 실행.' },
-      { level: 'info', title: '헬스체크 경로 /health 를 찾았습니다', detail: '배포 후 확인과 로드밸런서 헬스체크에 씁니다.' },
+      { level: 'info', title: tr('Dockerfile이 없어서 새로 만듭니다'), detail: tr('python:3.12-slim 기반, uvicorn으로 8000번 포트 실행.') },
+      { level: 'info', title: tr('헬스체크 경로 /health 를 찾았습니다'), detail: tr('배포 후 확인과 로드밸런서 헬스체크에 씁니다.') },
     ],
     evidence: [
       'requirements.txt — fastapi, uvicorn, sqlalchemy',
@@ -88,10 +89,15 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
   const options = usable.map((c) => ({
     connectionId: c.id,
     provider: c.provider,
-    name: c.name,
+    name: tr(c.name),
     tiers: CATALOG[c.provider].map(({ resources, ...t }) => ({
       ...t,
-      resources: resources.map(({ addr: _addr, ...r }) => r),
+      label: tr(t.label),
+      fit: tr(t.fit),
+      headline: tr(t.headline),
+      tradeoff: tr(t.tradeoff),
+      usageNote: t.usageNote && tr(t.usageNote),
+      resources: resources.map(({ addr: _addr, ...r }) => ({ ...r, service: tr(r.service), spec: tr(r.spec), why: tr(r.why) })),
     })),
   }))
 
@@ -112,19 +118,19 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
     if (best) break
   }
 
-  const label = (t: TierKey) => findTier('aws', t).label
-  const where = best ? `${best.name}(${PROVIDERS[best.provider].label})` : ''
+  const label = (t: TierKey) => tr(findTier('aws', t).label)
+  const where = best ? `${best.name}(${tr(PROVIDERS[best.provider].label)})` : ''
   let reason: string
-  if (options.length === 0) reason = '켜 둔 배포 대상이 없습니다.'
+  if (options.length === 0) reason = tr('켜 둔 배포 대상이 없습니다.')
   else if (!best) {
     const cheapest = Math.min(...options.map((o) => cost(o.provider, 'lean')))
-    reason = `월 예산 $${budget} 안에 맞는 구성이 없습니다. 가장 싼 구성도 월 $${cheapest.toFixed(2)}입니다. 예산을 늘려 주세요.`
+    reason = tr('월 예산 ${budget} 안에 맞는 구성이 없습니다. 가장 싼 구성도 월 ${cheapest}입니다. 예산을 늘려 주세요.', { budget, cheapest: cheapest.toFixed(2) })
   } else {
-    const downgraded = tier !== wanted ? ` 규모로는 '${label(wanted)}'이 맞지만 예산 $${budget}을 넘어서 '${label(tier)}'으로 낮췄습니다.` : ''
+    const downgraded = tier !== wanted ? ' ' + tr("규모로는 '{wanted}'이 맞지만 예산 ${budget}을 넘어서 '{tier}'으로 낮췄습니다.", { wanted: label(wanted), budget, tier: label(tier) }) : ''
     reason =
       best.provider === 'onprem'
-        ? `이미 연결된 ${where}에 올리면 추가 비용 없이 운영할 수 있습니다.${downgraded}`
-        : `예산 $${budget} 안에서 '${label(tier)}' 구성이 가장 싼 곳은 ${where}입니다.${downgraded}`
+        ? tr('이미 연결된 {where}에 올리면 추가 비용 없이 운영할 수 있습니다.', { where }) + downgraded
+        : tr("예산 ${budget} 안에서 '{tier}' 구성이 가장 싼 곳은 {where}입니다.", { budget, tier: label(tier), where }) + downgraded
   }
 
   const recommended = best ? { connectionId: best.connectionId, tier } : null
@@ -138,9 +144,13 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
     bundles,
     options,
     assumptions: [
-      `월 사용자 ${scale.expectedUsers}명, 월 예산 $${budget}, ${scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'}`,
-      '클라우드는 상파울루(sa-east-1) 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외',
-      '온프레미스는 전기, 회선 비용을 넣지 않음',
+      tr('월 사용자 {users}명, 월 예산 ${budget}, {pattern}', {
+        users: scale.expectedUsers,
+        budget,
+        pattern: tr(scale.pattern === 'peak' ? '특정 시간에 몰림' : scale.pattern === 'steady' ? '고르게 들어옴' : '패턴 모름'),
+      }),
+      tr('클라우드는 상파울루(sa-east-1) 리전 온디맨드 가격, 데이터 전송 비용과 무료 크레딧은 제외'),
+      tr('온프레미스는 전기, 회선 비용을 넣지 않음'),
     ],
   }
 }
@@ -197,8 +207,8 @@ export async function status(_projectId: string): Promise<DeployStatus> {
       state: 'failed',
       log: [...log, 'curl: (7) Failed to connect: Connection refused', 'health check failed after 5 attempts'],
       diagnosis: {
-        cause: '앱이 127.0.0.1에서만 요청을 받고 있어서 컨테이너 바깥에서 접속할 수 없습니다.',
-        fix: 'Dockerfile의 실행 명령에 --host 0.0.0.0 을 넣고 같은 계획으로 다시 배포합니다. 인프라는 바뀌지 않습니다.',
+        cause: tr('앱이 127.0.0.1에서만 요청을 받고 있어서 컨테이너 바깥에서 접속할 수 없습니다.'),
+        fix: tr('Dockerfile의 실행 명령에 --host 0.0.0.0 을 넣고 같은 계획으로 다시 배포합니다. 인프라는 바뀌지 않습니다.'),
         patch: HOST_PATCH,
       },
     }
@@ -221,8 +231,8 @@ let domainChoice: DomainChoice = { mode: 'auto', name: '' }
 let autoName = ''
 
 const appRecords = (name: string): DnsRecord[] => [
-  { type: 'CNAME', name, value: '배포 뒤 확정 (예: paved-alb-1203.sa-east-1.elb.amazonaws.com)', purpose: '도메인을 앱 주소로 연결' },
-  { type: 'CNAME', name: `_3f9a1c.${name}`, value: '_8d2e0b.acm-validations.aws', purpose: 'HTTPS 인증서 발급 확인용' },
+  { type: 'CNAME', name, value: tr('배포 뒤 확정 (예: paved-alb-1203.sa-east-1.elb.amazonaws.com)'), purpose: tr('도메인을 앱 주소로 연결') },
+  { type: 'CNAME', name: `_3f9a1c.${name}`, value: '_8d2e0b.acm-validations.aws', purpose: tr('HTTPS 인증서 발급 확인용') },
 ]
 
 export async function saveDomain(_projectId: string, choice: DomainChoice): Promise<DomainPlan> {
@@ -231,7 +241,7 @@ export async function saveDomain(_projectId: string, choice: DomainChoice): Prom
   if (choice.mode === 'own') return { mode: 'own', name: choice.name, monthlyUsd: 0, records: appRecords(choice.name) }
   const pick = () => WORDS[Math.floor(Math.random() * WORDS.length)]
   autoName = `${pick()}-${pick()}-${Math.random().toString(16).slice(2, 6)}.apps.paved.example`
-  return { mode: 'auto', name: autoName, monthlyUsd: 0, records: [], note: '플랫폼 도메인 아래의 자동 주소라 추가 비용이 없습니다. 내 도메인은 아니며 HTTPS 인증서는 플랫폼이 관리합니다.' }
+  return { mode: 'auto', name: autoName, monthlyUsd: 0, records: [], note: tr('플랫폼 도메인 아래의 자동 주소라 추가 비용이 없습니다. 내 도메인은 아니며 HTTPS 인증서는 플랫폼이 관리합니다.') }
 }
 
 /** 앱 배포가 끝난 뒤 지난 시간(ms)에 따라 도메인 단계를 흉내 */
@@ -239,15 +249,20 @@ function domainProgress(since: number): DomainStatus {
   const name = domainChoice.mode === 'auto' ? autoName : domainChoice.name
   if (since < 3000)
     return domainChoice.mode === 'auto'
-      ? { state: 'waiting_dns', name, message: '주소를 앱에 연결하고 있습니다.' }
-      : { state: 'waiting_dns', name, message: '도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.', records: appRecords(name) }
-  if (since < 5000) return { state: 'issuing_cert', name, message: 'HTTPS를 준비하고 있습니다.' }
+      ? { state: 'waiting_dns', name, message: tr('주소를 앱에 연결하고 있습니다.') }
+      : { state: 'waiting_dns', name, message: tr('도메인 업체에 아래 레코드를 추가해 주세요. 추가하면 자동으로 확인합니다.'), records: appRecords(name) }
+  if (since < 5000) return { state: 'issuing_cert', name, message: tr('HTTPS를 준비하고 있습니다.') }
   return { state: 'active', name, url: `https://${name}` }
 }
 
 export async function history(): Promise<DeployRecord[]> {
   await wait(200)
-  return HISTORY.filter((r) => isEnabled(r.provider))
+  return HISTORY.filter((r) => isEnabled(r.provider)).map((r) => ({
+    ...r,
+    tier: tr(r.tier),
+    target: tr(r.target),
+    note: r.note && tr(r.note),
+  }))
 }
 
 const HISTORY: DeployRecord[] = [

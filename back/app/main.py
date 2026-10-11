@@ -670,11 +670,11 @@ def list_plan_failures(project_id: UUID) -> list[PlanFailureOut]:
         if cursor.fetchone() is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
         cursor.execute(
-            "SELECT target, reason, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s ORDER BY target",
+            "SELECT target, reason, kind, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s ORDER BY target",
             (str(project_id),),
         )
         return [
-            PlanFailureOut(target=row["target"], reason=row["reason"], retryable=bool(row["retryable"]),
+            PlanFailureOut(target=row["target"], reason=row["reason"], kind=row["kind"], retryable=bool(row["retryable"]),
                            attempts=row["attempts"], updated_at=row["updated_at"])
             for row in cursor.fetchall()
         ]
@@ -689,24 +689,25 @@ def record_plan_failure(
     """worker가 계획 생성 실패를 알린다. 대상별 최신 1건만 둔다(같은 대상의 이전 기록을 덮어씀)."""
     _require_worker(x_worker_token)
     reason = _redact(body.reason)[:1000]
+    kind = body.kind or ("transient" if body.retryable else "input")
     with connect() as connection, connection.cursor() as cursor:
         cursor.execute("SELECT id FROM projects WHERE id = %s", (str(project_id),))
         if cursor.fetchone() is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
         cursor.execute(
-            """INSERT INTO plan_failures (project_id, target, reason, retryable, attempts)
-               VALUES (%s, %s, %s, %s, %s)
-               ON DUPLICATE KEY UPDATE reason = VALUES(reason), retryable = VALUES(retryable),
+            """INSERT INTO plan_failures (project_id, target, reason, kind, retryable, attempts)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE reason = VALUES(reason), kind = VALUES(kind), retryable = VALUES(retryable),
                    attempts = VALUES(attempts), updated_at = CURRENT_TIMESTAMP(6)""",
-            (str(project_id), body.target, reason, body.retryable, body.attempts),
+            (str(project_id), body.target, reason, kind, body.retryable, body.attempts),
         )
         connection.commit()
         cursor.execute(
-            "SELECT target, reason, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s AND target = %s",
+            "SELECT target, reason, kind, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s AND target = %s",
             (str(project_id), body.target),
         )
         row = cursor.fetchone()
-    return PlanFailureOut(target=row["target"], reason=row["reason"], retryable=bool(row["retryable"]),
+    return PlanFailureOut(target=row["target"], reason=row["reason"], kind=row["kind"], retryable=bool(row["retryable"]),
                           attempts=row["attempts"], updated_at=row["updated_at"])
 
 

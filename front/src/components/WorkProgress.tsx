@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { progressPercent, type WorkStage } from '../progress'
+import { useT } from '../i18n'
 
 interface Props {
   title: string
@@ -18,6 +19,7 @@ const HINT_MS = 4000
 
 /** 오래 걸리는 작업(분석, 계획)의 진행 표시. 단계는 서버가 알려 준 실제 신호로만 움직임 */
 export default function WorkProgress({ title, startedAt, stageStartedAt, stages, hints, note }: Props) {
+  const t = useT()
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
@@ -33,9 +35,9 @@ export default function WorkProgress({ title, startedAt, stageStartedAt, stages,
     <div className="work-progress" aria-live="polite">
       <div className="work-head">
         <strong>
-          {!failed && <span className="pulse" aria-hidden />} {title}
+          {!failed && <span className="pulse" aria-hidden />} {t(title)}
         </strong>
-        <span className="muted small mono">{elapsed < 60 ? `${elapsed}초` : `${Math.floor(elapsed / 60)}분 ${elapsed % 60}초`}</span>
+        <span className="muted small mono">{elapsed < 60 ? t('{s}초', { s: elapsed }) : t('{m}분 {s}초', { m: Math.floor(elapsed / 60), s: elapsed % 60 })}</span>
       </div>
       <div
         className={'work-bar' + (failed ? ' is-failed' : '')}
@@ -43,7 +45,7 @@ export default function WorkProgress({ title, startedAt, stageStartedAt, stages,
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={percent}
-        aria-label={title}
+        aria-label={t(title)}
       >
         <span style={{ width: `${percent}%` }} />
       </div>
@@ -51,16 +53,16 @@ export default function WorkProgress({ title, startedAt, stageStartedAt, stages,
         {stages.map((s) => (
           <li key={s.label} className={'is-' + s.state}>
             <span className="dot" aria-hidden />
-            {s.label}
+            {t(s.label)}
           </li>
         ))}
       </ol>
       {!failed && hint && (
         <p key={hint} className="work-hint">
-          {hint}
+          {t(hint)}
         </p>
       )}
-      {note && <p className="hint">{note}</p>}
+      {note && <p className="hint">{t(note)}</p>}
     </div>
   )
 }

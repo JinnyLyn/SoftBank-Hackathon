@@ -37,7 +37,7 @@ npm run build
 | 분석 시작 (ZIP) | `POST /api/projects?name=&filename=&expected_users=&traffic_pattern=&monthly_budget_usd=&purpose=` 본문은 ZIP 원본 바이트, `Content-Type: application/zip` |
 | 분석 시작 (GitHub) | `POST /api/projects/github` `{ name, repository_url, ref, expected_users, traffic_pattern, monthly_budget_usd, purpose }` |
 | 분석 결과 대기 | `GET /api/projects/{id}/analyses/latest` 를 2초 간격 (404는 대기, 5분 제한) |
-| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 (2초 간격, 5분 제한). 계획이 아직 없으면 `GET /api/projects/{id}/plan-failures`도 읽어, worker가 `retryable=false` 실패(예산 부족 등)를 알렸으면 바로 그 이유를 보여 줌(404면 예전 백엔드로 보고 계속 기다림). AWS 줄 이름은 "관리형 AWS"로 고정. 계획이 있는 칸은 계획 변수 `tier` 하나이고, 나머지(비교용) 칸을 누르면 `POST /api/projects/{id}/plan-requests`로 그 안의 계획을 다시 요청한 뒤 새 계획을 기다림(다시 승인) |
+| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 (2초 간격, 5분 제한). 계획이 아직 없으면 `GET /api/projects/{id}/plan-failures`도 읽어, worker가 다시 해도 같은 실패(`kind=input`, 예산 부족 등)나 운영자 조치 필요(`kind=operator`, AWS 로그인 만료 등. 기다리기 시작한 뒤의 보고만)를 알렸으면 바로 그 이유를 보여 줌(404면 예전 백엔드로 보고 계속 기다림). AWS 줄 이름은 "관리형 AWS"로 고정. 계획이 있는 칸은 계획 변수 `tier` 하나이고, 나머지(비교용) 칸을 누르면 `POST /api/projects/{id}/plan-requests`로 그 안의 계획을 다시 요청한 뒤 새 계획을 기다림(다시 승인) |
 | 코드 검토 | `GET /api/plans/{id}` — 변수값, 설명, 모듈, 가격 기준, fingerprint, plan 파일 준비 여부 |
 | 승인하고 배포 | `POST /api/plans/{id}/approve` `{ expected_fingerprint }` → `POST /api/deployments` `{ plan_id, expected_fingerprint }` (202 = 대기열 등록) |
 | 배포 진행 | `GET /api/projects/{id}/status` 0.7초 간격 (404는 대기열 대기로 표시) |
@@ -69,6 +69,14 @@ npm run build
 - **분석·계획 생성 시작**: 화면은 결과가 생길 때까지 기다림. 분석은 `ai/runner.py` 가 결과를 등록하고, PR #12의 worker(main `891fd9b`)가 저장된 분석 결과를 읽어 계획을 만듦(`infra/worker/README.md`). 셋을 한 번에 돌린 실제 통합 검증은 별도.
 - **plan 요약 개수**: 추가/변경/삭제 개수를 주는 필드가 없어 `-` 로 표시.
 - **실패 후 수정**: 수정안 반영 API(`/fix`)가 없어 안내 문구로 실패 처리. `status` 의 `diagnosis` 는 `{cause, fix, patch: {file, before, after}}` 형태일 때 화면에 나옴.
+
+## 화면 언어 (한국어·일본어)
+
+- 상단 바 오른쪽 끝(온프레미스 화면은 헤더 오른쪽)의 `한국어 | 日本語` 스위치로 바꾼다. 고른 언어는 브라우저에 저장(`localStorage` `paved-lang`)하고 `<html lang>`도 바꾼다.
+- 라이브러리 없이 `src/i18n/core.ts`의 `t('한국어 원문', { 값 })`을 쓴다. 키는 한국어 원문 그대로이고, 일본어는 `src/i18n/ja/*.ts`(app·steps·api·extra)에 있다. 사전에 없으면 한국어로 보인다.
+- 컴포넌트는 `useT()`로 받아 언어가 바뀌면 다시 그린다. 프런트가 만드는 오류·안내 문구도 번역한다.
+- **새 화면 문구를 추가할 때(다른 파트 포함)**: `t('한국어 원문')`으로 감싸고 `src/i18n/ja/`의 해당 영역 파일에 일본어를 넣는다. `npm run check:i18n --prefix front`가 사전에 없는 `t()` 문구를 찾아 준다(없으면 일본어 화면에서 한국어로 보임). 상수에 한국어로 두고 그릴 때 감싸는 문구는 이 검사로 찾지 못하니 사전에 직접 넣는다. 오류처럼 상태에 저장하는 문구는 번역된 문장 대신 원문과 값을 저장하고 그릴 때 `t()`로 바꾼다(언어를 바꿔도 따라 바뀌게).
+- 서버·worker·분석기가 만든 문장(계획 이유·비용 제외 항목·분석 근거·오류 원인·로그)은 번역하지 않는다. 비교표 위 가정 문구처럼 계획을 받을 때 만든 문장은 그때의 언어로 남고, 계획을 다시 받으면 바뀐다.
 
 ## 보안
 

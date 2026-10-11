@@ -14,6 +14,7 @@ import { STAGE_SIZE } from '../progress'
 import { costText, tierTotal, usd } from '../format'
 import { isEnabled } from '../providers'
 import type { PollIssue } from '../steps/DeployStep'
+import { useT } from '../i18n'
 import type {
   Analysis,
   Choice,
@@ -88,6 +89,7 @@ interface Props {
 }
 
 export default function NewDeploy({ onShowHistory }: Props) {
+  const t = useT()
   const [step, setStep] = useState(SOURCE)
   const [source, setSourceState] = useState<Source | null>(null)
   const [scale, setScaleState] = useState<ScaleInput>(DEFAULT_SCALE)
@@ -232,7 +234,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
         if (Date.now() > deadlineRef.current) {
           setPollIssue({
             kind: 'timeout',
-            message: '예상보다 오래 걸리고 있습니다. 배포는 서버에서 계속 진행 중일 수 있습니다.',
+            message: t('예상보다 오래 걸리고 있습니다. 배포는 서버에서 계속 진행 중일 수 있습니다.'),
           })
           return setBusy(null)
         }
@@ -408,29 +410,33 @@ export default function NewDeploy({ onShowHistory }: Props) {
   }
 
   const domainLabel = !isEnabled('aws')
-    ? '로컬 주소 (도메인 없음)'
+    ? t('로컬 주소 (도메인 없음)')
     : domainChoice.mode === 'auto'
-      ? '자동 주소'
-      : `${domainChoice.name || '이름 미입력'} (보유)`
+      ? t('자동 주소')
+      : t('{name} (보유)', { name: domainChoice.name || t('이름 미입력') })
 
   const railItems: RailItem[] = STEPS.map((s, i) => {
     let sub: string | undefined
     if (i === SOURCE && source)
-      sub = `${sourceName(source)} · 월 ${scale.expectedUsers}명 · ${budgetValid(scale.monthlyBudgetUsd) ? usd(scale.monthlyBudgetUsd) : '예산 미입력'}`
+      sub = t('{name} · 월 {users}명 · {budget}', {
+        name: sourceName(source),
+        users: scale.expectedUsers,
+        budget: budgetValid(scale.monthlyBudgetUsd) ? usd(scale.monthlyBudgetUsd) : t('예산 미입력'),
+      })
     if (i === DOMAIN && source) sub = domainLabel
-    if (i === ANALYSIS && option && selectedTier) sub = `${option.name} · ${selectedTier.label}`
-    if (i === REVIEW && bundle) sub = bundle.plan.add === null ? '계획 준비됨' : `${bundle.plan.add}개 추가`
-    if (i === REVIEW && !bundle && codeState === 'loading') sub = '코드 준비 중'
-    if (i === DEPLOY && deploy) sub = { running: '진행 중', success: '완료', failed: '실패' }[deploy.state]
-    if (i === DEPLOY && deploy?.state === 'success' && !domainDone(deploy.domain, domainPlan?.mode ?? 'none')) sub = '주소 연결 중'
-    if (i === DEPLOY && deploy?.state === 'success' && domainFailed(deploy.domain)) sub = '앱 완료 · 주소 연결 실패'
+    if (i === ANALYSIS && option && selectedTier) sub = `${t(option.name)} · ${t(selectedTier.label)}`
+    if (i === REVIEW && bundle) sub = bundle.plan.add === null ? t('계획 준비됨') : t('{n}개 추가', { n: bundle.plan.add })
+    if (i === REVIEW && !bundle && codeState === 'loading') sub = t('코드 준비 중')
+    if (i === DEPLOY && deploy) sub = t({ running: '진행 중', success: '완료', failed: '실패' }[deploy.state])
+    if (i === DEPLOY && deploy?.state === 'success' && !domainDone(deploy.domain, domainPlan?.mode ?? 'none')) sub = t('주소 연결 중')
+    if (i === DEPLOY && deploy?.state === 'success' && domainFailed(deploy.domain)) sub = t('앱 완료 · 주소 연결 실패')
 
     let state: RailItem['state'] = 'todo'
     if (i === DEPLOY && deploy?.state === 'failed') state = 'failed'
     else if (i === step) state = 'current'
     else if (i < reached || (i === DEPLOY && deploy?.state === 'success')) state = 'done'
 
-    return { label: s.label, sub, state, enabled: i <= reached && busy === null }
+    return { label: t(s.label), sub, state, enabled: i <= reached && busy === null }
   })
 
   const meta = STEPS[step]
@@ -438,45 +444,45 @@ export default function NewDeploy({ onShowHistory }: Props) {
   let next: { label: string; onClick: () => void; disabled?: boolean } | null = null
   if (step === SOURCE)
     next = {
-      label: '다음: 도메인',
+      label: t('다음: 도메인'),
       onClick: () => setStep(DOMAIN),
       disabled: !source || !budgetValid(scale.monthlyBudgetUsd),
     }
   if (step === DOMAIN && !locked)
     next = {
-      label: busy === 'analyze' ? '분석하고 계획 준비 중…' : analysis && domainPlan ? '다음' : '분석 시작',
+      label: busy === 'analyze' ? t('분석하고 계획 준비 중…') : analysis && domainPlan ? t('다음') : t('분석 시작'),
       onClick: analyze,
       disabled: !domainReady(domainChoice),
     }
-  if (step === DOMAIN && locked) next = { label: '다음', onClick: () => setStep(ANALYSIS) }
+  if (step === DOMAIN && locked) next = { label: t('다음'), onClick: () => setStep(ANALYSIS) }
   if (step === ANALYSIS && !locked) {
     if (!rec) {
       // 배포할 수 없거나 Dockerfile을 넣어야 하면 계획을 기다리지 않으므로 '준비 중'으로 보이지 않게
       const waiting = !recError && !analysis?.blockers?.length && (!analysis?.dockerfileDraft || DRAFT_BUILD)
-      next = { label: waiting ? '계획 준비 중…' : '비용 승인', onClick: () => {}, disabled: true }
+      next = { label: waiting ? t('계획 준비 중…') : t('비용 승인'), onClick: () => {}, disabled: true }
     }
     else if (codeState === 'error' && analysis && choice)
-      next = { label: '코드 다시 만들기', onClick: () => prefetch(analysis.projectId, choice) }
-    else if (!choice) next = { label: '비용 승인', onClick: () => {}, disabled: true }
+      next = { label: t('코드 다시 만들기'), onClick: () => prefetch(analysis.projectId, choice) }
+    else if (!choice) next = { label: t('비용 승인'), onClick: () => {}, disabled: true }
     else
       next = {
-        label: codeState === 'loading' ? '계획 준비 중…' : '비용 승인',
+        label: codeState === 'loading' ? t('계획 준비 중…') : t('비용 승인'),
         onClick: () => setStep(REVIEW),
         disabled: codeState !== 'ready',
       }
   }
-  if (step === ANALYSIS && locked) next = { label: '다음', onClick: () => setStep(REVIEW) }
+  if (step === ANALYSIS && locked) next = { label: t('다음'), onClick: () => setStep(REVIEW) }
   // 앱과 도메인을 합친 월 비용이 예산을 넘으면 승인하지 않음 (PR #25 리뷰)
   const overBudget =
     selectedTier !== null && tierTotal(selectedTier) + (domainPlan?.monthlyUsd ?? 0) > scale.monthlyBudgetUsd
   if (step === REVIEW && !locked)
     next = {
       label:
-        busy === 'approve' ? '승인 처리 중…' : '승인하고 배포',
+        busy === 'approve' ? t('승인 처리 중…') : t('승인하고 배포'),
       onClick: approve,
       disabled: !confirmed || overBudget,
     }
-  if (step === REVIEW && locked) next = { label: '진행 상태로', onClick: () => setStep(DEPLOY) }
+  if (step === REVIEW && locked) next = { label: t('진행 상태로'), onClick: () => setStep(DEPLOY) }
 
   return (
     <div className="deploy-layout">
@@ -484,21 +490,21 @@ export default function NewDeploy({ onShowHistory }: Props) {
         <StepRail items={railItems} onSelect={setStep} />
         {option && selectedTier && (
           <div className="cost-note">
-            <span>{selectedTier.usualUsd !== undefined ? '월 최대 예상 비용' : '월 예상 비용'}</span>
+            <span>{selectedTier.usualUsd !== undefined ? t('월 최대 예상 비용') : t('월 예상 비용')}</span>
             <strong>{costText(tierTotal(selectedTier))}</strong>
-            {selectedTier.usualUsd !== undefined && <small>평소 {usd(selectedTier.usualUsd)} (부하가 늘면 최대까지)</small>}
+            {selectedTier.usualUsd !== undefined && <small>{t('평소 {cost} (부하가 늘면 최대까지)', { cost: usd(selectedTier.usualUsd) })}</small>}
             <small className="with-mark">
-              <ProviderMark provider={option.provider} /> {option.name} · {selectedTier.label}
+              <ProviderMark provider={option.provider} /> {t(option.name)} · {t(selectedTier.label)}
             </small>
-            <small className="muted">월 예산 {usd(scale.monthlyBudgetUsd)} 안</small>
+            <small className="muted">{t('월 예산 {budget} 안', { budget: usd(scale.monthlyBudgetUsd) })}</small>
             {domainPlan && domainPlan.mode !== 'none' && (
               <small>
-                주소 {domainPlan.name}
-                {domainPlan.monthlyUsd > 0 && ` · 매달 +${usd(domainPlan.monthlyUsd)}`}
+                {t('주소 {name}', { name: domainPlan.name ?? '' })}
+                {domainPlan.monthlyUsd > 0 && ' · ' + t('매달 +{cost}', { cost: usd(domainPlan.monthlyUsd) })}
               </small>
             )}
             {rec && (rec.recommended?.connectionId !== option.connectionId || rec.recommended?.tier !== selectedTier.key) && (
-              <small className="muted">추천과 다른 선택</small>
+              <small className="muted">{t('추천과 다른 선택')}</small>
             )}
           </div>
         )}
@@ -509,13 +515,13 @@ export default function NewDeploy({ onShowHistory }: Props) {
           <span className="eyebrow">
             {step + 1} / {STEPS.length}
           </span>
-          <h1>{meta.title}</h1>
-          <p>{meta.desc}</p>
+          <h1>{t(meta.title)}</h1>
+          <p>{t(meta.desc)}</p>
         </header>
 
         {error && (
           <div className="error" role="alert">
-            요청이 실패했습니다. {error}
+            {t('요청이 실패했습니다.')} {error}
           </div>
         )}
 
@@ -523,17 +529,19 @@ export default function NewDeploy({ onShowHistory }: Props) {
           {domainNotice && (step === ANALYSIS || step === REVIEW) && <p className="readonly-note">{domainNotice}</p>}
           {step === REVIEW && overBudget && (
             <div className="error" role="alert">
-              앱과 주소 비용을 합치면 월 예산 {usd(scale.monthlyBudgetUsd)}을 넘습니다. 예산을 늘리거나 더 작은 구성·다른 주소를 골라 주세요.
+              {t('앱과 주소 비용을 합치면 월 예산 {budget}을 넘습니다. 예산을 늘리거나 더 작은 구성·다른 주소를 골라 주세요.', {
+                budget: usd(scale.monthlyBudgetUsd),
+              })}
             </div>
           )}
           {step === SOURCE && (
             <div className="stack-lg">
               <section>
-                <h3 className="sub-title">소스</h3>
+                <h3 className="sub-title">{t('소스')}</h3>
                 <SourceStep source={source} locked={locked || busy === 'analyze'} onSource={setSource} />
               </section>
               <section>
-                <h3 className="sub-title">사용 규모</h3>
+                <h3 className="sub-title">{t('사용 규모')}</h3>
                 <ScaleStep scale={scale} locked={locked || busy === 'analyze'} onChange={setScale} />
               </section>
             </div>
@@ -607,7 +615,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
           <footer className="panel-foot">
             {step > SOURCE ? (
               <button className="btn btn-ghost" onClick={() => setStep(step - 1)} disabled={busy !== null}>
-                이전
+                {t('이전')}
               </button>
             ) : (
               <span />

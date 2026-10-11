@@ -23,7 +23,9 @@ function loadTs(relativePath, imports = {}) {
   return module.exports;
 }
 
-const format = loadTs('../../front/src/format.ts');
+// 화면 언어 모듈(기본 한국어). real.ts·format.ts 등이 t()로 문장을 만든다
+const i18n = loadTs('../../front/src/i18n/core.ts');
+const format = loadTs('../../front/src/format.ts', { './i18n/core': i18n });
 const scale = { expectedUsers: '100', pattern: 'steady', monthlyBudgetUsd: 100, purpose: '시험' };
 
 async function checkBundle(target, initCommand) {
@@ -60,7 +62,7 @@ async function checkBundle(target, initCommand) {
   };
   const api = loadTs('../../front/src/api/real.ts', {
     './http': { req, ApiError: class extends Error {} },
-    '../format': format,
+    '../format': format, '../i18n/core': i18n,
     '../providers': { isEnabled: (provider) => provider === (local ? 'onprem' : 'aws') },
   });
   const choice = { connectionId: local ? 'local-docker' : 'aws', tier: 'balanced' };
@@ -117,7 +119,7 @@ async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
   };
   const api = loadTs('../../front/src/api/real.ts', {
     './http': { req, ApiError: class extends Error {} },
-    '../format': format,
+    '../format': format, '../i18n/core': i18n,
     '../providers': { isEnabled: () => true },
   });
   const rec = await api.recommend('project-1', { ...scale, monthlyBudgetUsd });
@@ -164,7 +166,7 @@ await checkMixedRecommendation(100, 'local-docker');
     ApiError: class extends Error { constructor(status, message) { super(message); this.status = status; } },
   };
   const api = loadTs('../../front/src/api/real.ts', {
-    './http': http, '../format': format, '../providers': { isEnabled: (provider) => provider === 'aws' },
+    './http': http, '../format': format, '../i18n/core': i18n, '../providers': { isEnabled: (provider) => provider === 'aws' },
   });
   failures = [{ target: 'aws', reason, retryable: false, attempts: 1, updated_at: '2026-10-11T00:00:00Z' }];
   await assert.rejects(api.recommend('p-budget', scale), (e) => e.status === 422 && e.message.includes(reason));
@@ -182,6 +184,19 @@ await checkMixedRecommendation(100, 'local-docker');
     failures = final;   // 다음 확인(2초 뒤)에서 최종 실패가 보이면 끝난다
     await assert.rejects(run, (e) => e.status === 422);
   }
+  // 운영자 조치 필요(AWS 로그인 만료): 기다리기 시작한 뒤의 보고면 바로 끝내고, 그 전의 옛 기록은 무시한다(다시 로그인한 뒤 다시 기다리기)
+  const operator = { target: 'aws', reason: 'session has expired', kind: 'operator', retryable: true, attempts: 1 };
+  failures = [{ ...operator, updated_at: new Date().toISOString().replace('Z', '') }];   // 서버처럼 시간대 표시 없는 UTC
+  await assert.rejects(api.recommend('p-budget', scale), (e) => e.status === 503 && e.message.includes('session has expired'));
+  failures = [{ ...operator, updated_at: '2026-01-01T00:00:00' }];
+  {
+    let settled = false;
+    const run = api.recommend('p-budget', scale).then(() => { settled = true; }, (e) => { settled = true; throw e; });
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(settled, false, '조치 전의 옛 기록으로는 끝내지 않음');
+    failures = final;
+    await assert.rejects(run, (e) => e.status === 422);
+  }
   // 다른 안으로 다시 계획 요청: 본문과 예전 백엔드(404) 안내
   const posts = [];
   http.req = async (path, init) => {
@@ -190,7 +205,7 @@ await checkMixedRecommendation(100, 'local-docker');
     return { project_id: 'p-budget', target: 'aws', tier: 'roomy' };
   };
   const api2 = loadTs('../../front/src/api/real.ts', {
-    './http': { ...http, send: (method, body) => ({ method, body: JSON.stringify(body) }) }, '../format': format,
+    './http': { ...http, send: (method, body) => ({ method, body: JSON.stringify(body) }) }, '../format': format, '../i18n/core': i18n,
     '../providers': { isEnabled: (provider) => provider === 'aws' },
   });
   await api2.requestTier('p-budget', 'roomy');
@@ -215,7 +230,7 @@ await checkMixedRecommendation(100, 'local-docker');
     throw new Error(`Unexpected HTTP request: ${path}`);
   };
   const api = loadTs('../../front/src/api/real.ts', {
-    './http': { req, ApiError: class extends Error {} }, '../format': format, '../providers': { isEnabled: (p) => p === 'aws' },
+    './http': { req, ApiError: class extends Error {} }, '../format': format, '../providers': { isEnabled: (p) => p === 'aws' }, '../i18n/core': i18n,
   });
   const rec = await api.recommend('project-1', { ...scale, monthlyBudgetUsd: 150 });
   assert(rec.assumptions.some((a) => a.includes('공용 기반') && a.includes('들어 있음')), '공용 기반이 합쳐진 이전 계획은 그렇게 안내해야 한다');
@@ -236,9 +251,9 @@ const localPlan = () => ({
 function localAdapter(handler) {
   const http = { req: handler, send: (method, body) => ({ method, body: JSON.stringify(body) }), ApiError: class extends Error { constructor(status, message) { super(message); this.status = status; } } };
   const real = loadTs('../../front/src/api/real.ts', {
-    './http': http, '../format': format, '../providers': { isEnabled: (provider) => provider === 'aws' },
+    './http': http, '../format': format, '../i18n/core': i18n, '../providers': { isEnabled: (provider) => provider === 'aws' },
   });
-  return { local: loadTs('../../front/src/onprem/api.ts', { '../api/http': http, '../api/real': real }), real };
+  return { local: loadTs('../../front/src/onprem/api.ts', { '../api/http': http, '../api/real': real, '../i18n/core': i18n }), real };
 }
 {
   const calls = [];
