@@ -1410,7 +1410,7 @@ def read_capacity(cfg, env, cluster, deploy_id):
 
 
 def check_capacity(api, cfg, state):
-    """healthy AWS 배포의 CPU·태스크 수를 읽어, 최대 태스크 수를 다 쓰고도 CPU가 높으면 알림을 올리고 내려가면 푼다.
+    """healthy AWS 배포의 실제 CPU·태스크 수를 1분마다 보고한다(화면의 서버 사용률). 최대 태스크 수를 다 쓰고도 CPU가 높으면 active=True(알림).
     CAPACITY_CHECK_SECONDS마다 한 번. 실패는 배포 작업을 막지 않는다(이 백엔드에 API가 없으면 조용히 끈다)."""
     if not state.capacity_enabled or time.time() - state.capacity_checked < CAPACITY_CHECK_SECONDS:
         return
@@ -1446,19 +1446,18 @@ def check_capacity(api, cfg, state):
         if cpu is None:
             continue
         hot = cpu >= CAPACITY_CPU_THRESHOLD and running >= max_tasks
-        if state.capacity_alerts.get(did) == hot:
-            continue   # 바뀐 것만 알린다
+        # 실제 사용률은 매번 보고한다(화면이 0%처럼 지금 값을 보여 줌). 알림(active)은 위 조건일 때만
         message = (f"서버 사용률이 최근 {CAPACITY_WINDOW_MINUTES}분 평균 {cpu:.0f}%이고, 자동 확장이 최대 {max_tasks}대를 모두 쓰고 있습니다. "
                    "더 큰 안으로 다시 계획해 승인하면 서버를 늘릴 수 있습니다." if hot else
-                   f"서버 사용률이 {cpu:.0f}%로 내려갔습니다(실행 중 {running}대 / 최대 {max_tasks}대).")
+                   f"서버 사용률 {cpu:.0f}% (실행 중 {running}대 / 최대 {max_tasks}대)")
         try:
             api.post(f"/api/worker/deployments/{did}/alerts", {
                 "kind": "capacity", "active": hot, "message": message,
                 "metrics": {"cpu_percent": round(cpu, 1), "running_tasks": running, "max_tasks": max_tasks,
                             "window_minutes": CAPACITY_WINDOW_MINUTES}})
-            state.capacity_alerts[did] = hot
-            if hot:
+            if hot and not state.capacity_alerts.get(did):
                 log(f"용량 알림(배포 {did}): CPU {cpu:.0f}%, {running}/{max_tasks}대")
+            state.capacity_alerts[did] = hot
         except ApiError as e:
             log(f"용량 알림을 보내지 못했습니다(배포 {did}): {e}")
 

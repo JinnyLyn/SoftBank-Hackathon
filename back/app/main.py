@@ -801,13 +801,15 @@ ALERT_STREAM_HEARTBEAT_SECONDS = 15.0
 
 @app.get("/api/alerts/stream", tags=["alerts"])
 async def stream_alerts(request: Request, last_event_id: str | None = Header(default=None)) -> StreamingResponse:
-    """운영 알림을 SSE(text/event-stream)로 보낸다. 서버→브라우저 한 방향이라 WebSocket이 필요 없고,
+    """운영 알림과 서버 사용률을 SSE(text/event-stream)로 보낸다. 서버→브라우저 한 방향이라 WebSocket이 필요 없고,
     브라우저 EventSource가 끊기면 Last-Event-ID로 이어 받는다. 처음 연결하면 지금 켜진 알림을 먼저 보낸다."""
 
     def changed_since(cursor_at: datetime | None) -> list[dict[str, Any]]:
         with connect() as connection, connection.cursor() as cursor:
             if cursor_at is None:
-                cursor.execute(_ALERT_SELECT + " WHERE a.active = TRUE ORDER BY a.updated_at")
+                # 처음 연결: 켜진 알림과 최근에 보고된 사용률(10분 안)을 먼저 보낸다
+                cursor.execute(_ALERT_SELECT + " WHERE a.active = TRUE OR a.updated_at > (NOW(6) - INTERVAL 10 MINUTE)"
+                               " ORDER BY a.updated_at")
             else:
                 cursor.execute(_ALERT_SELECT + " WHERE a.updated_at > %s ORDER BY a.updated_at",
                                (cursor_at.astimezone(timezone.utc).replace(tzinfo=None),))

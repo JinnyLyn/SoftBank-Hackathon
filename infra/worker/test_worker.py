@@ -2438,7 +2438,8 @@ class CapacityTests(Base):
         self.assertEqual(body["metrics"], {"cpu_percent": 87.4, "running_tasks": 2, "max_tasks": 2, "window_minutes": 5})
         self.assertIn("최대 2대", body["message"])
         self.check()
-        self.assertEqual(len(self.backend.alerts), 1, "상태가 같으면 다시 보내지 않음")
+        self.assertEqual(len(self.backend.alerts), 2, "실제 사용률은 확인할 때마다 보고")
+        self.assertTrue(self.backend.alerts[1][1]["active"])
         os.environ["FAKE_CPU"] = "40"
         self.check()
         self.assertEqual(self.backend.alerts[-1][1]["active"], False, "내려가면 알림을 품")
@@ -2450,7 +2451,8 @@ class CapacityTests(Base):
         self.check()
         os.environ.update(FAKE_ECS_RUNNING="2", FAKE_CPU="none")   # 지표 없음
         self.check()
-        self.assertEqual([b["active"] for _, b in self.backend.alerts], [False], "처음 상태(정상)만 한 번 기록")
+        self.assertEqual([b["active"] for _, b in self.backend.alerts], [False], "여유가 있으면 알림 없이 사용률만, 지표가 없으면 보고하지 않음")
+        self.assertEqual(self.backend.alerts[0][1]["metrics"]["cpu_percent"], 95.0)
 
     def test_old_backend_disables_quietly_and_interval_is_respected(self):
         self.backend.monitored = None
