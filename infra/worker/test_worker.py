@@ -61,7 +61,7 @@ case "$cmd" in
       sleep 60
     fi
     [ "${FAKE_APPLY_RC:-0}" = "0" ] || { echo "[00:00:09] 헬스체크 실패" ; exit "$FAKE_APPLY_RC"; }
-    echo '{"url": {"value": "http://alb.example:8001"}}' > "$FAKE_DEPLOYMENTS/$1/outputs.json" ;;
+    echo "{\"url\": {\"value\": \"${FAKE_APPLY_URL:-http://alb.example:8001}\"}}" > "$FAKE_DEPLOYMENTS/$1/outputs.json" ;;
   diagnose) echo '{"deployId": "fake0001", "targets": []}' ;;
   *) echo "unknown $cmd" >&2; exit 9 ;;
 esac
@@ -292,7 +292,7 @@ class Base(unittest.TestCase):
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
         for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL",
                   "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC",
-                  "FAKE_BUILD_SRC_LOG"):
+                  "FAKE_BUILD_SRC_LOG", "FAKE_APPLY_URL"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
         os.environ["FAKE_HEARTBEAT"] = worker.posix(self.tmp / "heartbeat")
@@ -666,6 +666,51 @@ class RedactTests(unittest.TestCase):
 
     def test_plain_text_kept(self):
         self.assertEqual(worker.redact("헬스체크 대기 (최대 300초)"), "헬스체크 대기 (최대 300초)")
+
+
+class CheckHttpsTests(unittest.TestCase):
+    """도메인 접속 확인 한 번(check_https)의 판정. 시험용 HTTP 서버로 응답 코드별 결과를 본다(인증서 검증은 urllib 기본 동작)."""
+
+    def setUp(self):
+        codes = self.codes = {"/ok": 200, "/moved": 302, "/missing": 404, "/broken": 503}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                code = codes.get(self.path, 404)
+                self.send_response(code)
+                if code == 302:
+                    self.send_header("Location", "/elsewhere")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def test_2xx_and_3xx_are_answers_like_the_alb_health_check(self):
+        self.assertEqual(worker.check_https(self.base + "/ok", timeout=5), (True, "HTTP 200"))
+        self.assertEqual(worker.check_https(self.base + "/moved", timeout=5), (True, "HTTP 302"))   # 리다이렉트는 따르지 않는다
+
+    def test_4xx_5xx_and_connection_errors_fail(self):
+        self.assertEqual(worker.check_https(self.base + "/missing", timeout=5), (False, "HTTP 404"))
+        self.assertEqual(worker.check_https(self.base + "/broken", timeout=5), (False, "HTTP 503"))
+        self.server.shutdown()
+        self.server.server_close()
+        ok, detail = worker.check_https(self.base + "/ok", timeout=5)
+        self.assertFalse(ok)
+        self.assertNotIn("HTTP", detail)   # 연결 오류의 종류가 남는다
+
+    def test_platform_domain_needs_both_the_base_domain_and_the_https_listener(self):
+        f = {"app_domain": "totorosi.cloud", "https_listener_arn": "arn:aws:elasticloadbalancing:sa-east-1:123456789012:listener/app/x/1/2"}
+        self.assertEqual(worker.platform_domain(f, "abcd1234"), "abcd1234.totorosi.cloud")
+        self.assertIsNone(worker.platform_domain({**f, "https_listener_arn": ""}, "abcd1234"))
+        self.assertIsNone(worker.platform_domain({**f, "app_domain": ""}, "abcd1234"))
+        self.assertIsNone(worker.platform_domain(None, "abcd1234"))   # foundation-info가 빈 객체(옛 foundation)
 
 
 class ApiTests(Base):
@@ -1282,6 +1327,31 @@ class PlannerTests(Base):
             worker.plan_project(self.api, self.cfg, PROJECT, self.analysis({"stack": []}))
         self.assertEqual(self.calls(), [])
 
+    DOMAIN_FOUNDATION = {"app_domain": "totorosi.cloud",
+                         "https_listener_arn": "arn:aws:elasticloadbalancing:sa-east-1:123456789012:listener/app/paved-clouds-alb/1/2"}
+
+    def test_foundation_with_app_domain_plans_the_platform_subdomain_instead_of_a_port(self):
+        os.environ["FAKE_FOUNDATION_JSON"] = json.dumps(self.DOMAIN_FOUNDATION)
+        worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+        up = [c for c in self.calls() if c.startswith("up ")][0]
+        self.assertIn("--domain fake0001.totorosi.cloud", up)
+        body = self.backend.created_plans[0]
+        self.assertEqual(body["variables"]["domain"], "fake0001.totorosi.cloud")   # 승인 대상(fingerprint)에 주소가 들어간다
+        self.assertIn("접속 주소: https://fake0001.totorosi.cloud", body["summary"])
+
+    def test_foundation_without_app_domain_keeps_the_port_listener(self):
+        for f in [{}, {"app_domain": "totorosi.cloud"}]:   # 옛 foundation, HTTPS 리스너가 없는 foundation
+            with self.subTest(foundation=f):
+                self.backend.created_plans.clear()
+                os.environ["FAKE_FOUNDATION_JSON"] = json.dumps(f) if f else ""
+                shutil.rmtree(self.tmp / "deployments" / "fake0001", ignore_errors=True)
+                worker.plan_project(self.api, self.cfg, PROJECT, self.analysis())
+                up = [c for c in self.calls() if c.startswith("up ")][-1]
+                self.assertNotIn("--domain", up)
+                body = self.backend.created_plans[0]
+                self.assertIsNone(body["variables"]["domain"])
+                self.assertIn("미리보기 주소", body["summary"])
+
 
 class ExecutorTests(Base):
     IMAGE = "123456789012.dkr.ecr.sa-east-1.amazonaws.com/paved-clouds/apps:fake0001-r1"
@@ -1340,6 +1410,56 @@ class ExecutorTests(Base):
     def test_deploying_is_reported_before_health_wait_ends_once(self):
         worker.execute_job(self.api, self.cfg, self.make_job())
         self.assertEqual(self.statuses().count("deploying"), 1)
+
+    def domain_job(self):
+        job = self.make_job()
+        job["variables"]["domain"] = "fake0001.totorosi.cloud"
+        job["variables"]["app"] = {"health_check_path": "/health"}
+        os.environ["FAKE_APPLY_URL"] = "https://fake0001.totorosi.cloud"
+        return job
+
+    def test_domain_deploy_checks_https_on_the_domain_after_healthy(self):
+        checked = []
+        with mock.patch.object(worker, "check_https", side_effect=lambda url: checked.append(url) or (True, "HTTP 200")):
+            worker.execute_job(self.api, self.cfg, self.domain_job())
+        self.assertEqual(checked, ["https://fake0001.totorosi.cloud/health"])
+        self.assertEqual(self.statuses(), ["deploying", "healthy", "healthy"])
+        self.assertEqual(self.backend.events[1][1]["url"], "https://fake0001.totorosi.cloud")
+        last = self.backend.events[-1][1]
+        self.assertEqual((last["event_type"], last["level"]), ("domain_verified", "info"))
+
+    def test_unreachable_domain_is_a_warning_and_the_app_stays_healthy(self):
+        # 앱 헬스(대상 그룹)와 도메인 연결 상태는 따로 관리한다. 도메인 실패로 healthy를 failed로 바꾸지 않는다
+        with mock.patch.object(worker, "DOMAIN_CHECK_ATTEMPTS", 3), mock.patch.object(worker, "DOMAIN_CHECK_DELAY", 0), \
+                mock.patch.object(worker, "check_https", return_value=(False, "SSLCertVerificationError: hostname mismatch")) as chk:
+            worker.execute_job(self.api, self.cfg, self.domain_job())
+        self.assertEqual(chk.call_count, 3)
+        self.assertEqual(self.statuses(), ["deploying", "healthy", "healthy"])
+        last = self.backend.events[-1][1]
+        self.assertEqual((last["event_type"], last["level"]), ("domain_failed", "warning"))
+        self.assertIn("hostname mismatch", last["message"])
+        self.assertEqual(last["details"]["attempts"], 3)
+
+    def test_domain_retry_succeeds_on_a_later_attempt(self):
+        answers = iter([(False, "URLError: timed out"), (True, "HTTP 200")])
+        with mock.patch.object(worker, "DOMAIN_CHECK_DELAY", 0), mock.patch.object(worker, "check_https", side_effect=lambda url: next(answers)):
+            worker.execute_job(self.api, self.cfg, self.domain_job())
+        last = self.backend.events[-1][1]
+        self.assertEqual((last["event_type"], last["details"]["attempts"]), ("domain_verified", 2))
+
+    def test_applied_url_different_from_the_planned_domain_is_reported_without_checking(self):
+        job = self.domain_job()
+        os.environ["FAKE_APPLY_URL"] = "https://paved-clouds-alb-1.sa-east-1.elb.amazonaws.com:8001"
+        with mock.patch.object(worker, "check_https") as chk:
+            worker.execute_job(self.api, self.cfg, job)
+        chk.assert_not_called()
+        self.assertEqual(self.backend.events[-1][1]["event_type"], "domain_failed")
+
+    def test_port_deploy_does_not_check_a_domain(self):
+        with mock.patch.object(worker, "check_https") as chk:
+            worker.execute_job(self.api, self.cfg, self.make_job())
+        chk.assert_not_called()
+        self.assertEqual(self.statuses(), ["deploying", "healthy"])
 
     def test_changed_source_after_approval_is_rejected_before_build(self):
         job = self.make_job()

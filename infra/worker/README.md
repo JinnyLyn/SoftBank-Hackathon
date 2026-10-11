@@ -4,7 +4,7 @@
 
 현재 제품 기준은 [PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`이다. 아래 AWS 자격 증명과 foundation 준비는 운영자/worker 환경용이며 사용자 계정·IAM 키 입력을 전제하지 않는다. 계정 이전은 [OPERATOR_AWS.md](../../docs/OPERATOR_AWS.md)를 따른다.
 
-이 worker의 `healthy`는 앱 배포 상태다. 도메인 신규 등록·DNS·인증서·호스트 라우팅의 제품 흐름은 아직 포함하지 않는다. 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
+이 worker의 `healthy`는 앱 배포 상태다. 사용자 독립 도메인의 신규 등록·연결 제품 흐름은 아직 포함하지 않는다. foundation에 `app_domain`이 있으면 운영자 도메인 아래의 플랫폼 자동 주소(`https://<deploy_id>.<app_domain>`)로 계획하고, 배포 뒤 그 주소의 HTTPS 응답을 `domain_verified`/`domain_failed` 이벤트로 남긴다(아래 executor 5). 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 이 이벤트를 백엔드 상태 API의 `domain`으로 바꾸는 계약은 백엔드와 맞춰야 한다. 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
 
 이 worker는 기본으로 AWS만 다룬다. 발표자 PC의 Docker로 올리는 선택 기능은 [로컬 Docker 배포](#로컬-docker-배포-발표자-pc-시연용-선택-기능)에 따로 적었고 `--targets local_docker`를 줄 때만 켜진다.
 
@@ -138,7 +138,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 ### 계획 변수 (프런트가 읽는 키)
 
-`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `shared_resources`(공용 기반 행, 승인 금액에 들어가지 않는 참고), `cost`(`app_monthly`(평소의 앱 추가 비용), `app_peak_monthly`(부하 최대 때의 앱 추가 비용, `cost_estimate.amount`와 같은 값), `shared_monthly`(공용 기반 비용, 참고), `total_monthly`·`peak_monthly`(앱 + 공용을 합친 참고용 총액), `amount_basis`(`app_peak_monthly`), `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `reserved_vcpu`(승인 대기·승인된 다른 계획의 예약), `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
+`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`domain`**(자동 주소 방식이면 `<deploy_id>.<app_domain>`, 포트 방식이면 `null`. foundation 출력에 `app_domain`과 `https_listener_arn`이 둘 다 있을 때만 자동 주소이고 `deploy.sh up --domain`으로 넘긴다), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `shared_resources`(공용 기반 행, 승인 금액에 들어가지 않는 참고), `cost`(`app_monthly`(평소의 앱 추가 비용), `app_peak_monthly`(부하 최대 때의 앱 추가 비용, `cost_estimate.amount`와 같은 값), `shared_monthly`(공용 기반 비용, 참고), `total_monthly`·`peak_monthly`(앱 + 공용을 합친 참고용 총액), `amount_basis`(`app_peak_monthly`), `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `reserved_vcpu`(승인 대기·승인된 다른 계획의 예약), `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
 현재는 **권장 단계 하나만** 계획으로 등록하고, 나머지 안은 `options`로 비교 정보만 알린다. 단계마다 Terraform 저장 계획이 따로 필요한데 한 배포 폴더에는 계획 하나만 둘 수 있어서, 단계 비교용 여러 계획은 아직 만들지 않았다(프런트 `README`의 "추천 비교표"는 계획이 하나면 그 하나만 보여 준다). 사용자가 다른 안을 고르는 흐름(선택한 안을 worker에 전달해 그 안으로 다시 계획)은 백엔드·프런트와 계약을 맞춰야 한다(`docs/OPEN_QUESTIONS.md`).
 
 ## executor: 승인된 작업 실행
@@ -150,6 +150,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 2. `deploy.sh build`로 ZIP에서 이미지를 빌드해 ECR에 올린다(계획에 적힌 이미지 주소와 같아야 한다). **계획에 기록한 `cpu_architecture`를 `--arch`로 넘겨** 계획과 같은 아키텍처로 빌드한다.
 3. `deploy.sh apply`로 저장된 계획 그대로 적용한다. 헬스체크 대기에 들어가면 `deploying`을 보고한다.
 4. 성공하면 접속 주소와 함께 `healthy`, 실패하면 `deploy.sh diagnose` 결과와 로그 끝부분을 담아 `failed`로 보고한다.
+5. 계획 변수에 `domain`이 있으면(자동 주소 방식) `https://<도메인><헬스체크 경로>`에 인증서를 검증하며 요청한다(리다이렉트는 따르지 않고 200~399면 응답으로 본다. 10초 간격 최대 12번). 응답하면 `domain_verified`, 끝내 응답하지 않거나 적용 결과 주소가 계획한 주소와 다르면 `domain_failed`(경고)를 같은 `healthy` 상태의 이벤트로 남긴다. 대상 그룹 헬스체크는 이미 통과했으므로 도메인 확인 실패로 `healthy`를 `failed`로 바꾸지 않는다(앱 헬스와 도메인 연결 상태를 따로 관리한다, AGENTS §5).
 
 - **보고는 일시 오류(연결 실패, 5xx)면 최대 4번 다시 보낸다.** 4xx(상태 전이 거부 등)는 다시 보내도 같아서 바로 올린다. `deploying` 보고가 끝내 실패해도 apply 출력 읽기는 멈추지 않고, 끝난 뒤 `deploying`을 다시 보내고 `healthy`를 보낸다(백엔드는 `provisioning`에서 `healthy`로 바로 갈 수 없다).
 - **제한 시간**(계획 15분, 빌드 20분, 적용 25분)을 넘기면 bash만이 아니라 **하위 프로세스(terraform·docker) 전체를 종료**하고 `failed`로 보고한다(Windows는 `taskkill /T`, 그 밖에는 프로세스 그룹 종료). 종료된 Terraform은 state 잠금이 남을 수 있어 `deploy.sh` 재시도 전에 확인이 필요하다.

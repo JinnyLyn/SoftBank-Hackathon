@@ -6,9 +6,9 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 
 제품 기준은 [PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`이다. AWS 계정·기반 인프라는 운영자가 준비하며 사용자가 IAM 키·DNS 지식을 갖고 있다고 전제하지 않는다. 이 문서의 CLI·계정 설정은 운영자/실행기용이다. 교차 계정 이전의 state·인증서·프로필 경계는 [OPERATOR_AWS.md](../docs/OPERATOR_AWS.md)를 확인한다.
 
-- 아래 구조·명령은 현재 구현된 포트별 리스너·ALB URL 방식이다. 사용자 독립 도메인을 연결하는 제품 목표나 실제 구매 자동화의 완성을 뜻하지 않는다.
+- 아래 구조·명령은 포트별 리스너·ALB URL 방식(기본)과, foundation에 `app_domain`을 지정했을 때 쓰는 플랫폼 자동 주소 `https://<deploy_id>.<app_domain>` 방식(아래 [앱 자동 주소](#앱-자동-주소-deploy_idapp_domain))이다. 자동 주소는 운영자 도메인 아래의 미리보기·기본 주소이며, 사용자 독립 도메인을 연결하는 제품 목표나 실제 구매 자동화의 완성을 뜻하지 않는다.
 - 기존 확보 도메인 연결 시연(A)과 신규 등록부터 자동화(B)의 최종 선택은 확인 대상이다. 10/10 회의록의 인증서·DNS·호스트 규칙 목록은 구현 후보다. 선택 범위·계약·수동 준비·실제 시험 결과를 연결 PR에 남긴다.
-- 공유 443 리스너와 호스트 규칙으로 전환한다면 foundation/앱 state의 소유권, 수동 리소스 편입, 인증서·DNS 정리 범위를 먼저 정한다. 포트 제약이 줄어도 ALB 규칙·대상 그룹·인증서 할당량은 남는다. 진행 중 리스너를 문서만 보고 제거하지 않는다.
+- 공유 443 리스너와 호스트 규칙으로 전환한다면 foundation/앱 state의 소유권, 수동 리소스 편입, 인증서·DNS 정리 범위를 먼저 정한다. 포트 제약이 줄어도 ALB 규칙·대상 그룹·인증서 할당량은 남는다. 진행 중 리스너를 문서만 보고 제거하지 않는다. 자동 주소 방식의 경계: 443 리스너·인증서·와일드카드 DNS·인증서 검증 CNAME은 foundation state, 앱별 호스트 규칙은 그 배포의 state가 소유한다. 이미 포트로 배포된 앱은 그대로 두며, 포트 리스너는 `app_domain`이 없을 때의 대체 경로로 남긴다.
 - 앱 삭제와 도메인 등록 해지·갱신 중단은 별개다. 공유 인증서·hosted zone·다른 앱 레코드를 앱 destroy에 묶지 않는다. B를 구현할 경우 등록인 정보·구매 승인·중복 등록 방지도 별도 계약이 필요하다.
 - 검증은 앱의 `healthy`와 선택한 독립 도메인의 유효한 HTTPS·해당 앱 응답을 구분한다. 사전 확보 도메인의 수동 연결이나 자체 서명 인증서 시험을 신규 사용자의 구매부터 자동화한 것으로 보고하지 않는다.
 
@@ -19,8 +19,8 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 | 경로 | 역할 | 누가 실행하나 |
 |---|---|---|
 | `bootstrap/` | Terraform state를 보관하는 S3 버킷(버전 관리, 암호화, 공개 차단, 잠금). foundation보다 오래 살아야 해서 따로 둔다 | 담당자가 최초 1회 |
-| `foundation/` | 사전 생성 리소스: VPC, 서브넷, 보안 그룹(ALB·NAT·DB), 공유 ALB(HTTPS 선택), ECS 클러스터, ECR, 태스크 실행 역할, RDS MySQL, DB 접속 정보 파라미터 | 담당자가 행사 전에 1회 apply. 플랫폼은 건드리지 않는다 |
-| `modules/ecs-web-app/` | 검증된 모듈. 배포 1건 = 앱 전용 보안 그룹, 로그 그룹, 태스크 정의, 대상 그룹, 전용 포트 리스너, ECS 서비스, 오토스케일링 | 배포 루트가 호출 |
+| `foundation/` | 사전 생성 리소스: VPC, 서브넷, 보안 그룹(ALB·NAT·DB), 공유 ALB(HTTPS 선택), 앱 자동 주소 DNS(선택), ECS 클러스터, ECR, 태스크 실행 역할, RDS MySQL, DB 접속 정보 파라미터 | 담당자가 행사 전에 1회 apply. 플랫폼은 건드리지 않는다 |
+| `modules/ecs-web-app/` | 검증된 모듈. 배포 1건 = 앱 전용 보안 그룹, 로그 그룹, 태스크 정의, 대상 그룹, 전용 포트 리스너 또는 공유 443 리스너의 호스트 규칙, ECS 서비스, 오토스케일링 | 배포 루트가 호출 |
 | `modules/ecs-web-app/app-config.schema.json` | LLM 출력이 따라야 할 JSON 스키마. `variables.tf`의 LLM 입력과 규칙이 같다 | LLM 계층이 3·5단계 출력 검증에 사용 |
 | `deployments/_template/` | 배포 건별 루트 모듈 템플릿 | 플랫폼이 `deployments/<deploy_id>/`로 복사해서 사용 |
 | `platform/` | **플랫폼 자체**(백엔드+프런트)를 같은 모듈로 AWS에 올리는 이미지 정의와 설정. 시연용 서버 실행이며 로그인이 없다. 한계는 [platform/README.md](platform/README.md) | 운영자가 `deploy.sh up --secret`으로 |
@@ -35,7 +35,7 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 | `main.tf` | — | 모듈 개요, 리전 조회, 태스크 크기 프리셋, DB 접속 정보 선택 등 공용 `locals` |
 | `cloudwatch.tf` | CloudWatch Logs | 배포 건별 로그 그룹 |
 | `ecs.tf` | ECS Fargate | 태스크 정의(컨테이너 실행 명세), 서비스(서킷 브레이커 포함) |
-| `alb.tf` | ELB | 대상 그룹, 이 배포 전용 포트 리스너(HTTPS면 인증서 포함) |
+| `alb.tf` | ELB | 대상 그룹, 이 배포 전용 포트 리스너(HTTPS면 인증서 포함). `domain_name`을 주면 포트 리스너 대신 foundation 443 리스너에 호스트 규칙 하나 |
 | `security_groups.tf` | VPC 보안 그룹 | 앱 전용 보안 그룹과 ALB·DB 쪽 허용 규칙 |
 | `autoscaling.tf` | Application Auto Scaling | 태스크 수 범위, CPU 기준 자동 증감 |
 | `variables.tf`, `outputs.tf`, `versions.tf`, `app-config.schema.json` | — | 입력 변수, 출력값, provider 버전, LLM 출력 스키마 |
@@ -50,6 +50,7 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 | `ec2_nat.tf` | EC2 | NAT 인스턴스(AZ마다 또는 1대), Elastic IP, 자동 복구 알람, 프라이빗 라우트 테이블과 NAT 경로 |
 | `security_groups.tf` | VPC 보안 그룹 | ALB, NAT, DB, DB 작업용 방화벽. 앱 태스크용은 배포 모듈이 앱마다 만든다 |
 | `alb.tf` | ELB | 공유 ALB, 80번 기본 리스너. 인증서를 주면 443 리스너와 80→443 리다이렉트 |
+| `dns.tf` | Route 53 | `app_domain`을 주면 `*.<app_domain>` → ALB 와일드카드 A 별칭과 ACM 인증서 검증 CNAME. 호스팅 영역과 apex 레코드는 만들거나 바꾸지 않는다 |
 | `ecs.tf` | ECS | ECS 클러스터 |
 | `ecr.tf` | ECR | 이미지 저장소와 수명 주기 정책 |
 | `iam.tf` | IAM | 태스크 실행 역할, DB 접속 정보 읽기 권한(공유 URL, 관리자 비밀번호, `/apps/*`) |
@@ -64,7 +65,7 @@ Paved Clouds의 AWS 배포 계층이다. 담당: 이태훈
 
 | 파일 | 작성 주체 | 내용 |
 |---|---|---|
-| `platform.auto.tfvars.json` | 플랫폼 코드 | `deploy_id`, `image`, `cpu_architecture`, `listener_port`, `database_url_parameter_arn`(앱 전용 DB 접속 정보), `health_check_grace_seconds`, `foundation`(foundation 출력 그대로) |
+| `platform.auto.tfvars.json` | 플랫폼 코드 | `deploy_id`, `image`, `cpu_architecture`, `listener_port`(포트 방식) 또는 `domain_name`·`listener_rule_priority`(자동 주소 방식), `database_url_parameter_arn`(앱 전용 DB 접속 정보), `health_check_grace_seconds`, `foundation`(foundation 출력 그대로) |
 | `app.auto.tfvars.json` | 스키마 검증과 사용자 승인을 통과한 LLM 출력 | `container_port`, `health_check_path`, `task_size`, `min_tasks`, `max_tasks`, `use_database`, `environment` |
 
 검증은 두 겹이다. 1차는 LLM 계층의 JSON 스키마, 2차는 Terraform 변수 검증과 사전 조건이다. JSON 스키마로 표현할 수 없는 `max_tasks >= min_tasks`는 LLM 계층 코드와 Terraform 사전 조건에서 확인한다.
@@ -118,7 +119,27 @@ terraform -chdir=infra/foundation output -json deploy_inputs > infra/deployments
 | `final_snapshot` | `true` | RDS를 지울 때 최종 스냅샷을 남긴다 |
 | `budget_monthly_usd`, `budget_alert_emails` | `0`, 비움(만들지 않음) | 계정의 월 비용이 이 금액의 80%·100%를 넘거나 100%를 넘을 것으로 예측되면 이메일로 알리는 AWS Budgets를 만든다. **알림만 보내고 비용을 차단하지 않는다.** 둘 다 지정해야 만들어지고(금액만 주면 경고), 이메일은 코드에 적지 말고 `-var`로 넘긴다. 배포 역할에 `budgets:` 권한이 필요하다. 사용자가 입력한 앱별 월 예산과는 별개인 운영자용 안전망이다 |
 | `protect_from_destroy` | `true` | RDS 삭제 보호, ECR 강제 삭제 방지 |
+| `app_domain`, `app_domain_zone_id`, `certificate_validation_records` | 비움(포트 방식만) | 앱 자동 주소. 아래 [앱 자동 주소](#앱-자동-주소-deploy_idapp_domain) 참고 |
 | `ecr_keep_images` | `200` | ECR에 보관할 최근 앱 이미지 수. **저장소 하나를 모든 앱이 같이 쓰므로** 앱 수 × 되돌릴 버전 수보다 커야 한다. 부족하면 오래된 앱의 롤백 대상 이미지가 지워진다. DB 작업용 `tools-` 이미지는 별도 규칙이라 밀려나지 않는다 |
+
+### 앱 자동 주소 (`<deploy_id>.<app_domain>`)
+
+포트 리스너(`https://<ALB 주소>:8001`) 대신 앱마다 `https://<deploy_id>.<app_domain>`(예: `https://lpad0001.totorosi.cloud`)을 준다. ALB 기본 주소는 인증서(`*.totorosi.cloud`) 이름과 달라 브라우저 경고가 뜨고, 리스너 할당량 때문에 앱이 49개로 제한되는 문제를 함께 푼다. 운영자 도메인 아래의 주소라서 사용자 독립 도메인 연결(제품 목표)을 대신하지 않는다.
+
+```bash
+terraform -chdir=infra/foundation apply -var="region=sa-east-1" -var="enable_nat_instance=true" \
+  -var="certificate_arn=<*.<app_domain>을 포함한 ACM 인증서 ARN>" \
+  -var="app_domain=totorosi.cloud" \
+  -var='certificate_validation_records=[{name="<검증 CNAME 이름>",value="<검증 CNAME 값>"}]'   # aws acm describe-certificate 의 ResourceRecord
+terraform -chdir=infra/foundation output -json deploy_inputs > infra/deployments/foundation.json
+```
+
+- **foundation(한 번)**: `*.<app_domain>`을 ALB로 향하는 와일드카드 A 별칭을 만든다. 앱마다 DNS를 바꾸지 않는다. 와일드카드는 `<app_domain>` 자체(apex)를 포함하지 않으므로 플랫폼 주소 레코드와 겹치지 않는다. 인증서 검증 CNAME이 지워져 있으면 ACM 자동 갱신이 실패하므로 같이 관리한다. 콘솔에서 먼저 만든 같은 레코드는 덮어써서 가져온다(`allow_overwrite`). 출력 `deploy_inputs`에 `app_domain`·`https_listener_arn`이 추가된다. 호스팅 영역은 같은 계정의 공개 영역을 이름으로 찾고, `app_domain_zone_id`로 지정할 수도 있다. `certificate_arn` 없이 `app_domain`만 주면 plan에서 막는다.
+- **배포**: `deploy.sh up --domain <id>.<app_domain>`이면 포트를 예약하지 않고 443 리스너의 규칙 우선순위를 예약한다(아래 배포 스크립트). 모듈은 포트 리스너 대신 `Host: <id>.<app_domain>` 규칙 하나를 만들고 `url` 출력이 `https://<id>.<app_domain>`이 된다. 허용하는 이름은 `<deploy_id>.<app_domain>` 한 단계뿐이다(와일드카드 DNS·인증서가 덮는 범위이고, 배포 ID가 겹치지 않으므로 다른 앱의 주소를 가로챌 수 없다). `deploy.sh`와 모듈이 각각 확인한다.
+- **worker**: foundation에 `app_domain`과 HTTPS 리스너가 있으면 새 AWS 계획을 자동으로 이 방식으로 만들고, 계획 변수 `domain`에 주소를 넣는다(승인 대상). 배포가 `healthy`가 된 뒤 `https://<도메인><헬스체크 경로>`를 인증서 검증과 함께 확인해 `domain_verified` 또는 `domain_failed`(경고) 이벤트를 남긴다. 도메인 확인 실패는 앱 상태(`healthy`)를 바꾸지 않는다. 자세한 내용은 [worker/README.md](worker/README.md).
+- **기존 배포**: 이미 포트로 배포된 앱은 그대로 동작한다. 모듈의 포트 리스너에 `count`가 붙어 주소가 `aws_lb_listener.app[0]`으로 바뀌지만 `moved` 블록으로 옮겨서 다시 만들지 않는다(현재 `platform` 배포 state에 읽기 전용 `plan`: 0 add, 0 change, 0 destroy). `update`·`rollback`은 입력 파일을 그대로 쓰므로 방식이 바뀌지 않는다. 포트 배포를 자동 주소로 옮기려면 새 배포가 필요하다.
+- **소유권과 삭제**: 443 리스너·인증서·와일드카드·검증 CNAME은 foundation, 호스트 규칙은 각 배포 state가 소유한다. 앱 `destroy`는 자기 규칙만 지운다. 손으로 만든 규칙(예: `platform` 배포의 `domain.tf`가 관리하는 `totorosi.cloud` 우선순위 100)은 우선순위를 피해 간다(1000부터 고른다).
+- **한도**: ALB당 규칙 기본 할당량은 100개(기본 규칙 제외)라 리스너 50개보다 넉넉하지만 무제한은 아니다. 대상 그룹·보안 그룹 규칙 할당량도 남는다.
 
 ## 배포 1건 (플랫폼 자동화 대상)
 
@@ -162,6 +183,7 @@ export AWS_REGION=sa-east-1
 bash infra/scripts/deploy.sh make-id  "프로젝트 이름"        # 이름(한글 포함)에서 배포 ID를 만든다. 같은 이름은 같은 ID
 bash infra/scripts/deploy.sh image-ref a1b2c3d4          # plan에 쓸 이미지 주소(ECR 주소:태그)를 미리 정한다
 bash infra/scripts/deploy.sh up       --id a1b2c3d4 --image <ecr_url>:a1b2c3d4-r1 --app app.json --plan-only   # 포트는 자동 할당. --id 대신 --name "프로젝트 이름" 도 된다
+bash infra/scripts/deploy.sh up       --id a1b2c3d4 --image <ecr_url>:a1b2c3d4-r1 --app app.json --plan-only --domain a1b2c3d4.totorosi.cloud   # 자동 주소(foundation에 app_domain 필요)
 bash infra/scripts/deploy.sh build    --id a1b2c3d4 --source app.zip --dockerfile Dockerfile --tag a1b2c3d4-r1 [--arch ARM64]   # 승인 뒤: 이미지 빌드·푸시
 bash infra/scripts/deploy.sh apply    a1b2c3d4     # 위에서 만든 승인된 저장 계획만 적용한다
 bash infra/scripts/deploy.sh update   a1b2c3d4 --image <ecr_url>:a1b2c3d4-r2 [--app app.json] --plan-only
@@ -173,13 +195,14 @@ bash infra/scripts/deploy.sh destroy  a1b2c3d4     # 앱 삭제. 앱 전용 DB�
 bash infra/scripts/deploy.sh drop-db  a1b2c3d4     # 앱 전용 DB와 계정을 지운다(되돌릴 수 없다)
 ```
 
-`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`. `build --arch`도 같은 값을 받아 계획과 같은 아키텍처로 빌드한다), `--secret 이름`(여러 번 가능), `--yes`, `--plan-only`.
+`up` 옵션: `--id` 또는 `--name`(둘 중 하나), `--port 8001|auto`(기본 auto), `--domain <id>.<app_domain>`(포트 대신 자동 주소. `--port`와 함께 쓸 수 없다), `--shared-db`(앱 전용 DB를 쓰지 않음), `--grace 초`(헬스체크 유예), `--skip-nat-check`, `--arch X86_64|ARM64`(기본은 이 PC의 docker 아키텍처. `deploy.sh detect-arch`. `build --arch`도 같은 값을 받아 계획과 같은 아키텍처로 빌드한다), `--secret 이름`(여러 번 가능), `--yes`, `--plan-only`.
 
 - **`--secret 이름`**: 환경 변수 `<이름>`을 SSM SecureString `/<프로젝트>/apps/<id>/secrets/<이름>`에서 **비밀로** 주입한다(ECS `secrets`. 값은 plan·state·작업 정의에 들어가지 않고 컨테이너가 시작할 때 읽힌다). 파라미터는 운영자가 미리 만들어 두며, `up`이 **존재하는지와 SecureString인지**를 확인한다(값은 읽지 않는다). 모듈은 이 배포의 `/apps/<id>/secrets/<이름>`만 허용하고(다른 앱의 파라미터는 plan에서 막는다) `DATABASE_URL`·`environment`와 이름이 겹치면 막는다. `environment`는 `TOKEN`·`PASSWORD` 같은 이름을 평문으로 받지 않으므로 앱이 이런 비밀(예: 플랫폼 백엔드의 `WORKER_API_TOKEN`)을 받으려면 이 경로를 쓴다. foundation의 실행 역할이 이미 `/apps/*`를 읽을 수 있어 foundation 변경은 필요 없다. 입력 파일의 `platform.secret_parameter_arns`에 저장되므로 `update`·`rollback`에서도 유지된다. 예: [platform/](platform/README.md).
 
 - `app.json`은 `app.auto.tfvars.json`의 `app` 값만 담는다(예: `{"container_port": 8000, "health_check_path": "/health", "use_database": true, ...}`).
 - `--plan-only`는 계획을 `plan.json`으로 저장하고 멈춘다. 승인 후 `apply`가 **저장된 계획만** 실행한다. 승인 뒤에 새 계획을 만들지 않는다. `--plan-only` 없이 실행하면 계획을 보여 주고 `yes`를 입력받는다.
 - **리스너 포트**는 생략하면 공유 ALB에서 이미 쓰는 포트를 조회해 허용 범위(8001~8049)의 가장 작은 빈 포트를 고른다. 두 배포를 동시에 만들면 같은 포트를 고를 수 있고, 그때는 늦게 apply한 쪽이 실패한다.
+- **규칙 우선순위**(`--domain`): 포트와 같은 방법으로 고른다. 443 리스너에 이미 있는 규칙(손으로 만든 규칙 포함)과 이 PC의 미적용 계획이 예약한 번호(`priority.reserved`, 입력 파일의 `listener_rule_priority`)를 빼고 1000~49999(`RULE_PRIORITY_FROM`·`RULE_PRIORITY_TO`)에서 가장 작은 번호를 고르며, 포트 예약과 같은 잠금을 쓴다. 다른 PC에서 동시에 만든 계획과의 경합은 포트와 같은 한계가 있다(늦게 apply한 쪽이 `PriorityInUse`로 실패).
 - **헬스체크 대기**: ECS 배포가 `COMPLETED`이고 대상이 `healthy`일 때 통과한다. 대상만 보면 롤링 교체 중 옛 태스크 때문에 일찍 통과한다. 다음은 실패로 끝내고 이력에 기록하지 않는다.
   - 헬스체크가 4xx(예: 경로 오류 404)를 4번 연속 돌려줄 때. 기다려도 나아지지 않는 경우다. 실측으로 `apply` 후 183초에 실패가 확정됐다(태스크 기동과 대상 등록 약 1분 + 15초 간격 4회 확인). 5xx는 시작 중에 503을 주는 앱이 있어서 제외했다.
   - **이번 배포의** 태스크가 3개 이상 반복해서 죽을 때(현재 PRIMARY 배포가 시작한 태스크만 센다. 서비스 전체의 정지 태스크를 세면 이전 업데이트에서 교체된 태스크가 최근 1시간 동안 남아 있어서 업데이트를 몇 번 한 뒤의 정상 배포를 오판한다), 또는 대기 시간(`HEALTH_TIMEOUT`, 기본 300초)을 넘길 때
@@ -281,7 +304,7 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 
 - Apple Silicon에서 그냥 빌드한 이미지는 ARM64다. `--platform linux/amd64`로 빌드하거나 `cpu_architecture`를 `ARM64`로 넘긴다. 둘이 다르면 태스크가 바로 종료된다.
 - `container_port`나 `deploy_id`를 바꾸면 대상 그룹 이름이 충돌한다. 새 배포 ID로 배포한다. `deploy_id`는 소문자·숫자 4~8자다(하이픈 불가).
-- 앱 URL은 `<http|https>://<ALB 주소>:<8001~8049 포트>` 형식이다. ALB당 리스너 할당량 50개 중 80번(HTTPS면 443도)이 쓰고 남은 만큼만 동시에 유지할 수 있다(기본 설정에서 49개). 행사장 네트워크가 8000번대 포트를 막을 수 있으니 리허설 때 휴대폰 데이터와 행사장 Wi-Fi 양쪽에서 접속해 본다.
+- 앱 URL은 포트 방식이면 `<http|https>://<ALB 주소>:<8001~8049 포트>`, 자동 주소 방식이면 `https://<deploy_id>.<app_domain>`이다. 아래 포트 제약은 포트 방식에만 해당한다. ALB당 리스너 할당량 50개 중 80번(HTTPS면 443도)이 쓰고 남은 만큼만 동시에 유지할 수 있다(기본 설정에서 49개). 행사장 네트워크가 8000번대 포트를 막을 수 있으니 리허설 때 휴대폰 데이터와 행사장 Wi-Fi 양쪽에서 접속해 본다.
 - **HTTPS**: 인증서를 주지 않으면 비밀번호와 로그인 쿠키가 평문으로 오간다. 시험용으로만 쓴다. HTTPS를 켜면 앱의 `COOKIE_SECURE`도 `true`로 넘겨야 쿠키에 `Secure` 속성이 붙는다(예: `sample-back`). 반대로 HTTP로 `COOKIE_SECURE=true`를 주면 로그인이 되지 않는다. 도메인이 생기면 80/443 리스너의 호스트 헤더 라우팅으로 바꾸는 것이 정석이다.
 - DB 비밀번호는 foundation state에 남는다. 로컬 state를 쓰면 Git에 올리지 않고 담당자만 보관한다. S3 state를 쓰면 버킷 접근 권한을 담당자로 제한한다.
 - RDS는 MySQL 8.4다. 8.0은 2026-07-31 표준 지원이 끝나 유료 Extended Support 대상이라 막아 두었다.
@@ -302,9 +325,9 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 `python infra/scripts/test_infra.py` (자격증명이 없으면 `--skip-aws`)
 
 - A. 배포 모듈 입력 검증: 잘못된 값이 Terraform 단계에서 막히는지, 정상 값이 통과하는지
-- B. 배포 모듈 계획 내용: 앱 전용 보안 그룹, 서킷 브레이커, HTTPS 리스너, 앱별 DB 접속 정보
-- C. foundation 변수 검증과 계획 내용(NAT 수, AZ 수, AMI 고정, HTTPS, RDS 옵션). 계획 내용은 AWS 조회가 필요하다
-- D. `deploy.sh` 함수: `deploy_id` 규칙, 앱 전용 DB 이름·ARN, 비밀 마스킹, DB 작업 정의(로그 그룹·ARN·이미지가 입력과 같은지, 평문 비밀번호가 없는지), state 설정, NAT 부팅 로그 판정, 계획·입력 고정과 적용 차단, 이름→배포 ID, 아키텍처 감지, 앱 초기화(건너뛰기·시간 초과·실패 처리), ZIP 풀기 한도, build 임시 폴더 정리, DB 작업의 Lambda/Fargate 선택, 이미지 확인 시점
+- B. 배포 모듈 계획 내용: 앱 전용 보안 그룹, 서킷 브레이커, HTTPS 리스너, 자동 주소의 호스트 규칙·URL, 앱별 DB 접속 정보
+- C. foundation 변수 검증과 계획 내용(NAT 수, AZ 수, AMI 고정, HTTPS, 앱 자동 주소 DNS, RDS 옵션). 계획 내용은 AWS 조회가 필요하다
+- D. `deploy.sh` 함수: `deploy_id` 규칙, 앱 전용 DB 이름·ARN, 비밀 마스킹, DB 작업 정의(로그 그룹·ARN·이미지가 입력과 같은지, 평문 비밀번호가 없는지), state 설정, NAT 부팅 로그 판정, 계획·입력 고정과 적용 차단, 이름→배포 ID, 규칙 우선순위 예약과 `--domain` 검사, 아키텍처 감지, 앱 초기화(건너뛰기·시간 초과·실패 처리), ZIP 풀기 한도, build 임시 폴더 정리, DB 작업의 Lambda/Fargate 선택, 이미지 확인 시점
 - E. 정적 검사: `terraform fmt`, `validate`, `bash -n`
 
 판정은 Terraform이 실제로 내는 메시지로만 한다. 시험 환경이 고장난 것(초기화 실패 등)은 "차단 성공"이 아니라 **"시험환경오류"로 따로 센다**. 이 구분이 없으면 환경 오류가 전부 성공으로 읽힌다. 시험이 실제 실행과 같은 조건(Git Bash의 `/c/...` 경로)에서 도는지도 중요해서, 아래 AWS 시험에서 이 차이로 놓친 버그가 둘 있었다(고쳐서 시험에 반영했다).
@@ -368,6 +391,7 @@ terraform -chdir=infra/foundation destroy -var="region=sa-east-1" -var="enable_n
 - `up`이 `apply` 전에 실패했을 때 폴더를 지우는 동작, `destroy` 뒤 같은 ID 재사용, `update`·`rollback`의 입력 되돌리기, foundation 갱신, 계획 입력 고정·불일치 차단은 함수 단위 시험(모의 AWS)으로만 확인했고 실제 배포로 처음부터 끝까지 돌려 보지는 않았다.
 
 - 실제 도메인 인증서(ACM DNS 검증)와 도메인 기반 라우팅. 자체 서명 인증서로만 시험했다.
+- 앱 자동 주소(2026-10-11 추가)는 회귀 시험(모듈·foundation 계획, `deploy.sh` 함수)과 가짜 `deploy.sh`·시험용 백엔드의 worker 시험, 현재 `platform` 배포 state에 대한 읽기 전용 `plan`(기존 리스너 이동만, 변경 0)까지만 확인했다. foundation 적용(와일드카드·검증 CNAME), 실제 앱의 호스트 규칙 배포와 `https://<id>.totorosi.cloud` 응답은 확인하지 못했다.
 - 다른 PC에서 S3 state로 이어서 `destroy`(한 PC에서만 시험).
 - `db_multi_az`, `final_snapshot=true`로 삭제(스냅샷 남기기), `nat_high_availability=false`, `az_count=2`의 **실제 생성**(계획 내용만 회귀 시험으로 확인).
 - 두 배포를 정확히 동시에 `up`할 때의 포트 경합(문서에 한계를 적었다).

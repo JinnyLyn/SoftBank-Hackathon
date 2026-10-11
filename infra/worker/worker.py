@@ -82,6 +82,11 @@ FARGATE_QUOTA_CODE = "L-3032A538"
 FARGATE_USAGE_DIMENSIONS = {"Service": "Fargate", "Type": "Resource", "Resource": "vCPU", "Class": "Standard/OnDemand"}
 QUOTA_TIMEOUT = 30           # 초. aws CLI 호출 한 번의 제한 시간
 USAGE_WINDOW_MINUTES = 30    # 사용 중인 vCPU를 이 시간 동안의 최댓값으로 본다(지표는 몇 분 늦게 올라오고, 늘었다 줄어드는 사용량의 최대를 잡으려고)
+# 도메인 방식 배포의 최종 접속 확인: https://<도메인><헬스체크 경로>를 인증서 검증과 함께 요청한다(AGENTS.md 5장 10: HTTPS·앱 응답까지 확인해야 연결 성공).
+# 와일드카드 DNS는 foundation이 미리 만들어 두므로 보통 첫 시도에 끝난다. 시험에서는 줄인다
+DOMAIN_CHECK_ATTEMPTS = 12
+DOMAIN_CHECK_DELAY = 10      # 초. 시도 사이 간격
+DOMAIN_CHECK_TIMEOUT = 10    # 초. 요청 한 번의 제한 시간
 # 로그를 백엔드로 보내기 전에 한 번 더 가린다(백엔드도 가리지만 호출 측에서도 비밀을 보내지 않아야 한다)
 REDACT_RES = [
     re.compile(r"(?i)\b(AKIA|ASIA)[0-9A-Z]{16}\b"),
@@ -350,6 +355,16 @@ def find_bash():
 
 def deploy(cfg, *args):
     return [cfg.bash, posix(cfg.deploy_sh), *args]
+
+
+def platform_domain(foundation, deploy_id):
+    """foundation에 앱 자동 주소의 기반 도메인(app_domain)과 공유 443 리스너가 있으면 이 배포의 호스트 이름 <deploy_id>.<app_domain>.
+    없으면 None(포트 방식: ALB 기본 주소와 전용 포트). 배포 ID는 겹치지 않으므로 주소도 겹치지 않는다."""
+    f = foundation or {}
+    base = f.get("app_domain")
+    if isinstance(base, str) and base and f.get("https_listener_arn"):
+        return f"{deploy_id}.{base}"
+    return None
 
 
 # --- planner ---------------------------------------------------------------------------------------
@@ -700,6 +715,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     deploy_id = out.strip()
     if rc != 0 or not DEPLOY_ID_RE.match(deploy_id):
         raise PlanError(f"배포 ID를 만들지 못했습니다: {err.strip()[-200:]}")
+    domain = platform_domain(foundation, deploy_id)
     rc, out, err = run_capture(deploy(cfg, "image-ref", deploy_id), 120, cwd=str(INFRA), env=env)
     image = out.strip().splitlines()[-1] if out.strip() else ""
     if rc != 0 or ":" not in image:
@@ -716,9 +732,11 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     try:
         app_file = tmp / "app.json"
         app_file.write_text(json.dumps(app, ensure_ascii=False), encoding="utf-8")
-        log(f"계획 생성: 프로젝트 {project['id']} → 배포 ID {deploy_id}, 단계 {tier}")
-        rc, out = run_streaming(deploy(cfg, "up", "--id", deploy_id, "--image", image, "--app", posix(app_file), "--arch", arch, "--plan-only"),
-                                cfg.plan_timeout, cwd=str(INFRA), env=env)
+        log(f"계획 생성: 프로젝트 {project['id']} → 배포 ID {deploy_id}, 단계 {tier}" + (f", 주소 https://{domain}" if domain else ""))
+        up = ["--id", deploy_id, "--image", image, "--app", posix(app_file), "--arch", arch, "--plan-only"]
+        if domain:
+            up += ["--domain", domain]   # 포트 리스너 대신 공유 443 리스너의 호스트 규칙
+        rc, out = run_streaming(deploy(cfg, "up", *up), cfg.plan_timeout, cwd=str(INFRA), env=env)
         if rc != 0:
             raise PlanError("Terraform 계획을 만들지 못했습니다: " + redact(out)[-300:])
     finally:
@@ -740,6 +758,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
                           "why": "부하가 늘어 태스크가 최대 개수까지 늘었을 때만 더해지는 비용(평소에는 청구되지 않음). 승인 금액과 월 예산은 이 최대 비용 기준"})
     variables = {
         "deploy_id": deploy_id, "image": image, "dockerfile": dockerfile, "app": app,
+        # 도메인 방식이면 접속 호스트 이름(<deploy_id>.<app_domain>), 포트 방식이면 None. 승인 대상이고, executor가 배포 뒤 이 주소의 HTTPS 응답을 확인한다
+        "domain": domain,
         # 소스에 Dockerfile이 없으면 분석기가 만든 초안. 계획 변수에 넣어 승인 대상(fingerprint)이 되고, 빌드는 이 내용으로만 함
         "dockerfile_draft": dockerfile_draft_from_analysis(result),
         # 승인된 소스(ZIP)의 SHA-256과 이미지 아키텍처: executor가 빌드 직전에 확인하고 같은 아키텍처로 빌드한다
@@ -761,6 +781,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     summary = "\n".join([
         f"{est['label']} 구성({tier}): {app['task_size']} 태스크 {app['min_tasks']}개(최대 {app['max_tasks']}개), 포트 {app['container_port']}, "
         f"헬스체크 {app['health_check_path']}, 앱 전용 DB {'사용' if app['use_database'] else '미사용'}",
+        (f"접속 주소: https://{domain} (플랫폼 자동 주소. 공유 443 리스너의 호스트 규칙과 운영자 인증서를 쓴다)" if domain else
+         "접속 주소: ALB 기본 주소와 전용 포트(미리보기 주소. 도메인이 연결되지 않음)"),
         f"앱 추가 비용: 평소 월 ${est['app_monthly']:.2f}, 부하가 최대일 때(태스크 {app['max_tasks']}개) 월 ${est['app_peak_monthly']:.2f}",
         f"공용 기반(ALB·RDS·공인 IPv4)은 모든 앱이 함께 쓰는 고정비로 월 약 ${est['shared_monthly']:.2f}이며 승인 금액·예산 판정에 넣지 않았다(과금 방식은 미확정)",
         f"승인 금액은 부하가 최대일 때의 앱 추가 비용 월 ${est['app_peak_monthly']:.2f}"
@@ -930,6 +952,49 @@ def fail_job(api, deployment_id, event_type, message, details=None):
     report(api, deployment_id, "failed", event_type, message, level="error", details=details)
 
 
+def check_https(url, timeout=None):
+    """url에 GET을 한 번 보낸다. 인증서를 검증하고 리다이렉트는 따르지 않는다(ALB 헬스체크처럼 200~399면 응답으로 본다).
+    (성공 여부, 설명)을 돌려준다. 설명은 "HTTP 200"이나 연결·인증서 오류의 종류다."""
+    req = urllib.request.Request(url, method="GET", headers={"User-Agent": "paved-clouds-worker"})
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout or DOMAIN_CHECK_TIMEOUT) as r:
+            code = r.status
+    except urllib.error.HTTPError as e:
+        code = e.code
+    except urllib.error.URLError as e:
+        return False, f"{type(e.reason).__name__}: {e.reason}"[:300]
+    except (TimeoutError, OSError, http.client.HTTPException) as e:
+        return False, f"{type(e).__name__}: {e}"[:300]
+    return 200 <= code < 400, f"HTTP {code}"
+
+
+def verify_domain(api, deployment_id, domain, url, health_path):
+    """도메인 방식 배포가 healthy가 된 뒤 https://<도메인><헬스체크 경로>에 접속해 보고 domain_verified 또는 domain_failed 이벤트를 남긴다.
+    배포 상태(healthy)는 바꾸지 않는다: 대상 그룹 헬스체크는 이미 통과했고, 도메인 연결 상태는 앱 헬스와 따로 관리한다(AGENTS.md 5장 10).
+    확인에 성공하면 True."""
+    expected = f"https://{domain}"
+    if url != expected:
+        report(api, deployment_id, "healthy", "domain_failed", f"배포 결과 주소({url})가 계획한 도메인 주소({expected})와 다릅니다",
+               level="warning", details={"url": url, "expected": expected})
+        return False
+    target = expected + health_path
+    detail = ""
+    for attempt in range(DOMAIN_CHECK_ATTEMPTS):
+        ok, detail = check_https(target)
+        if ok:
+            log(f"도메인 접속 확인: {target} ({detail})")
+            report(api, deployment_id, "healthy", "domain_verified", f"{expected} 에 HTTPS로 접속해 앱 응답을 확인했습니다({detail})",
+                   details={"url": target, "attempts": attempt + 1})
+            return True
+        if attempt < DOMAIN_CHECK_ATTEMPTS - 1:
+            time.sleep(DOMAIN_CHECK_DELAY)
+    log(f"도메인 접속 실패: {target} ({detail})")
+    report(api, deployment_id, "healthy", "domain_failed",
+           f"앱은 정상(대상 그룹 헬스체크 통과)이지만 {expected} 에 HTTPS로 접속하지 못했습니다: {detail}",
+           level="warning", details={"url": target, "attempts": DOMAIN_CHECK_ATTEMPTS, "last_error": detail})
+    return False
+
+
 SOURCE_MISMATCH = ("source_mismatch",
                    "승인된 계획의 소스(ZIP)와 지금 소스가 다릅니다(파일이 없거나 SHA-256이 다릅니다). 빌드하지 않았습니다")
 
@@ -1081,6 +1146,10 @@ def execute_job(api, cfg, job):
             report(api, dep, "deploying", "apply_done", "인프라 적용이 끝났습니다")
         report(api, dep, "healthy", "healthy", "헬스체크를 통과했습니다", details={"log_tail": tail(out, 12)}, url=url)
         log(f"배포 완료: {url}")
+        domain = v.get("domain")
+        if isinstance(domain, str) and domain:
+            path = v["app"].get("health_check_path") if isinstance(v.get("app"), dict) else None
+            verify_domain(api, dep, domain, url, path if isinstance(path, str) and HEALTH_PATH_RE.match(path) else "/")
     except ApiError as e:
         log(f"백엔드 보고 실패: {e}")   # 보고가 안 되면 더 할 수 있는 것이 없다. 작업은 다음 점검에서 사람이 확인한다
     except Exception as e:   # noqa: BLE001 - 예상 못 한 오류도 failed로 남긴다

@@ -5,8 +5,8 @@
 
 확인하는 것
   A. 배포 모듈 입력 검증: 잘못된 값이 Terraform 단계에서 막히는지, 정상 값은 통과하는지
-  B. 배포 모듈 계획 내용: 앱 전용 보안 그룹, 서킷 브레이커, HTTPS 리스너, 앱별 DB 접속 정보
-  C. foundation 변수 검증과 계획 내용(NAT 수, AZ 수, AMI 고정, HTTPS, RDS 보호 옵션)
+  B. 배포 모듈 계획 내용: 앱 전용 보안 그룹, 서킷 브레이커, HTTPS 리스너, 도메인 방식의 호스트 규칙, 앱별 DB 접속 정보
+  C. foundation 변수 검증과 계획 내용(NAT 수, AZ 수, AMI 고정, HTTPS, 앱 자동 주소 DNS, RDS 보호 옵션)
      C의 계획 내용은 AWS 조회(가용 영역, AMI 파라미터)가 필요해서 자격증명이 없으면 건너뛴다
   D. deploy.sh 함수: deploy_id 규칙, 앱 전용 DB 이름·ARN, 비밀 마스킹, DB 작업 정의(비밀번호가 들어가지 않는지), state 설정
   E. 정적 검사: terraform fmt, validate (foundation, 템플릿, 부트스트랩)
@@ -158,6 +158,18 @@ FAKE_FOUNDATION = {
     "vpc_id": "vpc-00000000000000000",
 }
 FAKE_CERT = "arn:aws:acm:sa-east-1:123456789012:certificate/12345678-1234-1234-1234-123456789012"
+# 도메인 방식(앱 자동 주소)을 쓰는 foundation 출력: HTTPS 443 리스너와 app_domain이 있다
+FAKE_HTTPS_LISTENER = "arn:aws:elasticloadbalancing:sa-east-1:123456789012:listener/app/paved-clouds-alb/0000000000000000/1111111111111111"
+DOMAIN_FOUNDATION = {"listener_protocol": "HTTPS", "certificate_arn": FAKE_CERT, "app_domain": "totorosi.cloud",
+                     "https_listener_arn": FAKE_HTTPS_LISTENER}
+
+
+def domain_mode(p, **over):
+    """BASE_P를 도메인 방식 입력으로 바꾼다. 도메인 방식은 포트를 쓰지 않으므로 입력 파일에 listener_port가 없어도 된다"""
+    p.pop("listener_port", None)
+    p["foundation"].update(DOMAIN_FOUNDATION)
+    p.update(domain_name="abcd1234.totorosi.cloud", listener_rule_priority=1000)
+    p.update(over)
 ECR = FAKE_FOUNDATION["ecr_repository_url"]
 BASE_P = {"region": "sa-east-1", "deploy_id": "abcd1234", "image": ECR + ":abcd1234-r1", "cpu_architecture": "X86_64",
           "listener_port": 8001, "foundation": FAKE_FOUNDATION}
@@ -258,6 +270,20 @@ def part_a(d):
         f"S{i}": f"arn:aws:ssm:sa-east-1:123456789012:parameter/paved-clouds/apps/abcd1234/secrets/S{i}" for i in range(11)}), why="secret_parameter_arns")
     case_module(d, "deregistration_delay_seconds=301", "차단", lambda p: p.update(deregistration_delay_seconds=301), why="deregistration_delay_seconds")
     case_module(d, "정상: HTTPS + 인증서", "통과", lambda p: p["foundation"].update(listener_protocol="HTTPS", certificate_arn=FAKE_CERT))
+    # 도메인 방식: 포트 리스너 대신 foundation의 공유 443 리스너에 <deploy_id>.<app_domain> 호스트 규칙 하나
+    case_module(d, "정상: 도메인 방식(<id>.<app_domain>, 포트 없음)", "통과", domain_mode)
+    case_module(d, "도메인 방식: 다른 배포 ID의 주소(가로채기)", "차단", lambda p: domain_mode(p, domain_name="zzzz9999.totorosi.cloud"),
+                why="<deploy_id>.<foundation.app_domain>")
+    case_module(d, "도메인 방식: 두 단계 이름(와일드카드 DNS·인증서 밖)", "차단", lambda p: domain_mode(p, domain_name="www.abcd1234.totorosi.cloud"),
+                why="<deploy_id>.<foundation.app_domain>")
+    case_module(d, "도메인 방식: 대문자 호스트", "차단", lambda p: domain_mode(p, domain_name="ABCD1234.totorosi.cloud"), why="domain_name")
+    case_module(d, "도메인 방식: 우선순위 50001", "차단", lambda p: domain_mode(p, listener_rule_priority=50001), why="listener_rule_priority")
+    case_module(d, "도메인 방식: 우선순위 1.5", "차단", lambda p: domain_mode(p, listener_rule_priority=1.5), why="listener_rule_priority")
+    case_module(d, "도메인 방식: foundation에 443 리스너 없음", "차단",
+                lambda p: (domain_mode(p), p["foundation"].update(https_listener_arn="")), why="https_listener_arn")
+    case_module(d, "도메인 방식: foundation에 app_domain 없음", "차단",
+                lambda p: (domain_mode(p), p["foundation"].update(app_domain="")), why="<deploy_id>.<foundation.app_domain>")
+    case_module(d, "포트 방식인데 listener_port 없음", "차단", lambda p: p.pop("listener_port"), why="listener_port")
 
 
 def part_b(d):
@@ -342,6 +368,26 @@ def part_b(d):
         is_("HTTPS면 리스너에 인증서와 TLS 정책이 붙는다", lst and lst[0]["protocol"] == "HTTPS" and lst[0]["certificate_arn"] == FAKE_CERT and lst[0]["ssl_policy"], str(lst[:1]))
         is_("HTTPS면 접속 URL이 https://", "https://" in out, "")
 
+    # 포트 방식(기본)은 리스너 하나, 호스트 규칙 없음. count를 붙인 리스너의 주소는 [0]이고 기존 배포는 moved 블록으로 옮겨진다
+    plan, out = planned_with()
+    if plan:
+        addrs = [rc["address"] for rc in plan["resource_changes"]]
+        is_("포트 방식: 전용 포트 리스너(aws_lb_listener.app[0]) 하나, 호스트 규칙 없음",
+            "module.app.aws_lb_listener.app[0]" in addrs and not any("aws_lb_listener_rule" in a for a in addrs), str([a for a in addrs if "lb_listener" in a]))
+    plan, out = planned_with(pm=lambda p: domain_mode(p, listener_rule_priority=1234))
+    if plan is None:
+        say("fail", "B 도메인 방식 계획 만들기", out[:200].replace("\n", " "))
+    else:
+        rules = planned(plan, "module.app.aws_lb_listener_rule.app")
+        r = rules[0] if rules else {}
+        host = [c["host_header"][0]["values"] for c in r.get("condition", []) if c.get("host_header")]
+        is_("도메인 방식: 포트 리스너를 만들지 않는다", not planned(plan, "module.app.aws_lb_listener.app"))
+        is_("도메인 방식: 공유 443 리스너에 이 배포의 호스트 규칙 하나(우선순위·호스트·전달)",
+            len(rules) == 1 and r.get("listener_arn") == FAKE_HTTPS_LISTENER and r.get("priority") == 1234
+            and host == [["abcd1234.totorosi.cloud"]] and r["action"][0]["type"] == "forward", str(rules)[:240])
+        url = plan.get("output_changes", {}).get("url", {}).get("after")
+        is_("도메인 방식: 접속 URL은 https://<id>.<app_domain>(포트 없음)", url == "https://abcd1234.totorosi.cloud", str(url))
+
 
 def prepare_foundation_dir():
     d = WORK / "foundation"
@@ -387,6 +433,11 @@ def part_c(d, with_aws):
     inv("budget_monthly_usd=-1", R, "-var=budget_monthly_usd=-1")
     inv("budget_alert_emails 형식 오류", R, '-var=budget_alert_emails=["nope"]')
     inv("budget_alert_emails 11개", R, "-var=budget_alert_emails=[" + ",".join(f'"a{i}@example.com"' for i in range(11)) + "]")
+    inv("app_domain 대문자", R, "-var=app_domain=Totorosi.Cloud")
+    inv("app_domain에 와일드카드", R, "-var=app_domain=*.totorosi.cloud")
+    inv("app_domain_zone_id 접두사 포함", R, "-var=app_domain_zone_id=/hostedzone/Z0123456789ABC")
+    inv("certificate_validation_records 값이 ACM 검증 주소가 아님", R,
+        '-var=certificate_validation_records=[{name="_abc.totorosi.cloud.",value="evil.example.com."}]')
 
     if not with_aws:
         print("\n=== C. foundation 계획 내용 === (AWS 자격증명이 없거나 --skip-aws라서 건너뜀)")
@@ -467,6 +518,36 @@ def part_c(d, with_aws):
             and planned(https, "aws_lb_listener.default")[0]["default_action"][0]["type"] == "redirect")
         di = https["output_changes"]["deploy_inputs"]["after"]
         is_("certificate_arn 지정: 출력의 listener_protocol=HTTPS, certificate_arn 전달", di.get("listener_protocol") == "HTTPS" and di.get("certificate_arn") == FAKE_CERT, str(di.get("listener_protocol")))
+    is_("기본: 앱 자동 주소 DNS가 없다(app_domain 비어 있음)", n(base, "aws_route53_record.") == 0)
+    # 앱 자동 주소: *.<app_domain> 와일드카드 A 별칭 하나와 인증서 검증 CNAME. 호스팅 영역 ID를 주면 이름으로 찾지 않는다(AWS 조회 없음)
+    zone = "Z0000000000000000000A"
+    rec = '-var=certificate_validation_records=[{name="_abc123.totorosi.cloud.",value="_def456.xyz.acm-validations.aws."}]'
+    dom, out = pj("-var=enable_nat_instance=true", f"-var=certificate_arn={FAKE_CERT}", "-var=app_domain=totorosi.cloud",
+                  f"-var=app_domain_zone_id={zone}", rec)
+    if dom is None:
+        say("fail", "C 앱 자동 주소 계획 만들기", out[:200].replace("\n", " "))
+    else:
+        w = planned(dom, "aws_route53_record.apps_wildcard")
+        is_("app_domain: *.<app_domain> A 별칭 하나(지정한 호스팅 영역, 덮어쓰기 허용)",
+            len(w) == 1 and w[0]["name"] == "*.totorosi.cloud" and w[0]["type"] == "A" and w[0]["zone_id"] == zone
+            and w[0]["allow_overwrite"] is True and len(w[0]["alias"]) == 1, str(w)[:200])
+        v = planned(dom, "aws_route53_record.certificate_validation")
+        is_("app_domain: 인증서 검증 CNAME(이름 끝의 점 제거, 값 그대로)",
+            len(v) == 1 and v[0]["name"] == "_abc123.totorosi.cloud" and v[0]["type"] == "CNAME" and v[0]["records"] == ["_def456.xyz.acm-validations.aws."],
+            str(v)[:200])
+        is_("app_domain: apex 레코드는 만들지 않는다(플랫폼 주소는 별도 수명 주기)",
+            all(r["name"] != "totorosi.cloud" for r in planned(dom, "aws_route53_record.")))
+        di = dom["output_changes"]["deploy_inputs"]
+        is_("app_domain: 출력에 app_domain, 443 리스너 ARN은 apply 때 정해진다",
+            di["after"].get("app_domain") == "totorosi.cloud" and (di.get("after_unknown") or {}).get("https_listener_arn") is True, str(di)[:200])
+    code, out = tf(d, "plan", "-input=false", "-refresh=false", "-lock=false", "-no-color", "-var=region=sa-east-1",
+                   "-var=app_domain=totorosi.cloud", f"-var=app_domain_zone_id={zone}")
+    is_("app_domain만 있고 인증서가 없으면 막는다(호스트 규칙은 HTTPS 443 리스너에만 붙는다)",
+        code != 0 and "Resource precondition failed" in out and "certificate_arn" in out, out[-200:].replace("\n", " "))
+    code, out = tf(d, "plan", "-input=false", "-refresh=false", "-lock=false", "-no-color", "-var=region=sa-east-1", f"-var=certificate_arn={FAKE_CERT}",
+                   "-var=app_domain=totorosi.cloud", f"-var=app_domain_zone_id={zone}",
+                   '-var=certificate_validation_records=[{name="_abc123.other.example.",value="_def456.xyz.acm-validations.aws."}]')
+    is_("검증 레코드 이름이 app_domain 밖이면 막는다", code != 0 and "Resource precondition failed" in out, out[-200:].replace("\n", " "))
     snap, out = pj("-var=enable_nat_instance=true", "-var=final_snapshot=false", "-var=db_multi_az=true", "-var=db_backup_retention_days=14")
     if snap:
         db = planned(snap, "aws_db_instance.this")[0]
@@ -1268,6 +1349,64 @@ def part_d():
     rc2, out2, err2 = sh(with_root(r2) + 'local_reserved_ports abcd0099')
     say("ok" if rc != 0 and not (r2 / "deployments" / "abcd0014").exists() and out2.split() == ["8001", "8002"] else "fail",
         "D up 실패: 만들다 만 폴더가 정리되면 그 포트 예약도 풀린다", f"rc={rc} reserved={out2.strip()}")
+
+    # 도메인 방식: 포트 대신 443 리스너의 규칙 우선순위를 예약한다(포트와 같은 방법·같은 잠금). 범위는 1000부터
+    froot = fresh_root("priority_root")
+    dfj = WORK / "foundation_domain.json"
+    dfj.write_text(json.dumps({**FAKE_FOUNDATION, **DOMAIN_FOUNDATION}), encoding="utf-8")
+    use_dfj = f'FOUNDATION_JSON={P(dfj)}; '
+    rc, out, err = sh(with_root(froot) + use_dfj + 'aws() { return 255; }; pick_priority')
+    say("ok" if rc != 0 and out.strip() == "" and "조회하지 못했습니다" in err else "fail",
+        "D 규칙 우선순위: 규칙 조회 실패를 숨기고 1000을 고르지 않는다", f"rc={rc} out={out.strip()} {err[:60]}")
+    rc, out, err = sh(with_root(froot) + use_dfj + 'aws() { echo "100 default 1000 1001"; }; pick_priority')
+    say("ok" if out.strip() == "1002" else "fail", "D 규칙 우선순위: 기존 규칙(수동 규칙 100, default 포함)을 건너뛰고 1000부터 가장 작은 빈 번호", out.strip())
+    pa, pb = deploy_folder(froot, "dom00001"), deploy_folder(froot, "dom00002")
+    rc1, o1, e1 = sh(with_root(froot) + use_dfj + f'aws() {{ echo "100 default"; }}; reserve_priority dom00001 {P(pa)}')
+    rc2, o2, e2 = sh(with_root(froot) + use_dfj + f'aws() {{ echo "100 default"; }}; reserve_priority dom00002 {P(pb)}')
+    say("ok" if (rc1, rc2) == (0, 0) and (o1.strip(), o2.strip()) == ("1000", "1001") and (pa / "priority.reserved").exists() else "fail",
+        "D 규칙 우선순위 예약: 승인 전에 순서대로 계획한 두 배포가 서로 다른 번호를 받는다(1000, 1001)", f"{o1.strip()} {o2.strip()} {e1[:50]} {e2[:50]}")
+    dz = froot / "deployments" / "dom00003"
+    dz.mkdir()
+    (dz / "platform.auto.tfvars.json").write_text(json.dumps({"platform": {"listener_port": 0, "listener_rule_priority": 1005}}), encoding="utf-8")
+    rc, out, err = sh(with_root(froot) + 'local_reserved_priorities dom00099; echo "|"; local_reserved_ports dom00099')
+    pri, ports = (out.split("|") + [""])[:2]
+    say("ok" if rc == 0 and pri.split() == ["1000", "1001", "1005"] and ports.split() == [] else "fail",
+        "D 예약: 도메인 방식 배포의 우선순위는 세고, 그 배포의 listener_port 0은 포트 예약으로 세지 않는다", out.strip())
+
+    rc, out, err = sh(with_root(froot) + 'check_domain abcd1234 abcd1234.totorosi.cloud')
+    say("ok" if rc != 0 and "app_domain" in err else "fail", "D --domain: foundation에 app_domain·443 리스너가 없으면 거부", err[:80])
+    rc, out, err = sh(with_root(froot) + use_dfj + 'check_domain abcd1234 abcd1234.totorosi.cloud')
+    say("ok" if rc == 0 else "fail", "D --domain: <id>.<app_domain> 허용", err[:80])
+    for bad in ["zzzz9999.totorosi.cloud", "www.abcd1234.totorosi.cloud", "abcd1234.other.example"]:
+        rc, out, err = sh(with_root(froot) + use_dfj + f'check_domain abcd1234 {bad}')
+        say("ok" if rc != 0 and "abcd1234.totorosi.cloud" in err else "fail", f"D --domain: {bad} 거부(다른 배포의 주소·인증서 밖)", err[:80])
+
+    # cmd_up 통합: --domain이면 포트를 예약하지 않고 우선순위를 예약해 입력 파일에 도메인과 함께 고정한다
+    r3 = fresh_root("domain_root_up")
+    dstubs = stubs.replace("aws() { echo 80; }", 'aws() { echo "100 default"; }') + use_dfj
+    rc, out, err = sh(with_root(r3) + dstubs + up("dom00011", "--domain dom00011.totorosi.cloud") + "; " + up("dom00012", "--domain dom00012.totorosi.cloud"))
+    got = []
+    for i in ("dom00011", "dom00012"):
+        try:
+            pf = json.loads((r3 / "deployments" / i / "platform.auto.tfvars.json").read_text(encoding="utf-8"))["platform"]
+            got.append((pf["domain_name"], pf["listener_rule_priority"], pf["listener_port"], (r3 / "deployments" / i / "port.reserved").exists()))
+        except (OSError, ValueError, KeyError):
+            got.append(None)
+    say("ok" if rc == 0 and got == [("dom00011.totorosi.cloud", 1000, 0, False), ("dom00012.totorosi.cloud", 1001, 0, False)] else "fail",
+        "D up --domain --plan-only: 도메인과 서로 다른 규칙 우선순위가 입력에 고정되고 포트는 예약하지 않는다", f"rc={rc} got={got} {err[-90:]}")
+    rc, out, err = sh(with_root(r3) + dstubs + up("dom00013", "--domain dom00013.totorosi.cloud --port 8001"))
+    say("ok" if rc != 0 and "함께 쓸 수 없습니다" in err and not (r3 / "deployments" / "dom00013").exists() else "fail",
+        "D up --domain --port: 함께 쓰면 거부하고 폴더를 남기지 않는다", f"rc={rc} {err[-90:]}")
+    rc, out, err = sh(with_root(r3) + dstubs + up("dom00014", "--domain dom00011.totorosi.cloud"))
+    say("ok" if rc != 0 and "dom00014.totorosi.cloud" in err and not (r3 / "deployments" / "dom00014").exists() else "fail",
+        "D up --domain: 다른 배포의 주소를 지정하면 계획 전에 거부하고 폴더를 남기지 않는다", f"rc={rc} {err[-90:]}")
+    rc, out, err = sh(with_root(r3) + stubs + up("dom00015"))
+    try:
+        pf = json.loads((r3 / "deployments" / "dom00015" / "platform.auto.tfvars.json").read_text(encoding="utf-8"))["platform"]
+    except (OSError, ValueError, KeyError):
+        pf = {}
+    say("ok" if rc == 0 and pf.get("listener_port") == 8001 and pf.get("domain_name") == "" and pf.get("listener_rule_priority") == 0 else "fail",
+        "D up(--domain 없음): 기존 포트 방식 그대로(도메인 빈 값, 우선순위 0)", f"rc={rc} {pf} {err[-90:]}")
 
     # S3 state: 버전 확인, 이미 있는 원격 state를 덮어쓰지 않는다
     for ver, want in [("1.9.8", False), ("1.10.0", True), ("1.16.5", True), ("1.10.0-beta1", True)]:

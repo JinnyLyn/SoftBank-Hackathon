@@ -1,6 +1,7 @@
 # ALB(Application Load Balancer): 인터넷에서 들어오는 요청을 받아 앱 컨테이너로 나눠 보내는 입구다.
 # 배포마다 ALB를 만들면 생성에 수 분이 걸려 3분 데모를 넘기므로 미리 하나만 만든다.
-# 배포별 앱은 이 ALB에 전용 포트 리스너를 하나씩 추가한다 (modules/ecs-web-app).
+# 배포별 앱은 이 ALB에 전용 포트 리스너를 하나씩 추가하거나(기본), app_domain을 지정하면 443 리스너에
+# <deploy_id>.<app_domain> 호스트 규칙을 하나씩 추가한다 (modules/ecs-web-app). 규칙은 각 배포의 state가 소유한다.
 #
 # HTTPS: certificate_arn을 지정하면 443 리스너를 만들고 80번은 443으로 넘긴다. 배포별 리스너도 HTTPS가 된다.
 # 지정하지 않으면 HTTP만 열린다. 비밀번호와 로그인 쿠키가 평문으로 오가므로 시험용으로만 쓴다.

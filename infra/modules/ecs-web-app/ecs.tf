@@ -114,5 +114,5 @@ resource "aws_ecs_service" "app" {
   }
 
   # 리스너에 연결되지 않은 대상 그룹으로는 서비스를 만들 수 없다
-  depends_on = [aws_lb_listener.app]
+  depends_on = [aws_lb_listener.app, aws_lb_listener_rule.app]
 }
