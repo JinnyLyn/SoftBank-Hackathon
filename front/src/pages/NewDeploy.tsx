@@ -3,7 +3,7 @@ import { api, ApiError, DRAFT_BUILD, sourceName } from '../api'
 import StepRail, { type RailItem } from '../components/StepRail'
 import ProviderMark from '../components/ProviderMark'
 import SourceStep from '../steps/SourceStep'
-import ScaleStep, { budgetValid } from '../steps/ScaleStep'
+import ScaleStep, { MIN_BUDGET_USD, budgetValid } from '../steps/ScaleStep'
 import AnalysisStep, { type CodeState } from '../steps/AnalysisStep'
 import ReviewStep from '../steps/ReviewStep'
 import DeployStep from '../steps/DeployStep'
@@ -64,7 +64,7 @@ const ANALYZE_HINTS = [
   '규칙으로 못 찾은 값은 AI가 코드를 읽고 근거 줄과 함께 찾습니다',
 ]
 
-const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '', monthlyBudgetUsd: 30 }
+const DEFAULT_SCALE: ScaleInput = { expectedUsers: '~1,000', pattern: 'unknown', purpose: '', monthlyBudgetUsd: MIN_BUDGET_USD }
 
 // 상태 확인 간격과, 일시적인 오류를 몇 번까지 다시 시도할지
 const POLL_MS = 700
