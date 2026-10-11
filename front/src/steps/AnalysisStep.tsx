@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import ProviderMark from '../components/ProviderMark'
 import WorkProgress from '../components/WorkProgress'
 import DockerfileDraft from '../components/DockerfileDraft'
@@ -36,8 +37,28 @@ interface Props {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 
+/** AWS 계획은 보통 1분 안팎에 옴. 이보다 오래 없으면 worker가 계획을 못 만든 경우(예산 부족 등)를 먼저 의심하도록 안내 */
+const PLAN_SLOW_MS = 2 * 60 * 1000
+
+function useSlow(startedAt: number | null, afterMs: number) {
+  const [slow, setSlow] = useState(false)
+  useEffect(() => {
+    setSlow(false)
+    if (startedAt === null) return
+    const left = startedAt + afterMs - Date.now()
+    if (left <= 0) {
+      setSlow(true)
+      return
+    }
+    const timer = window.setTimeout(() => setSlow(true), left)
+    return () => window.clearTimeout(timer)
+  }, [startedAt, afterMs])
+  return slow
+}
+
 export default function AnalysisStep({ analysis, rec, recError, recStartedAt, onRetryRec, ...plans }: Props) {
   const blockers = analysis.blockers ?? []
+  const slowPlan = useSlow(rec || recError ? null : recStartedAt, PLAN_SLOW_MS)
   return (
     <div className="stack-lg">
       {blockers.length > 0 && (
@@ -109,6 +130,13 @@ export default function AnalysisStep({ analysis, rec, recError, recStartedAt, on
               hints={PLAN_HINTS}
               note="보통 1~4분 걸립니다. 위의 분석 결과를 먼저 확인해 주세요. 승인하기 전에는 아무것도 만들지 않습니다."
             />
+          )}
+          {!recError && slowPlan && (
+            <p className="hint" role="status">
+              계획이 늦어지고 있습니다. 가장 흔한 이유는 <strong>월 예산 {usd(plans.budget)}</strong>이 가장 작은 AWS 구성보다
+              낮은 경우입니다(공용 로드밸런서·DB 몫이 포함돼 소규모 앱도 월 수십 달러부터). 이때는 계획이 만들어지지 않으니, 처음 화면에서
+              예산을 올려 다시 시작해 주세요.
+            </p>
           )}
         </section>
       )}

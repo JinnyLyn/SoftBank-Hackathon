@@ -390,7 +390,9 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
     if (Date.now() > until)
       throw new ApiError(
         408,
-        `${Math.round(timeoutMs / 60000)}분 동안 기다렸지만 배포 계획이(가) 오지 않았습니다. 배포 계획은 인프라 worker(infra/worker)가 만듭니다. worker가 실행 중인지 확인한 뒤 다시 기다려 주세요.`,
+        `${Math.round(timeoutMs / 60000)}분 동안 기다렸지만 배포 계획이 오지 않았습니다. ` +
+          '월 예산이 가장 작은 구성의 비용보다 낮으면 인프라 worker가 계획을 만들지 않습니다(서버에 실패 이유를 알리는 기능은 아직 없음). ' +
+          '예산을 올려 처음부터 다시 시작하거나, 인프라 worker(infra/worker)가 실행 중인지 확인해 주세요.',
       )
     await wait(2000)
   }
