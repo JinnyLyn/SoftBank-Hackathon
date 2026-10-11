@@ -1,6 +1,7 @@
 /* Existing Paved Clouds tokens; isolated from the AWS route. */
 .onprem-header { background: var(--asphalt); color: white; }
 .onprem-header > div { max-width: 1040px; margin: auto; padding: 16px 24px; display: flex; gap: 24px; align-items: center; }
+.onprem .onprem-header .tab { margin-top: 0; }
 .onprem-header span { color: var(--marking); }
 .onprem-main { max-width: 1040px; margin: auto; padding: 32px 24px 64px; display: grid; gap: 24px; }
 .onprem-intro { display: grid; gap: 8px; max-width: 80ch; }

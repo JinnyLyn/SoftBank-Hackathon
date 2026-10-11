@@ -148,5 +148,7 @@ const ja: Record<string, string> = {
   '배포: {target}': 'デプロイ先: {target}',
   '새 배포': '新規デプロイ',
   '이 PC의 Docker': 'この PC の Docker',
+  'On-prem 배포': 'オンプレミスデプロイ',
+  Home: 'ホーム',
 }
 export default ja
