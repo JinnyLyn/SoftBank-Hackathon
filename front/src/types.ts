@@ -129,6 +129,8 @@ export interface PlanInfo {
   /** AWS 공용 기반(ALB·RDS 등)의 월 비용. sharedIncluded가 true면 계획 금액에 합쳐져 있고, false면 참고로만 담았을 뿐 계획 금액에 넣지 않음 */
   sharedMonthlyUsd?: number
   sharedIncluded?: boolean
+  /** 계획에 고정된 접속 호스트(variables.domain, 예: lpad0001.totorosi.cloud). worker가 플랫폼 자동 주소로 계획했을 때만 있음 */
+  domain?: string
 }
 
 export interface TerraformBundle {

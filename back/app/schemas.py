@@ -150,11 +150,43 @@ class PlanFailureOut(APIModel):
     updated_at: datetime
 
 
+class DomainIn(APIModel):
+    """auto: 플랫폼 자동 주소(<배포 ID>.<운영자 도메인>. 이름은 worker가 계획 때 정한다). own: 가지고 있는 도메인(아직 미지원)"""
+
+    mode: Literal["auto", "own"]
+    name: str | None = Field(default=None, max_length=253)
+
+
+class DnsRecordOut(APIModel):
+    type: Literal["CNAME", "A", "ALIAS", "TXT", "NS"]
+    name: str
+    value: str
+    purpose: str
+
+
+class DomainOut(APIModel):
+    mode: Literal["auto", "own"]
+    name: str | None = None
+    monthly_usd: float = 0
+    records: list[DnsRecordOut] = Field(default_factory=list)
+    note: str | None = None
+
+
+class FrontDomainStatus(APIModel):
+    """앱 배포(healthy)와 따로 보는 주소 연결 상태. 프런트 DomainStatus와 같은 값을 쓴다"""
+
+    state: Literal["skipped", "waiting_dns", "issuing_cert", "active", "failed"]
+    name: str | None = None
+    message: str | None = None
+    url: str | None = None
+
+
 class FrontDeployStatus(APIModel):
     state: Literal["running", "success", "failed"]
     log: list[str]
     url: str | None = None
     diagnosis: dict[str, Any] | None = None
+    domain: FrontDomainStatus | None = None
 
 
 class ProjectListOut(APIModel):

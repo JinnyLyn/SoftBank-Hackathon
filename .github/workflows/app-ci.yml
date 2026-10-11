@@ -167,6 +167,8 @@ jobs:
           python -m unittest discover -s scripts -p 'test_onprem_*.py' -v
           PYTHONPATH=back python -m unittest discover -s back/tests -p 'test_onprem_readiness.py' -v
           bash -n scripts/run_onprem.sh
+      - name: 자동 주소 도메인 선택·상태 응답 회귀 (DB·AWS 없음)
+        run: PYTHONPATH=back python -m unittest discover -s back/tests -p 'test_domain.py' -v
       - name: 격리 MySQL·마이그레이션 재실행·롤백 API 계약
         run: bash scripts/ci/run_platform_stack.sh
 
