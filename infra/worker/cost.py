@@ -5,7 +5,10 @@
 task_size 프리셋(CPU·메모리)은 modules/ecs-web-app/main.tf의 표와 같아야 한다.
 
 월 예산이 있으면 그 금액을 넘지 않는 범위에서 최저·평균·최대 세 안을 만든다(budget_configs). 예산 판정은 부하가 최대일 때
-(오토스케일링이 max_tasks까지 늘었을 때)의 월 비용(peak_monthly)으로 한다. 태스크 수·크기에 코드로 박아 둔 상한은 없고,
+(오토스케일링이 max_tasks까지 늘었을 때)의 **앱 추가 비용**(app_peak_monthly: Fargate와 NAT 없는 구성의 태스크 공인 IPv4)으로 한다.
+공용 foundation 비용(ALB, RDS, 공인 IPv4 등)은 모든 앱이 함께 쓰는 고정비라 앱 하나의 예산·승인 금액에 넣지 않고 참고로 따로 담는다
+(shared_monthly, shared_resources. PRODUCT_DIRECTION.md: 공유 인프라 원가를 모든 사용자에게 그대로 청구하는 것으로 가정하지 않는다).
+공용 비용까지 합친 값은 total_monthly(평소)·peak_monthly(부하 최대)에 그대로 남아 있다. 태스크 수·크기에 코드로 박아 둔 상한은 없고,
 한도는 사용자가 정한 예산이다. 예산이 없으면 TIERS 프리셋을 그대로 쓴다.
 다만 계정의 Fargate vCPU 할당량을 넘는 최대 구성은 도달할 수 없으므로, worker가 읽어 온 남은 vCPU(max_vcpu)를 알면 그 안으로
 max_tasks를 줄인다(할당량 값은 코드에 박지 않고 worker가 AWS에서 읽는다).
@@ -80,7 +83,9 @@ def _task_cost(size, prices, arch, foundation):
 def estimate(tier, prices, arch="X86_64", foundation=None, cfg=None):
     """한 단계의 월 비용. 앱 추가 비용(Fargate)과 공용 고정 비용(ALB, RDS, 스토리지, 공인 IPv4)을 나눠 담는다.
 
-    total_monthly는 평소(min_tasks개)의 월 비용이고, peak_monthly는 부하가 최대(max_tasks개)일 때의 월 비용이다. 예산 판정은 peak_monthly로 한다.
+    app_monthly는 평소(min_tasks개), app_peak_monthly는 부하가 최대(max_tasks개)일 때의 앱 추가 비용이다. 예산 판정과 승인 금액은 app_peak_monthly다.
+    shared_monthly는 모든 앱이 함께 쓰는 공용 비용으로 앱 금액에 넣지 않는다. total_monthly(평소)·peak_monthly(부하 최대)는 앱 비용에 공용 비용을 더한 참고용 총액이다.
+    resources는 앱 추가 비용 행(합계가 app_monthly), shared_resources는 공용 비용 행(합계가 shared_monthly)이다.
     cfg를 주면 TIERS[tier] 대신 그 구성(task_size, min_tasks, max_tasks와 표시 문구)으로 계산한다.
     NAT 인스턴스·데이터 전송·로그 등은 prices.json 의 excluded 에 적힌 대로 제외한 값이다.
     """
@@ -115,7 +120,7 @@ def estimate(tier, prices, arch="X86_64", foundation=None, cfg=None):
         resources.append(
             {"service": "공인 IPv4 주소 (앱 태스크)", "spec": f"{tasks}개 (NAT 없음: 태스크가 공인 IP를 직접 받음)", "monthlyUsd": _money(task_ipv4_monthly),
              "why": "NAT 인스턴스가 없는 구성에서는 앱 태스크마다 공인 IPv4가 붙어 시간당 요금이 생김. 태스크가 늘면 같이 늘어남"})
-    resources += [
+    shared_resources = [
         {"service": "Application Load Balancer", "spec": "1개 (공용)", "monthlyUsd": _money(alb),
          "why": "모든 앱이 함께 쓰는 공용 진입점. 앱이 늘어도 늘지 않음"},
         {"service": "RDS MySQL", "spec": f"{rds['instance_class']}, {rds['storage_gb']} GB (공용)", "monthlyUsd": _money(rds_instance + rds_storage),
@@ -126,12 +131,13 @@ def estimate(tier, prices, arch="X86_64", foundation=None, cfg=None):
     return {
         "tier": tier, "label": cfg["label"], "task_size": cfg["task_size"], "min_tasks": cfg["min_tasks"], "max_tasks": cfg["max_tasks"],
         "headline": cfg["headline"], "tradeoff": cfg["tradeoff"],
-        "app_monthly": _money(app_monthly), "shared_monthly": _money(shared), "total_monthly": _money(app_monthly + shared),
+        "app_monthly": _money(app_monthly), "app_peak_monthly": _money(app_peak_monthly),
+        "shared_monthly": _money(shared), "total_monthly": _money(app_monthly + shared),
         "peak_monthly": _money(app_peak_monthly + shared),
         # 부하가 최대일 때 동시에 띄우는 Fargate vCPU. 리전의 Fargate On-Demand vCPU 할당량과 비교하는 값이다
         "peak_vcpu": vcpu * cfg["max_tasks"],
         "quota_limited": bool(cfg.get("quota_limited")),   # 예산이 아니라 vCPU 할당량 때문에 max_tasks가 줄었는지
-        "resources": resources,
+        "resources": resources, "shared_resources": shared_resources,
         "region": prices["region"], "currency": prices["currency"], "pricing_as_of": prices["pricing_as_of"],
         "excluded": list(prices.get("excluded", [])),
     }
@@ -165,17 +171,16 @@ def _preset_cfg(tier, max_vcpu=None):
 
 
 def _fill_tier(tier, target, prices, arch, foundation, max_vcpu=None):
-    """프리셋 tier의 크기·최소 태스크 수는 그대로 두고, 부하가 최대일 때의 월 비용이 target 이하인 가장 큰 max_tasks를 정한다.
+    """프리셋 tier의 크기·최소 태스크 수는 그대로 두고, 부하가 최대일 때의 앱 추가 비용이 target 이하인 가장 큰 max_tasks를 정한다(공용 비용은 넣지 않는다).
     남은 Fargate vCPU 할당량(max_vcpu)을 알면 그 안으로 더 줄이고(quota_limited=True), 최소 태스크 수도 담지 못하면 None."""
     base = TIERS[tier]
-    shared = estimate(tier, prices, arch, foundation)["shared_monthly"]
     compute, ipv4 = _task_cost(base["task_size"], prices, arch, foundation)
-    n = max(int((target - shared) // (compute + ipv4)), 0)
+    n = max(int(target // (compute + ipv4)), 0)
 
     def peak(k):
-        return estimate(tier, prices, arch, foundation, {**base, "max_tasks": k})["peak_monthly"]
+        return estimate(tier, prices, arch, foundation, {**base, "max_tasks": k})["app_peak_monthly"]
 
-    # 공용 비용을 소수 둘째 자리로 반올림한 오차로 한 개 넘치거나 모자랄 수 있어 실제 금액으로 맞춘다.
+    # 태스크 비용을 소수 둘째 자리로 반올림한 오차로 한 개 넘치거나 모자랄 수 있어 실제 금액으로 맞춘다.
     # 최소 태스크 수를 확인하기 전에 위아래로 모두 보정해야 한다(모자라게 나온 채로 거르면 딱 맞는 예산이 탈락한다)
     while n > 0 and peak(n) > target:
         n -= 1
@@ -195,9 +200,10 @@ def _fill_tier(tier, target, prices, arch, foundation, max_vcpu=None):
 
 def budget_configs(budget_usd, prices, arch="X86_64", foundation=None, max_vcpu=None):
     """월 예산과 Fargate vCPU 할당량을 넘지 않는 최저·평균·최대 세 안의 구성을 {tier: 구성}으로 돌려준다. 어느 안도 못 만들면 빈 딕셔너리.
+    예산은 앱 추가 비용(app_peak_monthly)과 비교한다. 공용 foundation 비용은 넣지 않는다.
 
     - 최저(lean): 가장 작은 구성(xsmall 1개 고정).
-    - 최대(roomy): 부하가 최대일 때의 월 비용이 예산 한도에 닿도록 max_tasks를 채운 구성.
+    - 최대(roomy): 부하가 최대일 때의 앱 추가 비용이 예산 한도에 닿도록 max_tasks를 채운 구성.
     - 평균(balanced): 최저와 **실제로 만든 최대 안**의 중간 금액에 맞춰 max_tasks를 채운 구성. 태스크는 정수 개라 최대 안이
       예산을 다 쓰지 못할 수 있어, 예산 원금이 아니라 최대 안의 실제 금액을 기준으로 해야 중간이 된다.
     예산이 작아 최대(roomy)의 최소 구성(medium 2개)도 담지 못하면 balanced를 예산 한도까지 채워 최대 안으로 삼는다.
@@ -208,14 +214,14 @@ def budget_configs(budget_usd, prices, arch="X86_64", foundation=None, max_vcpu=
     budget = float(budget_usd)
     lean_cfg = _preset_cfg("lean", max_vcpu)
     lean = estimate("lean", prices, arch, foundation)
-    if lean_cfg is None or lean["peak_monthly"] > budget:
+    if lean_cfg is None or lean["app_peak_monthly"] > budget:
         return {}
     cfgs = {"lean": lean_cfg}
     top = _fill_tier("roomy", budget, prices, arch, foundation, max_vcpu)
     if top is not None:
         cfgs["roomy"] = top
-        top_peak = estimate("roomy", prices, arch, foundation, top)["peak_monthly"]
-        mid = _fill_tier("balanced", (lean["peak_monthly"] + top_peak) / 2, prices, arch, foundation, max_vcpu)
+        top_peak = estimate("roomy", prices, arch, foundation, top)["app_peak_monthly"]
+        mid = _fill_tier("balanced", (lean["app_peak_monthly"] + top_peak) / 2, prices, arch, foundation, max_vcpu)
     else:
         mid = _fill_tier("balanced", budget, prices, arch, foundation, max_vcpu)
     if mid is not None:
@@ -227,6 +233,7 @@ def option_summary(est, rank, recommended):
     """프런트·승인 화면에 보여줄 한 안의 요약. rank는 lowest/average/highest(최저·평균·최대 금액 순)."""
     return {"tier": est["tier"], "rank": rank, "label": est["label"], "task_size": est["task_size"],
             "min_tasks": est["min_tasks"], "max_tasks": est["max_tasks"],
+            "app_monthly": est["app_monthly"], "app_peak_monthly": est["app_peak_monthly"],
             "total_monthly": est["total_monthly"], "peak_monthly": est["peak_monthly"], "peak_vcpu": est["peak_vcpu"],
             "quota_limited": est["quota_limited"],
             "headline": est["headline"], "tradeoff": est["tradeoff"], "recommended": recommended}
@@ -243,7 +250,7 @@ def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", founda
     - max_vcpu(이 계정·리전에서 더 띄울 수 있는 Fargate vCPU)를 알면 어느 안도 부하가 최대일 때 그 vCPU를 넘지 않게 max_tasks를 줄인다.
       모르면(None) 할당량은 제한하지 않는다. 상한이 없는 예산만으로는 할당량보다 큰 최대 구성이 나올 수 있어서 둔 인자다.
     - 예상 사용자 수로 기본 단계를 정하고, 접속이 특정 시간에 몰리면(peak) 한 단계 올린다.
-    - 예산·할당량 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다. 예산 판정은 부하가 최대일 때의 월 비용(peak_monthly) 기준이다.
+    - 예산·할당량 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다. 예산 판정은 부하가 최대일 때의 앱 추가 비용(app_peak_monthly) 기준이다.
     - 가장 작은 안도 예산을 넘거나 할당량에 못 담으면 recommended=None 과 이유를 낸다(AGENTS.md 5장 6단계: 만족할 구성이 없으면 이유를 알리고 종료).
     """
     budget = None if budget_usd is None else float(budget_usd)
@@ -258,8 +265,9 @@ def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", founda
             reason = (f"Fargate 할당량이 부족해 구성을 만들 수 없습니다. 이 리전에서 더 띄울 수 있는 vCPU가 {max_vcpu:g}개인데 "
                       f"가장 작은 구성도 {need:g} vCPU가 필요합니다(할당량 증설을 요청하거나 사용 중인 작업을 줄이세요).")
         else:
-            cheapest = estimates[ORDER[0]]["peak_monthly"]
-            reason = f"월 예산 ${budget:.2f} 안에 들어가는 구성이 없습니다. 가장 작은 구성도 월 약 ${cheapest:.2f}입니다(공용 ALB·RDS 포함, 제외 항목 별도)."
+            cheapest = estimates[ORDER[0]]["app_peak_monthly"]
+            reason = (f"월 예산 ${budget:.2f} 안에 들어가는 구성이 없습니다. 가장 작은 구성도 앱 추가 비용이 월 약 ${cheapest:.2f}입니다"
+                      f"(모든 앱이 함께 쓰는 공용 ALB·RDS·공인 IPv4는 넣지 않은 값, 그 밖의 제외 항목 별도).")
         return {"recommended": None, "estimates": estimates, "options": [], "reason": reason}
     estimates = {t: estimate(t, prices, arch, foundation, cfgs[t]) for t in cfgs}
     base = USERS_TO_TIER.get(expected_users, "balanced")
@@ -281,7 +289,7 @@ def recommend(expected_users, pattern, budget_usd, prices, arch="X86_64", founda
         # 예산이 작으면 안이 세 개보다 적게 만들어진다. 만든 안의 수만 말한다
         n = len(estimates)
         who = "제시하는 안이 하나뿐이고 그 안은" if n == 1 else f"제시하는 {n}개 안은 모두"
-        reasons.append(f"{who} 부하가 최대일 때도 월 예산 ${budget:.2f}을 넘지 않음")
+        reasons.append(f"{who} 부하가 최대일 때도 앱 추가 비용이 월 예산 ${budget:.2f}을 넘지 않음")
     limited = [estimates[t]["label"] for t in ORDER if t in estimates and estimates[t]["quota_limited"]]
     if limited:
         reasons.append(f"Fargate 할당량(남은 {max_vcpu:g} vCPU)에 맞춰 {', '.join(limited)} 안의 최대 태스크 수를 줄임")

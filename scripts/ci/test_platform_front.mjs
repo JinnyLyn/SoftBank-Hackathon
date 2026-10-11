@@ -96,9 +96,12 @@ async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
     variables: {
       tier: 'balanced', recommended: true,
       dockerfile_draft: { content: 'FROM node:22-slim\n' },
+      cost: { amount_basis: 'app_peak_monthly', shared_monthly: 75.92 },
       options: [
-        { tier: 'lean', rank: 'lowest', peak_monthly: 40, total_monthly: 30 },
-        { tier: 'balanced', rank: 'average', peak_monthly: 120, total_monthly: 90, recommended: true },
+        // 공용 기반 비용을 합친 값(peak_monthly·total_monthly)이 아니라 앱 추가 비용(app_*)을 보여 줘야 한다
+        { tier: 'lean', rank: 'lowest', peak_monthly: 91.4, total_monthly: 91.4, app_peak_monthly: 15.48, app_monthly: 15.48 },
+        { tier: 'balanced', rank: 'average', peak_monthly: 196, total_monthly: 166, app_peak_monthly: 120, app_monthly: 90, recommended: true },
+        // app_*가 없는 이전 방식의 계획은 그 계획의 승인 금액과 같은 기준이라 peak_monthly·total_monthly를 그대로 쓴다
         { tier: 'roomy', rank: 'highest', peak_monthly: 200, total_monthly: 150 },
       ],
     },
@@ -126,6 +129,11 @@ async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
   ]);
   assert.deepEqual(Object.keys(rec.bundles).sort(), ['aws:balanced', 'local-docker:balanced']);
   assert.deepEqual(rec.recommended, { connectionId: expectedConnection, tier: 'balanced' });
+  const tiers = Object.fromEntries(rec.options[0].tiers.map((t) => [t.key, t]));
+  assert.deepEqual([tiers.lean.totalUsd, tiers.lean.usualUsd], [15.48, 15.48], '비교 안은 공용 기반 비용을 뺀 앱 추가 비용을 보여야 한다');
+  assert.deepEqual([tiers.roomy.totalUsd, tiers.roomy.usualUsd], [200, 150], 'app_*가 없는 이전 계획은 기존 필드를 쓴다');
+  assert(rec.assumptions.some((a) => a.includes('공용 기반') && a.includes('넣지 않음') && a.includes('75.92')), '공용 기반 비용을 금액에 넣지 않았다고 밝혀야 한다');
+  assert(!rec.assumptions.some((a) => a.includes('들어 있음')));
   assert.equal(rec.bundles['aws:balanced'].files[0].name, 'Dockerfile (초안)');
   assert.equal(rec.bundles['aws:balanced'].files[0].content, aws.variables.dockerfile_draft.content);
   assert.equal(rec.bundles['local-docker:balanced'].files[0].content, local.variables.compose_yaml);
@@ -192,7 +200,32 @@ await checkMixedRecommendation(100, 'local-docker');
   await assert.rejects(api2.requestTier('p-budget', 'lean'), (e) => e.status === 501);
   console.log('PASS: 계획 실패 보고 — 다시 해도 같은 실패는 즉시 이유 표시, 재시도 가능·예전 백엔드는 계속 대기');
 }
-console.log('PASS: 공개 recommend/generate 어댑터 회귀 5개 (로컬 초기화 있음·없음, AWS, 혼합 대상의 예산 내·초과)');
+{
+  const legacy = {
+    id: 'aws-plan', target: 'aws', module_id: 'ecs-web-app', status: 'awaiting_approval',
+    created_at: '2026-10-11T00:00:00Z', fingerprint: 'aws-fingerprint', terraform_plan_ready: true,
+    summary: 'AWS 계획', cost_estimate: { amount: '106.87', pricing_as_of: '2026-10-11' },
+    variables: {
+      tier: 'balanced', recommended: true,
+      cost: { amount_basis: 'peak_monthly', shared_monthly: 75.92 },
+      options: [{ tier: 'balanced', rank: 'lowest', peak_monthly: 106.87, total_monthly: 106.87, recommended: true }],
+    },
+  };
+  const req = async (path) => {
+    if (path === '/projects/project-1/plans') return structuredClone([legacy]);
+    if (path === '/plans/aws-plan') return structuredClone(legacy);
+    throw new Error(`Unexpected HTTP request: ${path}`);
+  };
+  const api = loadTs('../../front/src/api/real.ts', {
+    './http': { req, ApiError: class extends Error {} }, '../format': format, '../providers': { isEnabled: (p) => p === 'aws' }, '../i18n/core': i18n,
+  });
+  const rec = await api.recommend('project-1', { ...scale, monthlyBudgetUsd: 150 });
+  assert(rec.assumptions.some((a) => a.includes('공용 기반') && a.includes('들어 있음')), '공용 기반이 합쳐진 이전 계획은 그렇게 안내해야 한다');
+  assert.equal(rec.options[0].tiers[0].totalUsd, 106.87);
+  const bundle = (await api.generate('project-1', { connectionId: 'aws', tier: 'balanced' }));
+  assert.equal(bundle.planInfo.sharedIncluded, true);
+}
+console.log('PASS: 공개 recommend/generate 어댑터 회귀 6개 (로컬 초기화 있음·없음, AWS, 혼합 대상의 예산 내·초과, 공용 기반 비용 표기)');
 
 // Dedicated local service: immutable identity, no global provider/connection/domain requests.
 const localPlan = () => ({

@@ -126,8 +126,9 @@ export interface PlanInfo {
   pricingAsOf?: string
   /** 계획 금액에 넣지 않은 비용 (worker의 cost.excluded). 총액이 전부를 덮는 것처럼 보이지 않게 승인 화면에 같이 보여 줌 */
   excludedCosts?: string[]
-  /** AWS 공용 기반(ALB·RDS 등) 몫으로 금액에 포함한 월 비용 */
+  /** AWS 공용 기반(ALB·RDS 등)의 월 비용. sharedIncluded가 true면 계획 금액에 합쳐져 있고, false면 참고로만 담았을 뿐 계획 금액에 넣지 않음 */
   sharedMonthlyUsd?: number
+  sharedIncluded?: boolean
 }
 
 export interface TerraformBundle {

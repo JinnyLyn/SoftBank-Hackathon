@@ -205,5 +205,6 @@ const ja: Record<string, string> = {
   '월': '月額',
   '서버 자원 {note}': 'サーバーリソース {note}',
   '감수할 점': '注意点',
+  '모든 앱이 함께 쓰는 공용 기반(ALB·DB 등)의 월 {usd}는 이 합계에 넣지 않았습니다.': 'すべてのアプリが共用する基盤(ALB・DBなど)の月額{usd}は、この合計に含めていません。',
 }
 export default ja
