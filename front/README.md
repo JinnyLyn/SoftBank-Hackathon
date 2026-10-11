@@ -37,7 +37,7 @@ npm run build
 | 분석 시작 (ZIP) | `POST /api/projects?name=&filename=&expected_users=&traffic_pattern=&monthly_budget_usd=&purpose=` 본문은 ZIP 원본 바이트, `Content-Type: application/zip` |
 | 분석 시작 (GitHub) | `POST /api/projects/github` `{ name, repository_url, ref, expected_users, traffic_pattern, monthly_budget_usd, purpose }` |
 | 분석 결과 대기 | `GET /api/projects/{id}/analyses/latest` 를 2초 간격 (404는 대기, 5분 제한) |
-| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 (2초 간격, 5분 제한). AWS 줄 이름은 "관리형 AWS"로 고정 |
+| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 (2초 간격, 5분 제한). 계획이 아직 없으면 `GET /api/projects/{id}/plan-failures`도 읽어, worker가 `retryable=false` 실패(예산 부족 등)를 알렸으면 바로 그 이유를 보여 줌(404면 예전 백엔드로 보고 계속 기다림). AWS 줄 이름은 "관리형 AWS"로 고정 |
 | 코드 검토 | `GET /api/plans/{id}` — 변수값, 설명, 모듈, 가격 기준, fingerprint, plan 파일 준비 여부 |
 | 승인하고 배포 | `POST /api/plans/{id}/approve` `{ expected_fingerprint }` → `POST /api/deployments` `{ plan_id, expected_fingerprint }` (202 = 대기열 등록) |
 | 배포 진행 | `GET /api/projects/{id}/status` 0.7초 간격 (404는 대기열 대기로 표시) |

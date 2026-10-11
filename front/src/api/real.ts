@@ -373,6 +373,25 @@ function toBundle(p: PlanOut): TerraformBundle {
  * OTHER_TARGET_GRACE_MS 동안 더 기다린 뒤 있는 것만으로 진행 (한 대상의 계획 생성이 막혀도 다른 대상으로 배포할 수 있게)
  * AWS만 켠 기본 설정은 예전처럼 AWS 계획이 오면 바로 끝남
  */
+interface PlanFailureOut {
+  target: string
+  reason: string
+  /** false면 같은 입력으로는 다시 해도 실패(예: 예산 안에 드는 구성이 없음) → 더 기다리지 않음 */
+  retryable: boolean
+  attempts: number
+  updated_at: string
+}
+
+/** worker가 계획을 만들지 못한 이유(대상별 최신). 이 API가 없는 예전 백엔드면 빈 목록 */
+async function planFailures(projectId: string): Promise<PlanFailureOut[]> {
+  try {
+    return await req<PlanFailureOut[]>(`/projects/${projectId}/plan-failures`)
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405)) return []
+    throw e
+  }
+}
+
 async function waitForPlans(projectId: string, want: { aws: boolean; local: boolean }): Promise<PlanOut[]> {
   const timeoutMs = 5 * 60 * 1000
   const until = Date.now() + timeoutMs
@@ -382,10 +401,22 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
     const waiting = list.filter(
       (p) => p.status === 'awaiting_approval' && (isLocal(p) ? want.local : want.aws && p.target === 'aws'),
     )
+    const hasAws = waiting.some((p) => !isLocal(p))
+    const hasLocal = waiting.some(isLocal)
     if (waiting.length) {
       if (!firstSeen) firstSeen = Date.now()
-      const complete = (!want.aws || waiting.some((p) => !isLocal(p))) && (!want.local || waiting.some(isLocal))
+      const complete = (!want.aws || hasAws) && (!want.local || hasLocal)
       if (complete || Date.now() - firstSeen > OTHER_TARGET_GRACE_MS) return waiting
+    }
+    // 다시 해도 같은 실패(예산 부족 등)를 worker가 알렸으면 그 대상은 더 기다리지 않음
+    const final = (await planFailures(projectId)).filter((f) => !f.retryable)
+    const awsFailed = want.aws && !hasAws && final.some((f) => f.target === 'aws')
+    const localFailed = want.local && !hasLocal && final.some((f) => f.target === LOCAL)
+    const settled = (!want.aws || hasAws || awsFailed) && (!want.local || hasLocal || localFailed)
+    if (settled && waiting.length) return waiting
+    if (settled && (awsFailed || localFailed)) {
+      const reasons = final.filter((f) => (f.target === 'aws' ? awsFailed : localFailed)).map((f) => f.reason)
+      throw new ApiError(422, `배포 계획을 만들지 못했습니다. ${reasons.join(' / ')} 처음 화면에서 사용 규모·월 예산을 바꿔 다시 시작해 주세요.`)
     }
     if (Date.now() > until)
       throw new ApiError(
