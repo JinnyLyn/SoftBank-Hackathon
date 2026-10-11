@@ -729,10 +729,11 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         raise PlanError("계획 파일(tfplan)이 만들어지지 않았습니다")
     digest = sha256_file(plan_file)
 
-    # 승인 금액(cost_estimate.amount)은 월 예산을 판정한 기준과 같은 "부하가 최대일 때의 월 비용"이다. 평소 비용만 보여주면 사용자는 오토스케일링으로
-    # 늘어난 청구를 모른 채 승인한다. 승인 화면은 리소스 행을 나열하고 합계를 amount로 보여주므로, 행의 합이 합계와 맞도록 최대 시 추가분을 행으로 더한다
+    # 승인 금액(cost_estimate.amount)은 월 예산을 판정한 기준과 같은 "부하가 최대일 때의 앱 추가 비용"이다. 평소 비용만 보여주면 사용자는 오토스케일링으로
+    # 늘어난 청구를 모른 채 승인한다. 승인 화면은 리소스 행을 나열하고 합계를 amount로 보여주므로, 행의 합이 합계와 맞도록 최대 시 추가분을 행으로 더한다.
+    # 모든 앱이 함께 쓰는 공용 기반(ALB·RDS·공인 IPv4)은 resources에 넣지 않고 shared_resources에 참고로 둔다(승인 금액·예산 판정에 들어가지 않는다)
     resources = list(est["resources"])
-    extra = round(est["peak_monthly"] - est["total_monthly"], 2)
+    extra = round(est["app_peak_monthly"] - est["app_monthly"], 2)
     if extra > 0:
         resources.append({"service": "ECS Fargate 오토스케일링 최대 시 추가분",
                           "spec": f"태스크 {app['max_tasks'] - app['min_tasks']}개 더 (최대 {app['max_tasks']}개)", "monthlyUsd": extra,
@@ -745,21 +746,24 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         "source_sha256": src_sha, "cpu_architecture": arch,
         "tier": tier, "recommended": tier == rec_tier, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
         "resources": resources,
-        # total_monthly는 평소(min_tasks개) 월 비용, peak_monthly는 부하가 최대일 때의 월 비용이다. cost_estimate.amount는 peak_monthly다(amount_basis)
-        "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "total_monthly": est["total_monthly"],
-                 "peak_monthly": est["peak_monthly"], "amount_basis": "peak_monthly",
+        "shared_resources": est["shared_resources"],
+        # app_monthly는 평소(min_tasks개), app_peak_monthly는 부하가 최대일 때의 앱 추가 비용이다. cost_estimate.amount와 예산 판정은 app_peak_monthly다(amount_basis).
+        # shared_monthly는 공용 기반 고정비(참고), total_monthly·peak_monthly는 앱 비용에 공용 비용을 더한 참고용 총액이다
+        "cost": {"app_monthly": est["app_monthly"], "app_peak_monthly": est["app_peak_monthly"], "shared_monthly": est["shared_monthly"],
+                 "total_monthly": est["total_monthly"], "peak_monthly": est["peak_monthly"], "amount_basis": "app_peak_monthly",
                  "peak_vcpu": est["peak_vcpu"], "budget_usd": budget, "excluded": est["excluded"]},
         # Fargate On-Demand vCPU 할당량 조회 결과(quota_vcpu, used_vcpu, reserved_vcpu, available_vcpu). 조회를 건너뛰었으면 None
         "fargate_vcpu": capacity,
         # 최저·평균·최대 금액 순의 비교 안. 승인 화면이 세 안을 나란히 보여주는 데 쓴다(선택한 안은 recommended=True)
         "options": rec["options"],
     }
-    comparison = " / ".join(f"{cost.RANKS[o['rank']]} {o['label']}: 평소 ${o['total_monthly']:.2f}·최대 ${o['peak_monthly']:.2f}" for o in rec["options"])
+    comparison = " / ".join(f"{cost.RANKS[o['rank']]} {o['label']}: 평소 ${o['app_monthly']:.2f}·최대 ${o['app_peak_monthly']:.2f}" for o in rec["options"])
     summary = "\n".join([
         f"{est['label']} 구성({tier}): {app['task_size']} 태스크 {app['min_tasks']}개(최대 {app['max_tasks']}개), 포트 {app['container_port']}, "
         f"헬스체크 {app['health_check_path']}, 앱 전용 DB {'사용' if app['use_database'] else '미사용'}",
-        f"평소 월 추정 ${est['total_monthly']:.2f} = 앱 추가 ${est['app_monthly']:.2f} + 공용(ALB·RDS·공인 IPv4) ${est['shared_monthly']:.2f}",
-        f"승인 금액은 부하가 최대일 때(태스크 {app['max_tasks']}개)의 월 ${est['peak_monthly']:.2f}"
+        f"앱 추가 비용: 평소 월 ${est['app_monthly']:.2f}, 부하가 최대일 때(태스크 {app['max_tasks']}개) 월 ${est['app_peak_monthly']:.2f}",
+        f"공용 기반(ALB·RDS·공인 IPv4)은 모든 앱이 함께 쓰는 고정비로 월 약 ${est['shared_monthly']:.2f}이며 승인 금액·예산 판정에 넣지 않았다(과금 방식은 미확정)",
+        f"승인 금액은 부하가 최대일 때의 앱 추가 비용 월 ${est['app_peak_monthly']:.2f}"
         + (f"이며 월 예산 ${budget:.2f} 이내" if budget is not None else "이며 월 예산 입력 없음"),
         (f"Fargate vCPU 할당량: 한도 {capacity['quota_vcpu']:g}, 사용 중 {capacity['used_vcpu']:g}, "
          f"승인 대기·승인된 다른 계획이 예약 {capacity['reserved_vcpu']:g}, 남은 {capacity['available_vcpu']:g}. "
@@ -772,8 +776,8 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
     body = {
         "project_id": project["id"], "analysis_id": analysis.get("id"), "target": "aws", "module_id": "ecs-web-app",
         "variables": variables, "summary": summary,
-        # 백엔드 CostEstimate는 필드를 더 받지 않는다(extra=forbid). amount가 승인 화면·정렬·예산 판정·이력에 쓰이므로 최대 월 비용을 담는다
-        "cost_estimate": {"amount": f"{est['peak_monthly']:.4f}", "currency": est["currency"], "period": "month",
+        # 백엔드 CostEstimate는 필드를 더 받지 않는다(extra=forbid). amount가 승인 화면·정렬·예산 판정·이력에 쓰이므로 부하 최대 때의 앱 추가 비용을 담는다
+        "cost_estimate": {"amount": f"{est['app_peak_monthly']:.4f}", "currency": est["currency"], "period": "month",
                           "pricing_as_of": est["pricing_as_of"]},
         "terraform_plan_sha256": digest,
     }
@@ -802,7 +806,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         log(f"plan 파일 업로드 실패(계획 {plan['id']}은 등록됨, 파일은 남겨 다시 올립니다): {e}")
         plan["_upload_pending"] = True
         return plan
-    log(f"계획 등록 완료: {plan['id']} (월 최대 ${est['peak_monthly']:.2f}, 평소 ${est['total_monthly']:.2f}, sha {digest[:12]})")
+    log(f"계획 등록 완료: {plan['id']} (앱 추가 월 최대 ${est['app_peak_monthly']:.2f}, 평소 ${est['app_monthly']:.2f}, 공용 ${est['shared_monthly']:.2f} 별도, sha {digest[:12]})")
     return plan
 
 

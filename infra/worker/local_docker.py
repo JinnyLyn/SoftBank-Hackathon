@@ -331,7 +331,7 @@ def make_plan(*, deploy_id, image, dockerfile, app, source_sha256, tier, profile
         "source_sha256": source_sha256,
         "tier": tier, "recommended": True, "headline": profile["headline"], "tradeoff": profile["tradeoff"], "reason": ". ".join(reasons),
         "resources": resources, "usage_note": usage,
-        "cost": {"app_monthly": 0, "shared_monthly": 0, "total_monthly": 0, "peak_monthly": 0, "amount_basis": "peak_monthly", "excluded": excluded},
+        "cost": {"app_monthly": 0, "app_peak_monthly": 0, "shared_monthly": 0, "total_monthly": 0, "peak_monthly": 0, "amount_basis": "app_peak_monthly", "excluded": excluded},
         "connection_name": CONNECTION_NAME,
         "local": {"project": f"pc-{deploy_id}", "host_port": host_port, "bind": bind, "public_host": public_host, "url": url,
                   "app_cpus": profile["app_cpus"], "app_mem_mb": profile["app_mem_mb"], "db_cpus": profile["db_cpus"], "db_mem_mb": profile["db_mem_mb"],
