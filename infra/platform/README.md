@@ -7,7 +7,7 @@
 | 파일 | 역할 |
 |---|---|
 | `Dockerfile` | 프런트 빌드(`VITE_USE_MOCK=false`) → 백엔드 이미지에 `web/`으로 복사. 파이썬 버전은 `back/Dockerfile`과 같다 |
-| `serve.py` | `app.main:app`에 정적 파일을 붙이고 보안 헤더·CSP를 더한다. 백엔드·프런트 코드는 고치지 않는다 |
+| `serve.py` | `app.main:app`에 정적 파일을 붙이고 보안 헤더·CSP를 더한다. 화면 경로(`/onprem`)에는 `index.html`을 준다. 백엔드·프런트 코드는 고치지 않는다 |
 | `app.json` | 배포 앱 설정(포트 8000, `/health`, 앱 전용 DB, 마이그레이션 초기화 명령, `max_tasks=1`) |
 | `build-source.sh` | 빌드 컨텍스트를 `back/ front/ infra/platform/`의 필요한 파일로만 모은다(`.git`·`node_modules`·`.env` 제외) |
 
