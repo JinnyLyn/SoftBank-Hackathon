@@ -37,6 +37,7 @@ MAX_PROMPT_CHARS = 60_000  # 보낼 파일 내용 상한 (대략 1.5만 토큰)
 # 이보다 큰 파일은 단서(포트·경로·listen 등) 주변 줄만 보냄. 줄 번호는 원래 번호 그대로라 근거 검증은 같음
 MAX_FILE_CHARS = 12_000
 EXCERPT_CONTEXT = 3
+MAX_LINE_CHARS = 500  # 발췌할 때 한 줄 상한(압축된 한 줄짜리 파일이 발췌 상한을 넘지 않게)
 MAX_NOTES = 5
 # LLM 단계 전체 시간 상한(초, 재시도 포함). 넘으면 규칙 결과로 진행. 화면은 분석을 5분까지 기다리므로 그보다 훨씬 짧게
 LLM_BUDGET_SECONDS = 60.0
@@ -200,15 +201,25 @@ def _excerpt(text: str) -> List[Tuple[Optional[int], str]]:
     out: List[Tuple[Optional[int], str]] = []
     prev, size = -1, 0
     for i in sorted(keep):
-        if size > MAX_FILE_CHARS:
+        line = _clip(lines[i])
+        if size + len(line) + 8 > MAX_FILE_CHARS:   # 넣기 전에 상한을 확인(긴 줄 하나로 넘지 않게)
             out.append((None, "… (이하 생략)"))
             break
         if i != prev + 1:
             out.append((None, "…"))
-        out.append((i + 1, lines[i]))
-        size += len(lines[i]) + 8
+        out.append((i + 1, line))
+        size += len(line) + 8
         prev = i
     return out
+
+
+def _clip(line: str) -> str:
+    """긴 줄은 단서(포트·경로 등) 주변 MAX_LINE_CHARS 자만. 근거 검증은 원래 파일 전체로 하므로 값이 이 안에 있으면 통과"""
+    if len(line) <= MAX_LINE_CHARS:
+        return line
+    m = _HINTS.search(line) or _CONFIG_HINTS.search(line)
+    start = max(0, min(m.start() - MAX_LINE_CHARS // 2, len(line) - MAX_LINE_CHARS)) if m else 0
+    return ("… " if start else "") + line[start:start + MAX_LINE_CHARS] + " …"
 
 
 def build_prompt(analysis: Analysis, files: List[SourceFile], targets: List[str]) -> str:

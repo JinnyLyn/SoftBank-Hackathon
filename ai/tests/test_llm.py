@@ -444,6 +444,25 @@ class ExcerptTests(unittest.TestCase):
         self.assertLess(len(sent), MAX_FILE_CHARS * 3)
         self.assertEqual(out.filled, ["container_port"])
 
+    def test_single_huge_line_stays_within_excerpt_limit(self):
+        # PR #45 리뷰: 압축된 한 줄짜리 큰 파일이 발췌 상한을 넘으면 안 됨
+        from paved_ai.llm import MAX_FILE_CHARS, MAX_LINE_CHARS, MAX_PROMPT_CHARS
+        huge = "var a=1;" * 18000 + "app.listen(5050);" + "var b=2;" * 1000   # 약 15만 자 한 줄
+        spec = {"package.json": json.dumps({"dependencies": {"express": "^4"}, "scripts": {"start": "node server.js"}}),
+                "server.js": huge}
+        fs = files(spec)
+        client = FakeClient({"answers": [answer("container_port", "5050", "server.js", 1)], "notes": []})
+        a = analyze_files(fs)
+        a.unresolved.setdefault("container_port", "테스트")
+        a.container_port = None
+        out = fill_unresolved(a, fs, client)
+        sent = client.calls[0]["messages"][0]["content"]
+        self.assertLess(len(sent), MAX_PROMPT_CHARS)
+        self.assertLess(len(sent), MAX_FILE_CHARS + 5000)
+        self.assertIn("app.listen(5050)", sent, "긴 줄은 단서 주변을 남김")
+        self.assertLessEqual(max(len(l) for l in sent.splitlines()), MAX_LINE_CHARS + 20)
+        self.assertEqual(out.filled, ["container_port"], "근거 검증은 원래 줄 전체로")
+
 
 if __name__ == "__main__":
     unittest.main()
