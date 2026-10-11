@@ -141,6 +141,42 @@ class PlanFailureIn(APIModel):
     kind: Literal["input", "operator", "transient"] | None = None
 
 
+class AlertMetrics(APIModel):
+    cpu_percent: float = Field(ge=0, le=1000)
+    running_tasks: int = Field(ge=0, le=10000)
+    max_tasks: int = Field(ge=0, le=10000)
+    window_minutes: int = Field(ge=1, le=1440)
+
+
+class AlertIn(APIModel):
+    """worker가 알리는 배포 앱의 운영 알림. active=False면 풀림"""
+    kind: Literal["capacity"]
+    active: bool
+    message: str = Field(min_length=1, max_length=1000)
+    metrics: AlertMetrics | None = None
+
+
+class AlertOut(APIModel):
+    deployment_id: UUID
+    project_id: UUID
+    app: str
+    url: str | None
+    kind: Literal["capacity"]
+    active: bool
+    message: str
+    metrics: AlertMetrics | None
+    updated_at: datetime
+
+
+class MonitoredDeploymentOut(APIModel):
+    """worker가 용량을 확인할 배포: 프로젝트마다 가장 최근의 healthy AWS 배포"""
+    deployment_id: UUID
+    project_id: UUID
+    deploy_id: str
+    min_tasks: int | None
+    max_tasks: int | None
+
+
 class PlanFailureOut(APIModel):
     target: Literal["aws", "local_docker"]
     reason: str

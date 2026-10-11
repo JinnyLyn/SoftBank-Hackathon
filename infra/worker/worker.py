@@ -1374,6 +1374,95 @@ def verify_connection(api, cfg, state, env, conn):
     log(f"연결 실패 보고: {cid}")
 
 
+# --- 용량 알림 -------------------------------------------------------------------------------------
+# 자동 확장(CPU 60% 목표)이 최대 태스크 수까지 늘렸는데도 CPU가 이 값 이상이면, 고른 안으로는 감당이 안 되는 것이라 사용자에게 알린다.
+# 알림만 보내고 구성은 바꾸지 않는다(바꾸려면 더 큰 안으로 다시 계획·승인. AGENTS.md: 승인 없이 변경하지 않음)
+CAPACITY_CPU_THRESHOLD = 80.0
+CAPACITY_WINDOW_MINUTES = 5
+CAPACITY_CHECK_SECONDS = 60.0
+
+
+def ecs_service_name(deploy_id):
+    """modules/ecs-web-app 의 서비스 이름(${project}-${deploy_id}, project 기본값 paved-clouds)"""
+    return f"paved-clouds-{deploy_id}"
+
+
+def read_capacity(cfg, env, cluster, deploy_id):
+    """(최근 CAPACITY_WINDOW_MINUTES분 평균 CPU %, 실행 중 태스크 수). 읽지 못하면 QuotaError"""
+    service = ecs_service_name(deploy_id)
+    desc = aws_json(cfg, env, ["ecs", "describe-services", "--cluster", cluster, "--services", service])
+    services = desc.get("services") if isinstance(desc.get("services"), list) else []
+    if not services or not isinstance(services[0], dict):
+        raise QuotaError(f"ECS 서비스 {service}를 찾지 못했습니다")
+    running = services[0].get("runningCount")
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(minutes=CAPACITY_WINDOW_MINUTES)
+    metric = aws_json(cfg, env, [
+        "cloudwatch", "get-metric-statistics", "--namespace", "AWS/ECS", "--metric-name", "CPUUtilization",
+        "--dimensions", f"Name=ClusterName,Value={cluster}", f"Name=ServiceName,Value={service}",
+        "--start-time", start.strftime("%Y-%m-%dT%H:%M:%SZ"), "--end-time", now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "--period", str(CAPACITY_WINDOW_MINUTES * 60), "--statistics", "Average"])
+    points = [p.get("Average") for p in metric.get("Datapoints") or [] if isinstance(p, dict)]
+    points = [p for p in points if isinstance(p, (int, float)) and not isinstance(p, bool) and math.isfinite(p)]
+    if not isinstance(running, int) or isinstance(running, bool):
+        raise QuotaError(f"ECS 서비스 {service}의 실행 중 태스크 수를 읽지 못했습니다")
+    return (max(points) if points else None), running
+
+
+def check_capacity(api, cfg, state):
+    """healthy AWS 배포의 CPU·태스크 수를 읽어, 최대 태스크 수를 다 쓰고도 CPU가 높으면 알림을 올리고 내려가면 푼다.
+    CAPACITY_CHECK_SECONDS마다 한 번. 실패는 배포 작업을 막지 않는다(이 백엔드에 API가 없으면 조용히 끈다)."""
+    if not state.capacity_enabled or time.time() - state.capacity_checked < CAPACITY_CHECK_SECONDS:
+        return
+    state.capacity_checked = time.time()
+    try:
+        monitored = api.get("/api/worker/deployments/monitored") or []
+    except ApiError as e:
+        if e.status in (404, 405):
+            state.capacity_enabled = False   # 예전 백엔드
+        else:
+            log(f"용량 확인 대상을 읽지 못했습니다: {e}")
+        return
+    cluster = None
+    try:
+        cluster = json.loads((cfg.deployments_dir / "foundation.json").read_text(encoding="utf-8")).get("cluster_name")
+    except (OSError, ValueError, AttributeError):
+        pass
+    if not cluster:
+        return   # foundation 정보를 아직 읽지 않았다(첫 계획 때 foundation-info가 저장한다)
+    env = child_env(cfg)
+    for dep in monitored:
+        did, deploy_id, max_tasks = dep.get("deployment_id"), dep.get("deploy_id"), dep.get("max_tasks")
+        if not isinstance(deploy_id, str) or not DEPLOY_ID_RE.match(deploy_id) or not isinstance(max_tasks, int):
+            continue
+        try:
+            cpu, running = read_capacity(cfg, env, cluster, deploy_id)
+        except QuotaError as e:
+            if did not in state.capacity_errors:
+                log(f"용량을 읽지 못했습니다(배포 {did}): {e}")
+            state.capacity_errors.add(did)
+            continue
+        state.capacity_errors.discard(did)
+        if cpu is None:
+            continue
+        hot = cpu >= CAPACITY_CPU_THRESHOLD and running >= max_tasks
+        if state.capacity_alerts.get(did) == hot:
+            continue   # 바뀐 것만 알린다
+        message = (f"서버 사용률이 최근 {CAPACITY_WINDOW_MINUTES}분 평균 {cpu:.0f}%이고, 자동 확장이 최대 {max_tasks}대를 모두 쓰고 있습니다. "
+                   "더 큰 안으로 다시 계획해 승인하면 서버를 늘릴 수 있습니다." if hot else
+                   f"서버 사용률이 {cpu:.0f}%로 내려갔습니다(실행 중 {running}대 / 최대 {max_tasks}대).")
+        try:
+            api.post(f"/api/worker/deployments/{did}/alerts", {
+                "kind": "capacity", "active": hot, "message": message,
+                "metrics": {"cpu_percent": round(cpu, 1), "running_tasks": running, "max_tasks": max_tasks,
+                            "window_minutes": CAPACITY_WINDOW_MINUTES}})
+            state.capacity_alerts[did] = hot
+            if hot:
+                log(f"용량 알림(배포 {did}): CPU {cpu:.0f}%, {running}/{max_tasks}대")
+        except ApiError as e:
+            log(f"용량 알림을 보내지 못했습니다(배포 {did}): {e}")
+
+
 def verify_connections(api, cfg, state):
     """백엔드의 대기 중인 AWS 연결을 확인한다. 이 일이 실패해도 배포 작업(claim·계획)은 계속한다.
 
@@ -1419,6 +1508,11 @@ class State:
     repair: set = field(default_factory=set)       # plan 파일 업로드가 남은 프로젝트(점검마다 다시 올린다)
     recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
     retry_after: float = 120.0
+    requested: dict = field(default_factory=dict)  # 프로젝트 id → 마지막으로 본 requested_tier(사용자가 비교표에서 고른 안). 바뀌면 바로 다시 계획
+    capacity_enabled: bool = True                  # 배포 앱 용량 알림(백엔드에 API가 없으면 끔)
+    capacity_checked: float = 0.0                  # 마지막 용량 확인 시각
+    capacity_alerts: dict = field(default_factory=dict)   # 배포 id → 지금 알림이 켜져 있는지(바뀔 때만 보냄)
+    capacity_errors: set = field(default_factory=set)     # 용량을 읽지 못한 배포(같은 오류 로그를 반복하지 않음)
     max_tries: int = 3
     conn_tries: dict = field(default_factory=dict)   # 연결 id → (사용자 쪽 거부 횟수, 마지막 시도 시각). 오류·미증명 거부는 횟수 0으로 시각만 남긴다
     conn_blocked: set = field(default_factory=set)   # 형식 오류·4xx로 이 프로세스에서 더 다루지 않는 연결
@@ -1460,6 +1554,11 @@ def report_plan_failure(api, project_id, target, reason, retryable, attempts, ki
 def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
     for project in list_projects(api):
         pid = project["id"]
+        # 사용자가 다른 안을 골랐으면(백엔드가 승인 대기 계획을 superseded로 바꿈) recheck_after를 기다리지 않고 이번 점검에서 다시 계획한다
+        requested = project.get("requested_tier")
+        if requested and state.requested.get(pid) != requested:
+            state.requested[pid] = requested
+            state.done.pop(pid, None)
         # 활성 계획이 있는 프로젝트도 recheck_after마다 다시 조회한다(같은 프로세스에서 계획이 superseded로 바뀔 수 있다)
         if pid in state.done and pid not in state.repair and time.time() - state.done[pid] < state.recheck_after:
             continue
@@ -1532,6 +1631,7 @@ def tick(api, cfg, state, prices=None, arch="X86_64"):
         execute_job(api, cfg, job)
     if "aws" in cfg.targets:
         verify_connections(api, cfg, state)
+        check_capacity(api, cfg, state)
     if local_docker.TARGET in cfg.targets:
         plan_pending_local(api, cfg, state)
     if "aws" in cfg.targets:

@@ -36,6 +36,8 @@ interface Props {
   onChoice: (c: Choice) => void
   /** 계획이 없는 비교용 안을 누르면 그 안으로 다시 계획을 요청 */
   onRequestTier: (tier: TierKey) => void
+  /** 다른 안의 실행 계획을 만드는 중이면 그 안 */
+  replanning?: TierKey | null
 }
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
@@ -156,7 +158,7 @@ const PLAN_HINTS = [
 
 type PlansProps = Omit<Props, 'analysis' | 'rec' | 'recError' | 'recStartedAt' | 'onRetryRec'> & { rec: Recommendation }
 
-function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, onRequestTier }: PlansProps) {
+function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, onRequestTier, replanning }: PlansProps) {
   const tr = useT()
   const option = rec.options.find((o) => o.connectionId === choice?.connectionId)
   const selected = option?.tiers.find((t) => t.key === choice?.tier)
@@ -228,7 +230,7 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
                       return (
                         <td key={t.key}>
                           <button
-                            className={'cell' + (on ? ' is-on' : '') + (over ? ' is-over' : '')}
+                            className={'cell' + (on || replanning === t.key ? ' is-on' : '') + (over ? ' is-over' : '')}
                             disabled={locked || over}
                             title={
                               over
@@ -255,7 +257,13 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
                               <small className="cell-usual">{tr('평소 {usd} · 부하 최대 기준', { usd: usd(t.usualUsd) })}</small>
                             )}
                             <small>{t.headline}</small>
-                            {compareOnly && !over && <small className="cell-note">{tr('누르면 이 안으로 계획을 다시 만듭니다(약 1분)')}</small>}
+                            {replanning === t.key ? (
+                              <small className="cell-note is-working">
+                                <span className="pulse" aria-hidden /> {tr('이 안의 실행 계획을 만드는 중… (1분 안팎, 분석은 다시 하지 않음)')}
+                              </small>
+                            ) : (
+                              compareOnly && !over && <small className="cell-note">{tr('누르면 이 안의 실행 계획을 만듭니다(1분 안팎)')}</small>
+                            )}
                           </button>
                         </td>
                       )
@@ -268,7 +276,7 @@ function Plans({ rec, choice, budget, codeState, codeError, locked, onChoice, on
         )}
         {rec.options.some((o) => o.tiers.some((t) => t.planned === false)) && (
           <p className="hint">
-            {tr('배포 계획은 고른 안 하나로 만듭니다. 다른 안을 누르면 그 안으로 계획을 다시 만들고, 바뀐 계획으로 다시 승인합니다.')}
+            {tr('실행 계획은 고른 안 하나로 만듭니다. 다른 안을 누르면 분석·비용 계산은 그대로 두고 그 안의 실행 계획만 새로 만든 뒤, 바뀐 계획으로 다시 승인합니다.')}
           </p>
         )}
 

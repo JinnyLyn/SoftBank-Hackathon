@@ -98,6 +98,13 @@ code { font-family: var(--mono); font-size: 12px; background: var(--sunken); bor
 .lang-switch button.is-on { background: var(--marking); color: var(--asphalt); font-weight: 700; }
 .lang-switch button:focus-visible { outline: 2px solid var(--marking); outline-offset: 1px; }
 
+/* ---------- 운영 알림 띠 (SSE) ---------- */
+.alert-bar { background: var(--marking-soft); border-bottom: 1px solid var(--marking); }
+.alert-item { max-width: 1120px; margin: 0 auto; padding: 10px 24px; display: flex; align-items: flex-start; gap: 10px; font-size: 13.5px; color: var(--ink); }
+.alert-item > span:nth-child(2) { flex: 1; }
+.alert-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--fail); margin-top: 5px; flex-shrink: 0; }
+@media (max-width: 640px) { .alert-item { padding: 10px 16px; } }
+
 /* ---------- layout ---------- */
 .container { max-width: 1120px; margin: 0 auto; padding: 32px 24px 72px; }
 .page { display: flex; flex-direction: column; gap: 16px; }
@@ -635,6 +642,8 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .tag-rank { font-size: 11px; font-weight: 600; color: var(--ink-2); border: 1px solid var(--line-strong); border-radius: 4px; padding: 0 5px; }
 .cell-usual { color: var(--muted); }
 .cell-note { color: var(--muted); font-size: 11.5px; }
+.cell-note.is-working { color: var(--marking-ink); font-weight: 600; }
+.cell-note .pulse { display: inline-block; width: 8px; height: 8px; vertical-align: middle; }
 .draft-box { display: flex; flex-direction: column; gap: 8px; }
 .draft-next { background: var(--marking-soft); border: 1px solid var(--marking); border-radius: 8px; padding: 12px 16px; font-size: 13px; }
 .draft-next ol { margin: 6px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }

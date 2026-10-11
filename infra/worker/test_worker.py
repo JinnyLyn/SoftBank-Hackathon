@@ -84,7 +84,17 @@ case "$1" in
     [ "${FAKE_QUOTA_NOMETRIC:-0}" = "0" ] || metric=""
     printf '{"Quota": {"ServiceCode": "fargate", "QuotaCode": "L-3032A538", "QuotaName": "Fargate On-Demand vCPU resource count", "Value": %s%s}}\n' "${FAKE_QUOTA_VALUE:-1000}" "$metric"
     exit 0 ;;
+  ecs)
+    printf '{"services": [{"serviceName": "x", "runningCount": %s}]}
+' "${FAKE_ECS_RUNNING:-1}"
+    exit 0 ;;
   cloudwatch)
+    case "$*" in *AWS/ECS*)
+      if [ "${FAKE_CPU:-none}" = "none" ]; then echo '{"Label": "CPUUtilization", "Datapoints": []}'
+      else printf '{"Label": "CPUUtilization", "Datapoints": [{"Timestamp": "2026-10-11T00:00:00+00:00", "Average": %s, "Unit": "Percent"}]}
+' "$FAKE_CPU"; fi
+      exit 0 ;;
+    esac
     [ "${FAKE_USAGE_FAIL:-0}" = "0" ] || { echo "An error occurred (AccessDenied) when calling the GetMetricStatistics operation: not authorized" >&2; exit 254; }
     if [ "${FAKE_QUOTA_USED:-0}" = "none" ]; then echo '{"Label": "ResourceCount", "Datapoints": []}'
     else printf '{"Label": "ResourceCount", "Datapoints": [{"Timestamp": "2026-10-11T00:00:00+00:00", "Maximum": %s, "Unit": "None"}, {"Timestamp": "2026-10-11T00:05:00+00:00", "Maximum": 0, "Unit": "None"}]}\n' "${FAKE_QUOTA_USED:-0}"; fi
@@ -129,6 +139,8 @@ class FakeBackend:
         self.source_redirect = None   # 지정하면 소스 요청을 이 주소로 302 리다이렉트한다
         self.source_truncate = 0      # 앞으로 몇 번의 소스 응답을 "Content-Length만큼 보내지 않고 연결을 닫는" 방식으로 처리할지
         self.plan_failures = []       # (project_id, 본문) — 계획 실패 보고
+        self.monitored = None         # GET /api/worker/deployments/monitored 응답. None이면 404(예전 백엔드)
+        self.alerts = []              # (deployment_id, 본문) — 용량 알림
         self.plan_failure_code = 200  # 404면 이 API가 없는 예전 백엔드
         self.source_no_length = False   # True면 Content-Length 없이 보내고 연결을 닫아 끝을 알린다(길이를 미리 알 수 없는 응답)
         self.source_trickle = 0         # 0보다 크면 소스를 한 바이트씩 이 간격(초)으로 보낸다(연결은 살아 있고 느리게 진행되는 응답)
@@ -154,6 +166,12 @@ class FakeBackend:
             def do_GET(self):
                 outer.headers_seen.append((self.path, self.headers.get("X-Worker-Token")))
                 p = self.path
+                if p == "/api/worker/deployments/monitored":
+                    if self.headers.get("X-Worker-Token") != TOKEN:
+                        return self._send(401, {"error": "인증 실패"})
+                    if outer.monitored is None:
+                        return self._send(404, {"detail": "Not Found"})
+                    return self._send(200, outer.monitored)
                 if p == "/api/worker/connections/pending":
                     outer.order.append("pending")
                     if self.headers.get("X-Worker-Token") != TOKEN:
@@ -241,6 +259,11 @@ class FakeBackend:
                             if pl.get("id") == p.split("/")[4]:
                                 pl["terraform_plan_ready"] = True
                     return self._send(200, {"ok": True})
+                if p.startswith("/api/worker/deployments/") and p.endswith("/alerts"):
+                    if self.headers.get("X-Worker-Token") != TOKEN:
+                        return self._send(401, {"error": "인증 실패"})
+                    outer.alerts.append((p.split("/")[4], json.loads(body)))
+                    return self._send(200, {})
                 if p.startswith("/api/worker/projects/") and p.endswith("/plan-failures"):
                     if self.headers.get("X-Worker-Token") != TOKEN:
                         return self._send(401, {"error": "인증 실패"})
@@ -291,7 +314,7 @@ class Base(unittest.TestCase):
         self.old_env = dict(os.environ)
         os.environ.update({"FAKE_LOG": worker.posix(self.log_file), "FAKE_DEPLOYMENTS": worker.posix(self.tmp / "deployments")})
         for k in ("FAKE_UP_RC", "FAKE_BUILD_RC", "FAKE_APPLY_RC", "FAKE_BUILD_IMAGE", "FAKE_HANG", "FAKE_FOUNDATION_JSON", "FAKE_FOUNDATION_FAIL", "FAKE_FOUNDATION_ERR",
-                  "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC",
+                  "FAKE_AWS_MODE", "FAKE_AWS_ARN", "FAKE_ECS_RUNNING", "FAKE_CPU", "FAKE_QUOTA_VALUE", "FAKE_QUOTA_USED", "FAKE_QUOTA_FAIL", "FAKE_USAGE_FAIL", "FAKE_QUOTA_NOMETRIC",
                   "FAKE_BUILD_SRC_LOG", "FAKE_APPLY_URL"):
             os.environ.pop(k, None)
         os.environ["WORKER_API_TOKEN"] = TOKEN
@@ -1082,6 +1105,22 @@ class PlannerTests(Base):
         self.assertEqual({o["tier"]: o["recommended"] for o in v["options"]}, {"lean": False, "balanced": False, "roomy": True})
         self.assertIn("사용자가 고른 '작게 시작' 안", v["reason"])
         self.assertEqual(v["app"]["task_size"], "xsmall")
+
+    def test_new_requested_tier_is_planned_without_waiting_for_recheck(self):
+        # 사용자가 다른 안을 고르면(백엔드가 승인 대기 계획을 superseded로 바꾸고 requested_tier 저장) 30초를 기다리지 않고 바로 다시 계획
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=3600.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        for plan in self.backend.plans[p1["id"]]:
+            plan["status"] = "superseded"
+        p1["requested_tier"] = "lean"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2, "recheck_after(1시간) 안이어도 바로 다시 계획")
+        self.assertEqual(self.backend.created_plans[1]["variables"]["tier"], "lean")
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2, "같은 요청이면 다시 계획하지 않음")
 
     def test_requested_tier_outside_budget_falls_back_to_recommendation(self):
         self.plan_with_project({"expected_users": "~100", "traffic_pattern": "steady", "monthly_budget_usd": "100.0000",
@@ -2375,6 +2414,53 @@ class PathTests(unittest.TestCase):
         got = worker.posix("C:/Users/x/a.zip" if os.name == "nt" else "/tmp/a.zip")
         self.assertEqual(got, "/c/Users/x/a.zip" if os.name == "nt" else "/tmp/a.zip")
 
+
+
+class CapacityTests(Base):
+    """배포 앱 용량 알림: 최대 태스크 수를 다 쓰고도 CPU가 높을 때만 알리고, 바뀔 때만 보낸다. 구성은 바꾸지 않는다"""
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "deployments" / "foundation.json").write_text(json.dumps({"cluster_name": "paved-clouds"}), encoding="utf-8")
+        self.backend.monitored = [{"deployment_id": "d-1", "project_id": "p-1", "deploy_id": "laun1234", "min_tasks": 1, "max_tasks": 2}]
+        self.state = worker.State()
+
+    def check(self):
+        self.state.capacity_checked = 0.0   # 간격(1분)을 기다리지 않음
+        worker.check_capacity(self.api, self.cfg, self.state)
+
+    def test_alert_when_max_tasks_are_all_busy_and_resolve_later(self):
+        os.environ.update(FAKE_ECS_RUNNING="2", FAKE_CPU="87.4")
+        self.check()
+        self.assertEqual(len(self.backend.alerts), 1)
+        did, body = self.backend.alerts[0]
+        self.assertEqual((did, body["kind"], body["active"]), ("d-1", "capacity", True))
+        self.assertEqual(body["metrics"], {"cpu_percent": 87.4, "running_tasks": 2, "max_tasks": 2, "window_minutes": 5})
+        self.assertIn("최대 2대", body["message"])
+        self.check()
+        self.assertEqual(len(self.backend.alerts), 1, "상태가 같으면 다시 보내지 않음")
+        os.environ["FAKE_CPU"] = "40"
+        self.check()
+        self.assertEqual(self.backend.alerts[-1][1]["active"], False, "내려가면 알림을 품")
+        self.assertTrue(any("describe-services" in c and "paved-clouds-laun1234" in c for c in self.aws_calls()))
+        self.assertEqual(self.calls(), [], "deploy.sh(plan·apply)는 부르지 않음: 알림만 하고 구성을 바꾸지 않는다")
+
+    def test_no_alert_while_autoscaling_still_has_room_or_no_data(self):
+        os.environ.update(FAKE_ECS_RUNNING="1", FAKE_CPU="95")   # 아직 최대(2대)까지 늘지 않음 → 자동 확장이 처리
+        self.check()
+        os.environ.update(FAKE_ECS_RUNNING="2", FAKE_CPU="none")   # 지표 없음
+        self.check()
+        self.assertEqual([b["active"] for _, b in self.backend.alerts], [False], "처음 상태(정상)만 한 번 기록")
+
+    def test_old_backend_disables_quietly_and_interval_is_respected(self):
+        self.backend.monitored = None
+        self.check()
+        self.assertFalse(self.state.capacity_enabled)
+        self.state.capacity_enabled = True
+        self.backend.monitored = [{"deployment_id": "d-1", "project_id": "p-1", "deploy_id": "laun1234", "min_tasks": 1, "max_tasks": 2}]
+        self.state.capacity_checked = time.time()
+        worker.check_capacity(self.api, self.cfg, self.state)
+        self.assertEqual(self.aws_calls(), [], "1분 안에는 다시 확인하지 않음")
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

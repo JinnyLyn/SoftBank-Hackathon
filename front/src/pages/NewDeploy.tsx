@@ -122,6 +122,8 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const [pollIssue, setPollIssue] = useState<PollIssue | null>(null)
   const deadlineRef = useRef(0)
   const [busy, setBusy] = useState<Busy>(null)
+  // 비교표에서 다른 안을 골라 그 안의 실행 계획을 만드는 중(비교표는 그대로 두고 그 칸에만 표시)
+  const [replanning, setReplanning] = useState<TierKey | null>(null)
   const [error, setError] = useState<string | null>(null)
   // 분석을 새로 하면 이전 분석의 늦게 도착한 코드 응답은 버림
   const projectRef = useRef<string | null>(null)
@@ -367,10 +369,18 @@ export default function NewDeploy({ onShowHistory }: Props) {
   const requestTier = (projectId: string, tier: TierKey) =>
     run('replan', async () => {
       await api.requestTier(projectId, tier)
-      setRec(null)
-      setBundles({})
-      setChoiceState(null)
-      loadRec(projectId)
+      // 분석·비용은 다시 하지 않음: 고른 안의 Terraform 실행 계획만 새로 만들어짐(승인은 그 plan 파일에 묶임)
+      setReplanning(tier)
+      try {
+        const r = await api.recommend(projectId, scale)
+        if (projectRef.current !== projectId) return
+        setRec(r)
+        setBundles(r.bundles ?? {})
+        setChoiceState(r.recommended)
+        if (r.recommended && !r.bundles?.[keyOf(r.recommended)]) prefetch(projectId, r.recommended)
+      } finally {
+        setReplanning(null)
+      }
     })
 
   const approve = () =>
@@ -581,6 +591,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
               locked={locked || busy !== null}
               onChoice={setChoice}
               onRequestTier={(tier) => requestTier(analysis.projectId, tier)}
+              replanning={replanning}
             />
           )}
           {step === REVIEW && bundle && option && selectedTier && (

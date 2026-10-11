@@ -135,12 +135,16 @@ def check(root):
                                      ("/api/worker/rollback-plans/{plan_id}/summary", "post"),
                                      ("/api/projects/{project_id}/plan-failures", "get"),
                                      ("/api/projects/{project_id}/plan-requests", "post"),
+                                     ("/api/alerts", "get"), ("/api/alerts/stream", "get"),
+                                     ("/api/worker/deployments/monitored", "get"),
+                                     ("/api/worker/deployments/{deployment_id}/alerts", "post"),
                                      ("/api/projects/{project_id}/domain", "put"),
                                      ("/api/worker/projects/{project_id}/plan-failures", "post")):
                     require(isinstance(paths.get(path), dict) and method in paths[path],
                             f"/openapi.json: missing {method.upper()} {path}")
                 client.json("/ready", status=503)
                 client.json("/api/worker/deployments/claim", status=401, method="POST")
+                client.json("/api/worker/deployments/monitored", status=401)
                 client.json("/api/worker/projects/00000000-0000-0000-0000-000000000000/plan-failures", status=401, method="POST",
                             payload={"target": "aws", "reason": "x", "retryable": False, "attempts": 1})
                 client.json("/api/plans", status=422, method="POST", payload={})
