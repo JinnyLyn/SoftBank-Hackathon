@@ -122,7 +122,11 @@ export default function OnPremDeploy() {
   const httpUrl = result?.url && /^http:\/\//i.test(result.url) ? result.url : null
 
   return <div className="onprem">
-    <header className="onprem-header"><div><strong>Paved Clouds</strong><span>로컬 Docker 배포</span></div></header>
+    <header className="onprem-header"><div>
+      <strong>Paved Clouds</strong>
+      {import.meta.env.VITE_ONPREM_ONLY !== 'true' && <button type="button" className="tab" onClick={() => window.location.assign('/')}>Home</button>}
+      <span>로컬 Docker 배포</span>
+    </div></header>
     <main className="onprem-main">
       <section className="onprem-intro"><h1>이 플랫폼 PC에 앱 배포하기</h1>
         <p>플랫폼을 실행하는 PC의 Docker를 사용합니다. 방문자의 PC나 SSH 원격 서버에 배포하지 않습니다.</p>
