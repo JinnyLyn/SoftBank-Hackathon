@@ -125,6 +125,9 @@ export default function ReviewStep({
       {bundle.planInfo?.excludedCosts && (
         <p className="hint">이 금액에 넣지 않은 비용: {bundle.planInfo.excludedCosts.join(', ')}</p>
       )}
+      {bundle.planInfo?.sharedMonthlyUsd !== undefined && bundle.planInfo.sharedIncluded === false && (
+        <p className="hint">모든 앱이 함께 쓰는 공용 기반(ALB·DB 등)의 월 {usd(bundle.planInfo.sharedMonthlyUsd)}는 이 합계에 넣지 않았습니다.</p>
+      )}
 
       {bundle.planInfo && (
         <dl className="plan-info">

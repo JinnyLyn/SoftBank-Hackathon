@@ -201,7 +201,8 @@ export interface PlanOut {
 
 const TIER_KEYS: TierKey[] = ['lean', 'balanced', 'roomy']
 const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
-// 승인 금액. worker는 부하가 최대일 때(태스크 max_tasks개)의 월 비용을 넣음(cost.amount_basis: peak_monthly)
+// 승인 금액. worker는 부하가 최대일 때(태스크 max_tasks개)의 앱 추가 월 비용을 넣음(cost.amount_basis: app_peak_monthly).
+// 모든 앱이 함께 쓰는 공용 기반(ALB·DB 등)은 금액에 넣지 않음. 이전 방식의 계획(amount_basis: peak_monthly)에는 공용 기반이 합쳐져 있음
 const planCost = (p: PlanOut) => Number(p.cost_estimate?.amount ?? 0)
 
 const RANK_LABEL: Record<string, string> = { lowest: '최저', average: '평균', highest: '최대' }
@@ -218,8 +219,9 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
     const key = TIER_KEYS.find((k) => k === o.tier)
     if (!key || seen.has(key)) continue
     seen.add(key)
-    const peak = Number(o.peak_monthly)
-    const usual = Number(o.total_monthly)
+    // 앱 추가 비용 기준(app_*). app_*가 없는 이전 방식의 계획은 그 계획의 승인 금액과 같은 기준인 peak_monthly·total_monthly를 그대로 씀
+    const peak = Number(o.app_peak_monthly ?? o.peak_monthly)
+    const usual = Number(o.app_monthly ?? o.total_monthly)
     const extra = {
       rankLabel: RANK_LABEL[str(o.rank)],
       usualUsd: Number.isFinite(usual) ? usual : undefined,
@@ -300,13 +302,15 @@ function draftFile(p: PlanOut): { name: string; content: string }[] {
 }
 
 /** 계획 금액에 넣지 않은 비용과 공용 기반 몫 (variables.cost). 없거나 형식이 다르면 비움 */
-function costScope(p: PlanOut): { excludedCosts?: string[]; sharedMonthlyUsd?: number } {
+function costScope(p: PlanOut): { excludedCosts?: string[]; sharedMonthlyUsd?: number; sharedIncluded?: boolean } {
   const c = isObj(p.variables.cost) ? p.variables.cost : {}
   const excluded = Array.isArray(c.excluded) ? c.excluded.map(str).filter(Boolean) : []
   const shared = Number(c.shared_monthly)
   return {
     excludedCosts: excluded.length ? excluded : undefined,
     sharedMonthlyUsd: c.shared_monthly != null && Number.isFinite(shared) ? shared : undefined,
+    // amount_basis가 app_peak_monthly인 계획은 공용 기반을 금액에 넣지 않고 참고로만 담음. 그 이전 계획은 금액에 합쳐져 있음
+    sharedIncluded: c.amount_basis !== 'app_peak_monthly',
   }
 }
 
@@ -506,9 +510,11 @@ export async function recommend(projectId: string, scale: ScaleInput): Promise<R
   if (awsExists) {
     assumptions.push(pricing ? `가격 기준: ${pricing}` : '가격 기준일 정보 없음')
     assumptions.push(
-      scope.sharedMonthlyUsd !== undefined
-        ? `AWS 금액에는 공용 기반(ALB·DB 등) 몫 월 ${usd(scope.sharedMonthlyUsd)}가 들어 있음`
-        : '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인',
+      scope.sharedMonthlyUsd === undefined
+        ? '공유 기반(foundation) 비용 포함 여부는 계획 설명을 확인'
+        : scope.sharedIncluded
+          ? `AWS 금액에는 공용 기반(ALB·DB 등) 몫 월 ${usd(scope.sharedMonthlyUsd)}가 들어 있음`
+          : `AWS 금액은 이 앱이 추가로 쓰는 비용만이고, 모든 앱이 함께 쓰는 공용 기반(ALB·DB·공인 IPv4)의 월 ${usd(scope.sharedMonthlyUsd)}는 넣지 않음`,
     )
     if (scope.excludedCosts) assumptions.push(`AWS 금액에 넣지 않은 비용: ${scope.excludedCosts.join(', ')}`)
   }

@@ -102,7 +102,9 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 ### 최저·평균·최대 세 안과 예산
 
-월 예산(프로젝트의 `monthly_budget_usd`, 없으면 분석 결과의 `scale.monthly_budget_usd`)은 코드에 박은 상한 대신 사용자가 정하는 한도다. 예산이 있으면 `cost.budget_configs`가 그 금액을 넘지 않는 세 안을 만든다. 예산 판정은 평소 비용이 아니라 **부하가 최대일 때(오토스케일링이 `max_tasks`까지 늘었을 때)의 월 비용(`peak_monthly`)** 으로 한다. 그래야 부하가 몰려도 예산을 넘지 않는다.
+월 예산(프로젝트의 `monthly_budget_usd`, 없으면 분석 결과의 `scale.monthly_budget_usd`)은 코드에 박은 상한 대신 사용자가 정하는 한도다. 예산이 있으면 `cost.budget_configs`가 그 금액을 넘지 않는 세 안을 만든다. 예산 판정은 평소 비용이 아니라 **부하가 최대일 때(오토스케일링이 `max_tasks`까지 늘었을 때)의 앱 추가 비용(`app_peak_monthly`)** 으로 한다. 그래야 부하가 몰려도 예산을 넘지 않는다.
+
+**모든 앱이 함께 쓰는 공용 foundation 비용(ALB·RDS·공인 IPv4)은 예산 판정과 승인 금액에 넣지 않는다.** [PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)가 "공유 인프라 원가를 모든 사용자에게 그대로 청구하는 것으로 가정하지 않는다"고 하기 때문이다. 이전에는 앱 하나에 공용 비용 월 $75.92가 통째로 붙어 가장 작은 구성도 월 $91.40이었고, 그보다 작은 예산은 항상 실패했다. 공용 비용은 `shared_monthly`·`shared_resources`로 참고용으로만 담는다. 공용 비용을 누가 어떻게 부담하는지(과금 방식)는 아직 팀이 정하지 않았다([남은 결정](../../docs/OPEN_QUESTIONS.md)).
 
 | 안 | 구성 | 금액 기준 |
 |---|---|---|
@@ -110,14 +112,14 @@ python infra/worker/worker.py --once             # 한 번만 점검
 | 평균 `balanced` | small, 최소 1개 | 최저와 **실제로 만든 최대 안**의 중간 금액까지 `max_tasks`를 채움 |
 | 최대 `roomy` | medium, 최소 2개 | **예산 한도**까지 `max_tasks`를 채움 |
 
-- `max_tasks`는 코드에 상한이 없고 예산이 허용하는 만큼 정해진다(예: foundation 기본 구성(3 AZ, NAT 3대)에서 월 $300이면 최대 안은 medium 2~3개, $1000이면 2~14개). 예산을 늘리면 최대 안도 따라 커진다. 단, 아래 "Fargate vCPU 할당량"이 이를 다시 제한한다.
-- 평균 안의 기준은 예산 원금이 아니라 최대 안의 실제 금액이다. 태스크는 정수 개라 최대 안이 예산을 다 쓰지 못할 수 있어서, 원금 기준이면 평균이 중간보다 위로 치우친다(월 $250이면 최저 $91.40·최대 $199.73의 중간은 $145.57인데 원금 기준은 $168.78이 나왔다).
-- 예산이 작아 최대 안의 최소 구성(medium 2개)을 못 담으면 평균 안을 예산 한도까지 채워 최대 안으로 삼는다. 그것도 못 담으면 최저 안만 남는다. 최저 안도 예산을 넘으면 계획을 만들지 않고 이유와 함께 종료한다.
+- `max_tasks`는 코드에 상한이 없고 예산이 허용하는 만큼 정해진다(예: 월 $300이면 최대 안은 medium 2~4개, $1000이면 2~16개. medium 태스크 하나는 월 $61.90). 예산을 늘리면 최대 안도 따라 커진다. 단, 아래 "Fargate vCPU 할당량"이 이를 다시 제한한다.
+- 평균 안의 기준은 예산 원금이 아니라 최대 안의 실제 금액이다. 태스크는 정수 개라 최대 안이 예산을 다 쓰지 못할 수 있어서, 원금 기준이면 평균이 중간보다 위로 치우친다(월 $250이면 최저 $15.48·최대 $247.62(medium 4개)의 중간은 $131.55인데 원금 기준은 $247.62(small 8개)가 나왔다).
+- 예산이 작아 최대 안의 최소 구성(medium 2개)을 못 담으면 평균 안을 예산 한도까지 채워 최대 안으로 삼는다. 그것도 못 담으면 최저 안만 남는다. 최저 안도 예산을 넘으면 계획을 만들지 않고 이유와 함께 종료한다. 가장 작은 구성(lean)의 앱 추가 비용은 월 $15.48(X86_64)이고, NAT 인스턴스가 없는 구성은 태스크 공인 IPv4가 더해져 $19.13이다. 예산이 이보다 작으면 항상 실패한다.
 - 예산이 없으면 예산 판정을 하지 않고 프리셋 세 안(1~1, 1~2, 2~4)을 그대로 쓴다.
 - 이 중 추천 안은 예상 사용자 수와 접속 패턴으로 고른다. 예산·할당량 때문에 만들 수 없는 안이면 만들 수 있는 가장 큰 안으로 내린다. 이유 문구는 실제로 만든 안의 수만 말한다(안이 2개면 "2개 안은 모두…").
-- 비교 금액은 두 가지다. `total_monthly`는 평소(`min_tasks`개) 비용, `peak_monthly`는 부하가 최대일 때 비용이다.
-- **승인 화면으로 가는 `cost_estimate.amount`는 `peak_monthly`(부하가 최대일 때)다.** 월 예산을 판정한 기준과 같아야 하고, 평소 금액만 보여주면 사용자가 오토스케일링으로 늘어난 청구를 모른 채 승인하기 때문이다. 백엔드 `CostEstimate`는 필드를 더 받지 않으므로(`extra=forbid`) 평소 금액은 `variables.cost.total_monthly`에 두고, `variables.cost.amount_basis`가 `amount`의 기준(`peak_monthly`)을 알린다. 프런트는 `amount`를 합계로, `variables.resources`를 행으로 보여주므로 행의 합이 합계와 맞도록 최대 시 추가분을 `ECS Fargate 오토스케일링 최대 시 추가분` 행(`peak_monthly - total_monthly`, 최대 안이 평소와 같으면 행 없음)으로 더한다. main `f506966`의 "월 예상 비용" 라벨은 최대 비용(상한)을 가리킨다. 10/11 확인한 [PR #29](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/29) `9aeee5b`의 비교표는 기존 `variables.options`의 `total_monthly`·`peak_monthly`를 읽어 평소·부하 최대 비용을 구분한다(main 통합 전). 이 표시를 위해 `CostEstimate` 필드를 추가할 필요는 없으며 승인 금액은 계속 부하 최대 기준이다. 다른 안 선택·재계획의 미결 계약은 [남은 결정](../../docs/OPEN_QUESTIONS.md)을 따른다.
-- 제외 항목(NAT 인스턴스 EC2, ALB 처리 용량·데이터 전송, 로그·ECR·백업 저장)은 두 금액 모두에 들어 있지 않다. 그래서 실제 청구는 예산보다 클 수 있다. 이를 알아채려면 foundation의 `budget_monthly_usd` 알림(`infra/README.md`)을 쓴다.
+- 비교 금액은 두 가지다. `app_monthly`는 평소(`min_tasks`개)의 앱 추가 비용, `app_peak_monthly`는 부하가 최대일 때의 앱 추가 비용이다. `total_monthly`·`peak_monthly`는 여기에 공용 비용을 더한 참고용 총액이며 예산 판정과 승인 금액에는 쓰지 않는다.
+- **승인 화면으로 가는 `cost_estimate.amount`는 `app_peak_monthly`(부하가 최대일 때의 앱 추가 비용)다.** 월 예산을 판정한 기준과 같아야 하고, 평소 금액만 보여주면 사용자가 오토스케일링으로 늘어난 청구를 모른 채 승인하기 때문이다. 백엔드 `CostEstimate`는 필드를 더 받지 않으므로(`extra=forbid`) 평소 금액은 `variables.cost.app_monthly`에 두고, `variables.cost.amount_basis`가 `amount`의 기준(`app_peak_monthly`)을 알린다. 이전 방식의 계획은 공용 비용을 합친 `peak_monthly`가 기준이었으므로(`amount_basis: peak_monthly`) 프런트는 이 값으로 둘을 구분한다. 프런트는 `amount`를 합계로, `variables.resources`를 행으로 보여주므로 행의 합이 합계와 맞도록 최대 시 추가분을 `ECS Fargate 오토스케일링 최대 시 추가분` 행(`app_peak_monthly - app_monthly`, 최대 안이 평소와 같으면 행 없음)으로 더한다. 공용 기반 행(ALB·RDS·공인 IPv4)은 `resources`에 넣지 않고 `variables.shared_resources`에 둔다. main `f506966`의 "월 예상 비용" 라벨은 최대 비용(상한)을 가리킨다. 10/11 확인한 [PR #29](https://github.com/JinnyLyn/SoftBank-Hackathon/pull/29) `9aeee5b`의 비교표는 `variables.options`의 `total_monthly`·`peak_monthly`를 읽는다(main 통합 전). 프런트는 `app_monthly`·`app_peak_monthly`가 있으면 그 값을, 없는 이전 계획은 기존 필드를 읽는다. 이 표시를 위해 `CostEstimate` 필드를 추가할 필요는 없으며 승인 금액은 계속 부하 최대 기준이다. 다른 안 선택·재계획의 미결 계약은 [남은 결정](../../docs/OPEN_QUESTIONS.md)을 따른다.
+- 제외 항목(NAT 인스턴스 EC2, ALB 처리 용량·데이터 전송, 로그·ECR·백업 저장)은 어느 금액에도 들어 있지 않다. 공용 기반(ALB·RDS·공인 IPv4)도 앱 금액에 넣지 않으므로, 운영자가 내는 실제 청구는 승인 금액이나 예산보다 훨씬 클 수 있다. 이를 알아채려면 foundation의 `budget_monthly_usd` 알림(`infra/README.md`)을 쓴다.
 
 ### Fargate vCPU 할당량
 
@@ -136,7 +138,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 
 ### 계획 변수 (프런트가 읽는 키)
 
-`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `cost`(`app_monthly`, `shared_monthly`, `total_monthly`(평소), `peak_monthly`(부하 최대, `cost_estimate.amount`와 같은 값), `amount_basis`, `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `reserved_vcpu`(승인 대기·승인된 다른 계획의 예약), `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
+`variables`에 `deploy_id`, `image`, `dockerfile`, `app`(앱 설정), **`source_sha256`(승인된 소스 ZIP의 지문)**, **`cpu_architecture`**, 그리고 프런트 표시용 `tier`, `recommended`, `headline`, `tradeoff`, `reason`, `resources`(`service`, `spec`, `monthlyUsd`, `why`), `shared_resources`(공용 기반 행, 승인 금액에 들어가지 않는 참고), `cost`(`app_monthly`(평소의 앱 추가 비용), `app_peak_monthly`(부하 최대 때의 앱 추가 비용, `cost_estimate.amount`와 같은 값), `shared_monthly`(공용 기반 비용, 참고), `total_monthly`·`peak_monthly`(앱 + 공용을 합친 참고용 총액), `amount_basis`(`app_peak_monthly`), `peak_vcpu`, `budget_usd`, `excluded`), **`fargate_vcpu`**(`quota_vcpu`, `used_vcpu`, `reserved_vcpu`(승인 대기·승인된 다른 계획의 예약), `available_vcpu`. 할당량 조회를 건너뛰었으면 `null`), **`options`**(최저·평균·최대 세 안의 비교: `tier`, `rank`(`lowest`/`average`/`highest`), `label`, `task_size`, `min_tasks`, `max_tasks`, `total_monthly`, `peak_monthly`, `peak_vcpu`, `quota_limited`, `headline`, `tradeoff`, `recommended`)를 담는다.
 현재는 **권장 단계 하나만** 계획으로 등록하고, 나머지 안은 `options`로 비교 정보만 알린다. 단계마다 Terraform 저장 계획이 따로 필요한데 한 배포 폴더에는 계획 하나만 둘 수 있어서, 단계 비교용 여러 계획은 아직 만들지 않았다(프런트 `README`의 "추천 비교표"는 계획이 하나면 그 하나만 보여 준다). 사용자가 다른 안을 고르는 흐름(선택한 안을 worker에 전달해 그 안으로 다시 계획)은 백엔드·프런트와 계약을 맞춰야 한다(`docs/OPEN_QUESTIONS.md`).
 
 ## executor: 승인된 작업 실행
@@ -225,7 +227,7 @@ compose 파일이 만드는 것: 앱 컨테이너 1개(`127.0.0.1:<포트>:<컨�
 - **실제 백엔드(PR #10)와 연결해서 시험하지 않았다.** `test_worker.py`는 `back/API.md`를 흉내 낸 서버와 가짜 `deploy.sh`로 돌고, `deploy.sh`와의 연결은 진짜 AWS로 따로 확인했다(상파울루, 가짜 백엔드).
 - **연결 확인(connector)**: `test_worker.py`는 가짜 `aws` CLI로 돈다. 별도로 시험 계정에서 실제 AWS(스택 생성, `sts:AssumeRole` 성공·거부)와 로컬 Docker 백엔드(PR #23)로 한 번씩 확인했다. 확인하지 못한 것은 콜백 Lambda의 성공 경로, 공개 주소의 백엔드, 계정이 다른 교차 계정 구성이다([infra/README.md](../README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용) 참고).
 - 한 번에 작업 하나씩 순서대로 처리한다(동시 배포 없음). worker가 작업 도중 죽으면 그 배포는 `provisioning` 상태로 남는다.
-- 비용은 `prices.json`의 가격표로 계산한다. 공용 ALB·RDS·**공인 IPv4(ALB 가용 영역별 + NAT용 탄력적 IP, 기준 구성 3개)** 를 포함하고, NAT 인스턴스 EC2 요금(가격 조회 실패)·ALB 처리 용량·데이터 전송·로그·백업은 제외했다(제외 항목은 계획 요약에 적힌다). 공인 IPv4 개수는 **배포된 foundation의 출력**(`infra/deployments/foundation.json`의 `task_subnet_ids` 개수 = 가용 영역 수, `assign_public_ip`, `nat_instance_count`)에서 센다. 읽을 수 없으면 `prices.json`의 `foundation_assumptions`(foundation 기본값: 가용 영역 3개 + NAT 3대)를 쓴다. 기준일 2026-10-10.
+- 비용은 `prices.json`의 가격표로 계산한다. 승인 금액과 예산 판정은 앱 추가 비용(Fargate, NAT 없는 구성은 태스크 공인 IPv4 포함)이고, 공용 ALB·RDS·**공인 IPv4(ALB 가용 영역별 + NAT용 탄력적 IP, 기준 구성 3개)** 는 계산해 `shared_monthly`로 참고만 담는다(금액에 넣지 않는다). NAT 인스턴스 EC2 요금(가격 조회 실패)·ALB 처리 용량·데이터 전송·로그·백업은 제외했다(제외 항목은 계획 요약에 적힌다). 공인 IPv4 개수는 **배포된 foundation의 출력**(`infra/deployments/foundation.json`의 `task_subnet_ids` 개수 = 가용 영역 수, `assign_public_ip`, `nat_instance_count`)에서 센다. 읽을 수 없으면 `prices.json`의 `foundation_assumptions`(foundation 기본값: 가용 영역 3개 + NAT 3대)를 쓴다. 기준일 2026-10-10.
 - 계획 만들기가 약 30초, 승인 뒤 배포가 약 2분(DB 준비 Lambda 사용, 빌드 포함 124초 실측)이다. 프런트의 5분 대기 제한 안에 들어온다.
 
 ## 시험
