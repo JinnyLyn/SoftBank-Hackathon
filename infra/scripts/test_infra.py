@@ -548,6 +548,20 @@ def part_c(d, with_aws):
                    "-var=app_domain=totorosi.cloud", f"-var=app_domain_zone_id={zone}",
                    '-var=certificate_validation_records=[{name="_abc123.other.example.",value="_def456.xyz.acm-validations.aws."}]')
     is_("검증 레코드 이름이 app_domain 밖이면 막는다", code != 0 and "Resource precondition failed" in out, out[-200:].replace("\n", " "))
+    # ACM은 apex(totorosi.cloud)와 와일드카드(*.totorosi.cloud) 인증서에 같은 검증 CNAME을 준다. describe-certificate 결과를 그대로 넘겨도 한 개만 만들어야 한다
+    dup_args = ["-var=enable_nat_instance=true", f"-var=certificate_arn={FAKE_CERT}", "-var=app_domain=totorosi.cloud", f"-var=app_domain_zone_id={zone}"]
+    same = '{name="_abc123.totorosi.cloud.",value="_def456.xyz.acm-validations.aws."}'
+    dup, out = pj(*dup_args, f"-var=certificate_validation_records=[{same},{same}]")
+    if dup is None:
+        say("fail", "C 검증 레코드 중복(같은 이름·값) 계획 만들기", out[:200].replace("\n", " "))
+    else:
+        v = planned(dup, "aws_route53_record.certificate_validation")
+        is_("검증 레코드가 같은 이름·같은 값으로 두 번 와도 CNAME은 하나만 만든다(ACM apex+와일드카드)",
+            len(v) == 1 and v[0]["name"] == "_abc123.totorosi.cloud" and v[0]["records"] == ["_def456.xyz.acm-validations.aws."], str(v)[:200])
+    other = '{name="_abc123.totorosi.cloud.",value="_zzz999.xyz.acm-validations.aws."}'
+    code, out = tf(d, "plan", "-input=false", "-refresh=false", "-lock=false", "-no-color", R, *dup_args, f"-var=certificate_validation_records=[{same},{other}]")
+    is_("검증 레코드가 같은 이름에 다른 값이면 막는다(CNAME은 이름 하나에 값 하나)",
+        code != 0 and "Resource precondition failed" in out and "서로 다르게" in out.replace("\n", ""), out[-200:].replace("\n", " "))
     snap, out = pj("-var=enable_nat_instance=true", "-var=final_snapshot=false", "-var=db_multi_az=true", "-var=db_backup_retention_days=14")
     if snap:
         db = planned(snap, "aws_db_instance.this")[0]

@@ -10,6 +10,11 @@
 locals {
   app_domain_enabled = var.app_domain != ""
   app_zone_id        = !local.app_domain_enabled ? "" : (var.app_domain_zone_id != "" ? var.app_domain_zone_id : data.aws_route53_zone.app[0].zone_id)
+
+  # ACM은 apex와 와일드카드처럼 같은 이름으로 확인되는 도메인에 같은 검증 CNAME을 준다(DomainValidationOptions에 두 번 나온다).
+  # 객체의 키는 겹칠 수 없으므로 이름(끝의 점 제거)으로 묶고, 같은 값은 하나로 합친다. 이름이 같은데 값이 다르면 아래 precondition이 막는다
+  validation_values  = local.app_domain_enabled ? { for r in var.certificate_validation_records : trimsuffix(r.name, ".") => r.value... } : {}
+  validation_records = { for name, values in local.validation_values : name => distinct(values) }
 }
 
 data "aws_route53_zone" "app" {
@@ -42,19 +47,23 @@ resource "aws_route53_record" "apps_wildcard" {
 }
 
 resource "aws_route53_record" "certificate_validation" {
-  for_each = local.app_domain_enabled ? { for r in var.certificate_validation_records : trimsuffix(r.name, ".") => r } : {}
+  for_each = local.validation_records
 
   zone_id         = local.app_zone_id
   name            = each.key
   type            = "CNAME"
   ttl             = 300
-  records         = [each.value.value]
+  records         = each.value
   allow_overwrite = true
 
   lifecycle {
     precondition {
       condition     = endswith(each.key, ".${var.app_domain}")
       error_message = "certificate_validation_records의 이름은 app_domain의 호스팅 영역 안(…<app_domain>)이어야 합니다."
+    }
+    precondition {
+      condition     = length(each.value) == 1
+      error_message = "certificate_validation_records에 같은 이름(${each.key})의 검증 값이 서로 다르게 들어 있습니다. CNAME은 이름 하나에 값 하나만 둘 수 있습니다."
     }
   }
 }
