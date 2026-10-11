@@ -12,17 +12,29 @@
 .onprem-components { display: flex; flex-wrap: wrap; padding: 0; list-style: none; gap: 12px 28px; margin-bottom: 16px; }
 .onprem-components li { display: grid; gap: 2px; }
 .onprem-components span { color: var(--ink-2); }
-.onprem-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 24px; margin-bottom: 16px; }
+.onprem-fields { display: grid; gap: 16px; margin-bottom: 16px; }
 .onprem-fields label { display: grid; gap: 6px; }
-.onprem-fields input, .onprem-fields select, .onprem-fields textarea { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); }
-.onprem textarea { min-height: 80px; resize: vertical; }
+.onprem-fields input { width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); }
 .onprem button { margin-top: 16px; }
-.onprem button:focus-visible, .onprem input:focus-visible, .onprem select:focus-visible, .onprem textarea:focus-visible, .onprem summary:focus-visible { outline: 3px solid var(--marking-ink); outline-offset: 3px; }
+.onprem-source-kind { display: flex; flex-wrap: wrap; gap: 8px; }
+.onprem-source-kind button { margin: 0; }
+.onprem-source-kind button[aria-pressed="true"] { background: var(--marking-soft); border-color: var(--marking-ink); }
+.onprem button:focus-visible, .onprem input:focus-visible, .onprem summary:focus-visible { outline: 3px solid var(--marking-ink); outline-offset: 3px; }
 .onprem-error { color: var(--fail); padding: 16px; border: 1px solid var(--fail); border-radius: 6px; overflow-wrap: anywhere; }
 .onprem details { margin: 16px 0; min-width: 0; }
 .onprem summary { cursor: pointer; font-weight: 600; margin-bottom: 8px; }
-.onprem .code { max-height: 360px; overflow: auto; }
-.onprem-identity { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+.onprem .code { max-height: 360px; overflow: auto; padding: 16px 18px; background: #f6f8fa; color: #24292f; border: 1px solid #d0d7de; border-radius: 6px; font-family: var(--mono), Pretendard, 'Malgun Gothic', sans-serif; font-size: 13px; line-height: 1.75; }
+.onprem .code.is-numbered .ln { width: 3em; color: #57606a; }
+.onprem .tk-comment { color: #57606a; }
+.onprem .tk-string, .onprem .tk-add { color: #116329; }
+.onprem .tk-kw, .onprem .tk-cmd { color: #0550ae; }
+.onprem .tk-change { color: #7d4e00; }
+.onprem .tk-del { color: #a40e26; }
+.onprem .tk-strong { color: #24292f; }
+.onprem-review-summary { white-space: pre-line; line-height: 1.8; }
+.onprem-identity { margin: 16px 0; font-size: 13px; line-height: 1.7; }
+.onprem .onprem-identity > div { grid-template-columns: 100px minmax(0, 1fr); gap: 12px; padding: 4px 0; }
+.onprem-identity dd { font-family: var(--mono); color: #24292f; }
 .onprem-consent { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; }
 .onprem-consent input { margin-top: 4px; }
 .onprem dl > div { display: grid; grid-template-columns: minmax(120px, 1fr) 3fr; gap: 16px; }
@@ -30,7 +42,7 @@
 @media (max-width: 640px) {
   .onprem-main { padding: 24px 16px 48px; gap: 16px; }
   .onprem-panel { padding: 16px; }
-  .onprem-fields { grid-template-columns: 1fr; }
   .onprem h1 { font-size: 24px; }
   .onprem-header > div { padding: 14px 16px; gap: 12px; flex-wrap: wrap; }
+  .onprem .onprem-identity > div { grid-template-columns: 1fr; gap: 2px; }
 }
