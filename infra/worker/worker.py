@@ -969,13 +969,13 @@ def check_https(url, timeout=None):
 
 
 def verify_domain(api, deployment_id, domain, url, health_path):
-    """도메인 방식 배포가 healthy가 된 뒤 https://<도메인><헬스체크 경로>에 접속해 보고 domain_verified 또는 domain_failed 이벤트를 남긴다.
-    배포 상태(healthy)는 바꾸지 않는다: 대상 그룹 헬스체크는 이미 통과했고, 도메인 연결 상태는 앱 헬스와 따로 관리한다(AGENTS.md 5장 10).
-    확인에 성공하면 True."""
+    """도메인 방식 배포의 https://<도메인><헬스체크 경로>에 접속해 보고 결과를 보고한다. healthy를 보고하기 전에 deploying 상태에서 호출한다.
+    백엔드는 healthy를 곧바로 사용자용 성공으로 보고 되돌리지 않으므로, 최종 주소가 열리지 않으면 healthy로 올리지 않고 failed(domain_failed)로 끝낸다
+    (AGENTS.md 5장 10: 선택한 주소의 HTTPS·앱 응답까지 확인해야 최종 연결 성공). 성공하면 domain_verified 이벤트를 남기고 True를 돌려준다."""
     expected = f"https://{domain}"
     if url != expected:
-        report(api, deployment_id, "healthy", "domain_failed", f"배포 결과 주소({url})가 계획한 도메인 주소({expected})와 다릅니다",
-               level="warning", details={"url": url, "expected": expected})
+        fail_job(api, deployment_id, "domain_failed", f"배포 결과 주소({url})가 계획한 도메인 주소({expected})와 다릅니다",
+                 details={"url": url, "expected": expected})
         return False
     target = expected + health_path
     detail = ""
@@ -983,15 +983,14 @@ def verify_domain(api, deployment_id, domain, url, health_path):
         ok, detail = check_https(target)
         if ok:
             log(f"도메인 접속 확인: {target} ({detail})")
-            report(api, deployment_id, "healthy", "domain_verified", f"{expected} 에 HTTPS로 접속해 앱 응답을 확인했습니다({detail})",
+            report(api, deployment_id, "deploying", "domain_verified", f"{expected} 에 HTTPS로 접속해 앱 응답을 확인했습니다({detail})",
                    details={"url": target, "attempts": attempt + 1})
             return True
         if attempt < DOMAIN_CHECK_ATTEMPTS - 1:
             time.sleep(DOMAIN_CHECK_DELAY)
-    log(f"도메인 접속 실패: {target} ({detail})")
-    report(api, deployment_id, "healthy", "domain_failed",
-           f"앱은 정상(대상 그룹 헬스체크 통과)이지만 {expected} 에 HTTPS로 접속하지 못했습니다: {detail}",
-           level="warning", details={"url": target, "attempts": DOMAIN_CHECK_ATTEMPTS, "last_error": detail})
+    fail_job(api, deployment_id, "domain_failed",
+             f"인프라는 적용됐지만 {expected} 에 HTTPS로 접속하지 못해 배포를 실패로 처리합니다: {detail}",
+             details={"url": target, "attempts": DOMAIN_CHECK_ATTEMPTS, "last_error": detail})
     return False
 
 
@@ -1144,12 +1143,13 @@ def execute_job(api, cfg, job):
             return fail_job(api, dep, "no_url", "배포는 끝났지만 접속 주소(outputs.json의 url)를 읽지 못했습니다", {"log_tail": tail(out)})
         if not state["deploying"]:
             report(api, dep, "deploying", "apply_done", "인프라 적용이 끝났습니다")
-        report(api, dep, "healthy", "healthy", "헬스체크를 통과했습니다", details={"log_tail": tail(out, 12)}, url=url)
-        log(f"배포 완료: {url}")
         domain = v.get("domain")
         if isinstance(domain, str) and domain:
             path = v["app"].get("health_check_path") if isinstance(v.get("app"), dict) else None
-            verify_domain(api, dep, domain, url, path if isinstance(path, str) and HEALTH_PATH_RE.match(path) else "/")
+            if not verify_domain(api, dep, domain, url, path if isinstance(path, str) and HEALTH_PATH_RE.match(path) else "/"):
+                return   # 이미 domain_failed로 failed를 보고했다
+        report(api, dep, "healthy", "healthy", "헬스체크를 통과했습니다", details={"log_tail": tail(out, 12)}, url=url)
+        log(f"배포 완료: {url}")
     except ApiError as e:
         log(f"백엔드 보고 실패: {e}")   # 보고가 안 되면 더 할 수 있는 것이 없다. 작업은 다음 점검에서 사람이 확인한다
     except Exception as e:   # noqa: BLE001 - 예상 못 한 오류도 failed로 남긴다

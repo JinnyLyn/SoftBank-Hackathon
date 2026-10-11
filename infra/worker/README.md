@@ -4,7 +4,7 @@
 
 현재 제품 기준은 [PRODUCT_DIRECTION.md](../../docs/PRODUCT_DIRECTION.md)의 `2026-10-10-managed-domains-v1`이다. 아래 AWS 자격 증명과 foundation 준비는 운영자/worker 환경용이며 사용자 계정·IAM 키 입력을 전제하지 않는다. 계정 이전은 [OPERATOR_AWS.md](../../docs/OPERATOR_AWS.md)를 따른다.
 
-이 worker의 `healthy`는 앱 배포 상태다. 사용자 독립 도메인의 신규 등록·연결 제품 흐름은 아직 포함하지 않는다. foundation에 `app_domain`이 있으면 운영자 도메인 아래의 플랫폼 자동 주소(`https://<deploy_id>.<app_domain>`)로 계획하고, 배포 뒤 그 주소의 HTTPS 응답을 `domain_verified`/`domain_failed` 이벤트로 남긴다(아래 executor 5). 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 이 이벤트를 백엔드 상태 API의 `domain`으로 바꾸는 계약은 백엔드와 맞춰야 한다. 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
+이 worker의 `healthy`는 앱 배포 상태다. 사용자 독립 도메인의 신규 등록·연결 제품 흐름은 아직 포함하지 않는다. foundation에 `app_domain`이 있으면 운영자 도메인 아래의 플랫폼 자동 주소(`https://<deploy_id>.<app_domain>`)로 계획하고, `healthy`를 보고하기 전에 그 주소의 HTTPS 응답을 확인해 `domain_verified`(성공) 또는 `domain_failed`(`failed`)로 남긴다(아래 executor 5). 기존 확보 도메인 연결(A) / 신규 구매 자동화(B)의 시연 범위와 파트 간 계약을 먼저 확인하며, 이 이벤트를 백엔드 상태 API의 `domain`으로 바꾸는 계약은 백엔드와 맞춰야 한다. 프런트 MOCK의 `status.domain`을 현재 worker의 출력으로 가정하지 않는다. 회의록의 도메인 목록은 구현 후보이며 일괄 실행 지시가 아니다.
 
 이 worker는 기본으로 AWS만 다룬다. 발표자 PC의 Docker로 올리는 선택 기능은 [로컬 Docker 배포](#로컬-docker-배포-발표자-pc-시연용-선택-기능)에 따로 적었고 `--targets local_docker`를 줄 때만 켜진다.
 
@@ -150,7 +150,7 @@ python infra/worker/worker.py --once             # 한 번만 점검
 2. `deploy.sh build`로 ZIP에서 이미지를 빌드해 ECR에 올린다(계획에 적힌 이미지 주소와 같아야 한다). **계획에 기록한 `cpu_architecture`를 `--arch`로 넘겨** 계획과 같은 아키텍처로 빌드한다.
 3. `deploy.sh apply`로 저장된 계획 그대로 적용한다. 헬스체크 대기에 들어가면 `deploying`을 보고한다.
 4. 성공하면 접속 주소와 함께 `healthy`, 실패하면 `deploy.sh diagnose` 결과와 로그 끝부분을 담아 `failed`로 보고한다.
-5. 계획 변수에 `domain`이 있으면(자동 주소 방식) `https://<도메인><헬스체크 경로>`에 인증서를 검증하며 요청한다(리다이렉트는 따르지 않고 200~399면 응답으로 본다. 10초 간격 최대 12번). 응답하면 `domain_verified`, 끝내 응답하지 않거나 적용 결과 주소가 계획한 주소와 다르면 `domain_failed`(경고)를 같은 `healthy` 상태의 이벤트로 남긴다. 대상 그룹 헬스체크는 이미 통과했으므로 도메인 확인 실패로 `healthy`를 `failed`로 바꾸지 않는다(앱 헬스와 도메인 연결 상태를 따로 관리한다, AGENTS §5).
+5. 계획 변수에 `domain`이 있으면(자동 주소 방식) `https://<도메인><헬스체크 경로>`에 인증서를 검증하며 요청한다(리다이렉트는 따르지 않고 200~399면 응답으로 본다. 10초 간격 최대 12번). 이 확인은 `healthy` 보고 **앞**, `deploying` 상태에서 한다. 응답하면 `domain_verified`(`deploying` 이벤트)를 남기고 이어서 `healthy`를 보고한다. 끝내 응답하지 않거나 적용 결과 주소가 계획한 주소와 다르면 `healthy`를 보고하지 않고 `domain_failed`(`failed`, error)로 끝낸다. 백엔드는 `healthy`를 곧바로 사용자용 성공으로 보여 주고 뒤의 이벤트로 되돌리지 못하므로, 최종 주소가 열리지 않는 배포가 성공으로 보이지 않게 한다(AGENTS §5-10). 이때 인프라는 이미 적용된 상태이므로 `failed` 뒤의 재시도·정리는 일반 실패와 같은 절차를 따른다.
 
 - **보고는 일시 오류(연결 실패, 5xx)면 최대 4번 다시 보낸다.** 4xx(상태 전이 거부 등)는 다시 보내도 같아서 바로 올린다. `deploying` 보고가 끝내 실패해도 apply 출력 읽기는 멈추지 않고, 끝난 뒤 `deploying`을 다시 보내고 `healthy`를 보낸다(백엔드는 `provisioning`에서 `healthy`로 바로 갈 수 없다).
 - **제한 시간**(계획 15분, 빌드 20분, 적용 25분)을 넘기면 bash만이 아니라 **하위 프로세스(terraform·docker) 전체를 종료**하고 `failed`로 보고한다(Windows는 `taskkill /T`, 그 밖에는 프로세스 그룹 종료). 종료된 Terraform은 state 잠금이 남을 수 있어 `deploy.sh` 재시도 전에 확인이 필요하다.

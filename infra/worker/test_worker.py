@@ -1418,41 +1418,44 @@ class ExecutorTests(Base):
         os.environ["FAKE_APPLY_URL"] = "https://fake0001.totorosi.cloud"
         return job
 
-    def test_domain_deploy_checks_https_on_the_domain_after_healthy(self):
+    def test_domain_deploy_checks_https_on_the_domain_before_healthy(self):
         checked = []
         with mock.patch.object(worker, "check_https", side_effect=lambda url: checked.append(url) or (True, "HTTP 200")):
             worker.execute_job(self.api, self.cfg, self.domain_job())
         self.assertEqual(checked, ["https://fake0001.totorosi.cloud/health"])
-        self.assertEqual(self.statuses(), ["deploying", "healthy", "healthy"])
-        self.assertEqual(self.backend.events[1][1]["url"], "https://fake0001.totorosi.cloud")
+        # healthy는 도메인 확인이 끝난 뒤에 보고한다(백엔드는 healthy를 바로 성공으로 보여 주고 되돌리지 않는다)
+        self.assertEqual(self.statuses(), ["deploying", "deploying", "healthy"])
+        self.assertEqual([e[1]["event_type"] for e in self.backend.events][1:], ["domain_verified", "healthy"])
         last = self.backend.events[-1][1]
-        self.assertEqual((last["event_type"], last["level"]), ("domain_verified", "info"))
+        self.assertEqual(last["url"], "https://fake0001.totorosi.cloud")
 
-    def test_unreachable_domain_is_a_warning_and_the_app_stays_healthy(self):
-        # 앱 헬스(대상 그룹)와 도메인 연결 상태는 따로 관리한다. 도메인 실패로 healthy를 failed로 바꾸지 않는다
-        with mock.patch.object(worker, "DOMAIN_CHECK_ATTEMPTS", 3), mock.patch.object(worker, "DOMAIN_CHECK_DELAY", 0), \
-                mock.patch.object(worker, "check_https", return_value=(False, "SSLCertVerificationError: hostname mismatch")) as chk:
+    def test_unreachable_domain_fails_the_deploy_and_never_reports_healthy(self):
+        with mock.patch.object(worker, "DOMAIN_CHECK_ATTEMPTS", 3), mock.patch.object(worker, "DOMAIN_CHECK_DELAY", 0),                 mock.patch.object(worker, "check_https", return_value=(False, "SSLCertVerificationError: hostname mismatch")) as chk:
             worker.execute_job(self.api, self.cfg, self.domain_job())
         self.assertEqual(chk.call_count, 3)
-        self.assertEqual(self.statuses(), ["deploying", "healthy", "healthy"])
+        self.assertEqual(self.statuses(), ["deploying", "failed"])
+        self.assertNotIn("healthy", self.statuses())
         last = self.backend.events[-1][1]
-        self.assertEqual((last["event_type"], last["level"]), ("domain_failed", "warning"))
+        self.assertEqual((last["event_type"], last["level"]), ("domain_failed", "error"))
         self.assertIn("hostname mismatch", last["message"])
         self.assertEqual(last["details"]["attempts"], 3)
+        self.assertNotIn("url", last)   # 열리지 않는 주소를 접속 주소로 내보내지 않는다
 
     def test_domain_retry_succeeds_on_a_later_attempt(self):
         answers = iter([(False, "URLError: timed out"), (True, "HTTP 200")])
         with mock.patch.object(worker, "DOMAIN_CHECK_DELAY", 0), mock.patch.object(worker, "check_https", side_effect=lambda url: next(answers)):
             worker.execute_job(self.api, self.cfg, self.domain_job())
-        last = self.backend.events[-1][1]
-        self.assertEqual((last["event_type"], last["details"]["attempts"]), ("domain_verified", 2))
+        self.assertEqual(self.statuses(), ["deploying", "deploying", "healthy"])
+        verified = self.backend.events[1][1]
+        self.assertEqual((verified["event_type"], verified["details"]["attempts"]), ("domain_verified", 2))
 
-    def test_applied_url_different_from_the_planned_domain_is_reported_without_checking(self):
+    def test_applied_url_different_from_the_planned_domain_fails_without_checking(self):
         job = self.domain_job()
         os.environ["FAKE_APPLY_URL"] = "https://paved-clouds-alb-1.sa-east-1.elb.amazonaws.com:8001"
         with mock.patch.object(worker, "check_https") as chk:
             worker.execute_job(self.api, self.cfg, job)
         chk.assert_not_called()
+        self.assertEqual(self.statuses(), ["deploying", "failed"])
         self.assertEqual(self.backend.events[-1][1]["event_type"], "domain_failed")
 
     def test_port_deploy_does_not_check_a_domain(self):
