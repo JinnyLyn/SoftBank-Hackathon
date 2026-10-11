@@ -3,8 +3,6 @@
 import type {
   Analysis,
   Choice,
-  Connection,
-  ConnectionInput,
   DeployRecord,
   DeployStatus,
   DnsRecord,
@@ -404,18 +402,12 @@ async function waitForPlans(projectId: string, want: { aws: boolean; local: bool
  * 월 예산을 넘는 계획은 추천하지 않음 (화면에서도 고를 수 없음)
  */
 export async function recommend(projectId: string, scale: ScaleInput): Promise<Recommendation> {
-  const [plans, conns] = await Promise.all([
-    waitForPlans(projectId, { aws: isEnabled('aws'), local: isEnabled('onprem') }),
-    req<Connection[]>('/connections'),
-  ])
-
-  const aws = conns.find((c) => c.provider === 'aws' && c.status === 'connected')
-  const awsId = aws?.id ?? 'aws'
+  const plans = await waitForPlans(projectId, { aws: isEnabled('aws'), local: isEnabled('onprem') })
   const localName = str(plans.find(isLocal)?.variables.connection_name) || '이 PC (로컬 Docker)'
 
   // 대상마다 한 칸씩. AWS는 연결이 없으면 worker가 쓰는 운영자 AWS (관리형 배포), 온프레미스는 worker가 도는 PC의 로컬 Docker
   const groups: { connectionId: string; provider: Provider; name: string; plans: PlanOut[] }[] = [
-    { connectionId: awsId, provider: 'aws', name: aws?.name ?? '관리형 AWS', plans: plans.filter((p) => !isLocal(p)) },
+    { connectionId: 'aws', provider: 'aws', name: '관리형 AWS', plans: plans.filter((p) => !isLocal(p)) },
     { connectionId: LOCAL_CONNECTION_ID, provider: 'onprem', name: localName, plans: plans.filter(isLocal) },
   ]
 
@@ -591,23 +583,6 @@ export async function history(): Promise<DeployRecord[]> {
     url: r.url ?? undefined,
     createdAt: r.createdAt,
   }))
-}
-
-// ---------- 연결 ----------
-
-export const listConnections = () => req<Connection[]>('/connections')
-
-/** 저장된 연결 상태를 다시 읽음. 백엔드가 AWS를 실시간으로 검증하지는 않음 (worker가 완료를 기록) */
-export const checkConnection = (id: string) => req<Connection>(`/connections/${id}/check`, { method: 'POST' })
-
-export const deleteConnection = (id: string) => req<void>(`/connections/${id}`, { method: 'DELETE' })
-
-/** 백엔드는 정의되지 않은 필드를 거절(422)하므로 id는 주소에만 넣고 본문에서 뺌 */
-export function saveConnection(input: ConnectionInput): Promise<Connection> {
-  const body = { provider: input.provider, name: input.name, fields: input.fields }
-  return input.id
-    ? req<Connection>(`/connections/${input.id}`, send('PUT', body))
-    : req<Connection>('/connections', send('POST', body))
 }
 
 // ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------

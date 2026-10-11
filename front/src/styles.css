@@ -90,10 +90,8 @@ code { font-family: var(--mono); font-size: 12px; background: var(--sunken); bor
   padding: 4px 11px;
   font-family: var(--mono);
   font-size: 12px;
-  cursor: pointer;
 }
 .account .dot { width: 7px; height: 7px; border-radius: 50%; background: #5cc98a; }
-.account .dot.is-warn { background: var(--marking); }
 
 /* ---------- layout ---------- */
 .container { max-width: 1120px; margin: 0 auto; padding: 32px 24px 72px; }
@@ -220,7 +218,7 @@ code { font-family: var(--mono); font-size: 12px; background: var(--sunken); bor
 }
 .input::placeholder { color: #a9a59b; }
 textarea.input { resize: vertical; }
-:is(.input, .btn, .tab, .switch button, .code-tabs button, .account, .rail-item button, .cell, .kind, .link-btn):focus-visible,
+:is(.input, .btn, .tab, .switch button, .code-tabs button, .rail-item button, .cell, .kind, .link-btn):focus-visible,
 .choice:has(input:focus-visible), .tier:has(input:focus-visible), .confirm:has(input:focus-visible) {
   outline: 2px solid var(--marking);
   outline-offset: 2px;
@@ -603,35 +601,10 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .code-state.is-error::before { background: var(--fail); }
 .tier-detail h4 { font-size: 14px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 4px; }
 
-/* ---------- 배포 대상(연결) ---------- */
-.conn-layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 20px; align-items: start; }
-.conn-form { position: sticky; top: 24px; }
+/* ---------- 목록 머리 ---------- */
 .list-head { display: flex; justify-content: space-between; align-items: baseline; padding: 16px 22px; border-bottom: 1px solid var(--line); }
 .list-head h2 { font-size: 15px; font-weight: 700; }
-.conn-list { list-style: none; padding: 0; }
-.conn-list li {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
-  grid-template-areas: 'mark main side' 'mark actions actions';
-  gap: 4px 12px;
-  padding: 14px 22px;
-  border-bottom: 1px solid var(--line);
-}
-.conn-list li:last-child { border-bottom: 0; }
-.conn-list li.is-editing { background: var(--marking-soft); }
-.conn-list .pmark { grid-area: mark; margin-top: 2px; }
-.conn-main { grid-area: main; display: flex; flex-direction: column; min-width: 0; }
-.conn-main .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.conn-side { grid-area: side; display: flex; flex-direction: column; align-items: flex-end; }
-.conn-actions { grid-area: actions; display: flex; gap: 2px; margin-left: -9px; }
-.conn-status { font-size: 12.5px; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; }
-.conn-status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; }
-.conn-status.is-connected { color: var(--ok); }
-.conn-status.is-connected::before { background: var(--ok); }
-.conn-status.is-error { color: var(--marking-ink); }
-.conn-status.is-error::before { background: var(--marking); }
 .conn-error { color: var(--fail); font-size: 12.5px; }
-.conn-pending { font-size: 12.5px; color: var(--marking-ink); }
 /* 오래 걸리는 작업 진행 표시 */
 .work-progress { border: 1px solid var(--line-strong); border-radius: var(--radius); padding: 14px 18px; display: flex; flex-direction: column; gap: 10px; max-width: 720px; }
 .work-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
@@ -665,9 +638,6 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .rec-wait { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; color: var(--ink-2); font-size: 13px; }
 .rec-wait .pulse { display: inline-block; width: 8px; height: 8px; }
 .rec-wait.is-error { color: var(--fail); }
-.conn-pending .pulse { display: inline-block; width: 8px; height: 8px; margin-right: 4px; vertical-align: middle; }
-.conn-status.is-pending { color: var(--marking-ink); }
-.conn-status.is-pending::before { background: transparent; border: 2px solid var(--marking); width: 5px; height: 5px; }
 .kind-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .kind {
   display: flex;
@@ -684,29 +654,9 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .kind.is-on { border-color: var(--asphalt); box-shadow: inset 0 -3px 0 var(--marking); }
 .kind:disabled:not(.is-on) { opacity: 0.4; cursor: default; }
 .kind:disabled.is-on { cursor: default; }
-.conn-form .howto { font-size: 13px; }
 .key-box { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .key-box code { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: var(--surface); }
-.conn-form .form-grid { gap: 14px 12px; }
 
-/* ---------- 온프레미스 설치 명령 ---------- */
-.install-intro { font-size: 13px; color: var(--ink-2); background: var(--sunken); border-radius: 8px; padding: 10px 14px; }
-.install-steps { list-style: none; padding: 0; counter-reset: s; display: flex; flex-direction: column; gap: 10px; }
-.install-steps li { counter-increment: s; display: grid; grid-template-columns: 24px 1fr; column-gap: 10px; }
-.install-steps li::before {
-  content: counter(s);
-  grid-row: span 2;
-  width: 22px;
-  height: 22px;
-  border-radius: 50%;
-  background: var(--asphalt);
-  color: var(--marking);
-  font-size: 12px;
-  font-weight: 700;
-  display: grid;
-  place-items: center;
-}
-.install-steps span { font-size: 12.5px; color: var(--muted); }
 .cmd {
   display: flex;
   align-items: stretch;
@@ -741,14 +691,6 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 .cmd.is-expired code { text-decoration: line-through; }
 .cmd-meta { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
 .waiting { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
-.install-done {
-  display: flex;
-  flex-direction: column;
-  border: 1px solid var(--asphalt);
-  border-left: 6px solid var(--ok);
-  border-radius: var(--radius);
-  padding: 12px 16px;
-}
 
 /* ---------- 새 배포 안에서 바로 연결 ---------- */
 .quick {
@@ -832,8 +774,6 @@ fieldset:disabled .choice { cursor: default; opacity: 0.7; }
 
 /* ---------- responsive ---------- */
 @media (max-width: 900px) {
-  .conn-layout { grid-template-columns: 1fr; }
-  .conn-form { position: static; }
   .deploy-layout { grid-template-columns: 1fr; gap: 16px; }
   .deploy-side { position: static; }
   .rail { display: flex; overflow-x: auto; gap: 4px; }

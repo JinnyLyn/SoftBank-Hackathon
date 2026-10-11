@@ -54,7 +54,6 @@ async function checkBundle(target, initCommand) {
   const calls = [];
   const req = async (path) => {
     calls.push(path);
-    if (path === '/connections') return [];
     if (path === '/projects/project-1/plans') return structuredClone([plan]);
     if (path === '/plans/plan-1') return structuredClone(plan);
     throw new Error(`Unexpected HTTP request: ${path}`);
@@ -84,7 +83,7 @@ async function checkBundle(target, initCommand) {
   plan.variables.app.health_check_path = '/health/latest';
   if (initCommand) plan.variables.app.init_command = ['python', '-m', 'app.migrate_latest'];
   verify(await api.generate('project-1', choice));
-  assert.deepEqual(calls, ['/projects/project-1/plans', '/connections', '/plans/plan-1']);
+  assert.deepEqual(calls, ['/projects/project-1/plans', '/plans/plan-1']);
 }
 
 async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
@@ -108,7 +107,6 @@ async function checkMixedRecommendation(monthlyBudgetUsd, expectedConnection) {
     variables: { tier: 'balanced', compose_yaml: 'services:\n  app:\n    image: local/app\n' },
   };
   const req = async (path) => {
-    if (path === '/connections') return [];
     if (path === '/projects/project-1/plans') return structuredClone([local, aws]);
     if (path === '/plans/aws-plan') return structuredClone(aws);
     if (path === '/plans/local-plan') return structuredClone(local);
@@ -162,7 +160,6 @@ function localAdapter(handler) {
     calls.push([path, init]);
     if (path === '/projects/project-1/plans') return [localPlan(), { ...localPlan(), id: 'aws', target: 'aws' }];
     if (path === '/projects/aws-project/plans') return [{ ...localPlan(), id: 'aws', target: 'aws', variables: { tier: 'balanced' } }];
-    if (path === '/connections') return [];
     if (path === '/plans/local-1') return localPlan();
     if (path.startsWith('/deployments?')) return [];
     if (path === '/plans/local-1/approve') return { ...localPlan(), status: 'approved' };
