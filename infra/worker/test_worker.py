@@ -1106,6 +1106,22 @@ class PlannerTests(Base):
         self.assertIn("사용자가 고른 '작게 시작' 안", v["reason"])
         self.assertEqual(v["app"]["task_size"], "xsmall")
 
+    def test_new_requested_tier_is_planned_without_waiting_for_recheck(self):
+        # 사용자가 다른 안을 고르면(백엔드가 승인 대기 계획을 superseded로 바꾸고 requested_tier 저장) 30초를 기다리지 않고 바로 다시 계획
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=3600.0)
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        for plan in self.backend.plans[p1["id"]]:
+            plan["status"] = "superseded"
+        p1["requested_tier"] = "lean"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2, "recheck_after(1시간) 안이어도 바로 다시 계획")
+        self.assertEqual(self.backend.created_plans[1]["variables"]["tier"], "lean")
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2, "같은 요청이면 다시 계획하지 않음")
+
     def test_requested_tier_outside_budget_falls_back_to_recommendation(self):
         self.plan_with_project({"expected_users": "~100", "traffic_pattern": "steady", "monthly_budget_usd": "100.0000",
                                 "requested_tier": "roomy"})   # 월 $100에는 최저 안만 들어간다

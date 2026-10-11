@@ -1508,6 +1508,7 @@ class State:
     repair: set = field(default_factory=set)       # plan 파일 업로드가 남은 프로젝트(점검마다 다시 올린다)
     recheck_after: float = 30.0                    # 활성 계획이 있는 프로젝트의 계획 상태를 다시 조회하는 간격(초). 계획이 superseded로 바뀌면 다시 계획한다
     retry_after: float = 120.0
+    requested: dict = field(default_factory=dict)  # 프로젝트 id → 마지막으로 본 requested_tier(사용자가 비교표에서 고른 안). 바뀌면 바로 다시 계획
     capacity_enabled: bool = True                  # 배포 앱 용량 알림(백엔드에 API가 없으면 끔)
     capacity_checked: float = 0.0                  # 마지막 용량 확인 시각
     capacity_alerts: dict = field(default_factory=dict)   # 배포 id → 지금 알림이 켜져 있는지(바뀔 때만 보냄)
@@ -1553,6 +1554,11 @@ def report_plan_failure(api, project_id, target, reason, retryable, attempts, ki
 def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
     for project in list_projects(api):
         pid = project["id"]
+        # 사용자가 다른 안을 골랐으면(백엔드가 승인 대기 계획을 superseded로 바꿈) recheck_after를 기다리지 않고 이번 점검에서 다시 계획한다
+        requested = project.get("requested_tier")
+        if requested and state.requested.get(pid) != requested:
+            state.requested[pid] = requested
+            state.done.pop(pid, None)
         # 활성 계획이 있는 프로젝트도 recheck_after마다 다시 조회한다(같은 프로세스에서 계획이 superseded로 바뀔 수 있다)
         if pid in state.done and pid not in state.repair and time.time() - state.done[pid] < state.recheck_after:
             continue
