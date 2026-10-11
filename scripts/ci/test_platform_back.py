@@ -134,6 +134,7 @@ def check(root):
                                      ("/api/worker/rollback-plans/{plan_id}/terraform-plan", "post"),
                                      ("/api/worker/rollback-plans/{plan_id}/summary", "post"),
                                      ("/api/projects/{project_id}/plan-failures", "get"),
+                                     ("/api/projects/{project_id}/plan-requests", "post"),
                                      ("/api/worker/projects/{project_id}/plan-failures", "post")):
                     require(isinstance(paths.get(path), dict) and method in paths[path],
                             f"/openapi.json: missing {method.upper()} {path}")
