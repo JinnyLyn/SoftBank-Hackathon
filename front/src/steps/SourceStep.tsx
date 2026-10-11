@@ -21,15 +21,16 @@ export default function SourceStep({ source, locked, onSource }: Props) {
   const [url, setUrl] = useState(source?.kind === 'github' ? source.url : '')
   const [branch, setBranch] = useState(source?.kind === 'github' ? source.branch : 'main')
   const [dragging, setDragging] = useState(false)
-  const [fileError, setFileError] = useState<string | null>(null)
+  // 번역 전 원문과 값만 저장하고 그릴 때 번역함(오류가 난 뒤 언어를 바꿔도 지금 언어로 보이게, PR #47 리뷰)
+  const [fileError, setFileError] = useState<{ key: string; vars?: Record<string, string> } | null>(null)
   const input = useRef<HTMLInputElement>(null)
   const t = useT()
 
   // 형식과 크기는 서버에서도 다시 검사함. 여기서는 빨리 알려 주는 용도
   const takeFile = (f: File | undefined) => {
     if (!f) return
-    if (!f.name.toLowerCase().endsWith('.zip')) return setFileError(t('zip 파일만 올릴 수 있습니다.'))
-    if (f.size > MAX_ZIP_BYTES) return setFileError(t('200MB를 넘습니다 ({size}). node_modules 같은 폴더를 빼고 다시 압축해 주세요.', { size: formatSize(f.size) }))
+    if (!f.name.toLowerCase().endsWith('.zip')) return setFileError({ key: 'zip 파일만 올릴 수 있습니다.' })
+    if (f.size > MAX_ZIP_BYTES) return setFileError({ key: '200MB를 넘습니다 ({size}). node_modules 같은 폴더를 빼고 다시 압축해 주세요.', vars: { size: formatSize(f.size) } })
     setFileError(null)
     onSource({ kind: 'zip', file: f })
   }
@@ -111,7 +112,7 @@ export default function SourceStep({ source, locked, onSource }: Props) {
             <strong>{t('zip 파일을 여기에 놓기')}</strong>
             <span>{t('또는 클릭해서 선택 · 최대 200MB')}</span>
           </div>
-          {fileError && <p className="conn-error">{fileError}</p>}
+          {fileError && <p className="conn-error">{t(fileError.key, fileError.vars)}</p>}
         </>
       ) : (
         <form
