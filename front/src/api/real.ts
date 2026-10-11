@@ -183,7 +183,7 @@ export async function analyze(source: Source, scale: ScaleInput, onUploaded?: ()
 
 // ---------- 배포 계획 → 추천 비교표, 코드 검토 ----------
 
-interface PlanOut {
+export interface PlanOut {
   id: string
   project_id: string
   analysis_id: string | null
@@ -311,7 +311,7 @@ function costScope(p: PlanOut): { excludedCosts?: string[]; sharedMonthlyUsd?: n
 }
 
 /** 온프레미스(로컬 Docker) 계획: 검토·승인 대상은 compose 파일과 실행 변수. compose의 SHA-256이 백엔드의 승인 식별자(fingerprint)에 들어 있음 */
-function toComposeBundle(p: PlanOut): TerraformBundle {
+export function toComposeBundle(p: PlanOut): TerraformBundle {
   const v = p.variables
   const containers = Array.isArray(v.resources) ? v.resources.length : null
   return {

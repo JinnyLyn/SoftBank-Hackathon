@@ -295,15 +295,22 @@ def _fail(state: State, pid: str, reason: str, permanent: bool, now: float) -> N
 
 
 def run_once(
-    api: Api, upload_dir: Path, state: State, clock: Callable[[], float] = time.time, llm=None, model: str = DEFAULT_MODEL
+    api: Api, upload_dir: Path, state: State, clock: Callable[[], float] = time.time, llm=None, model: str = DEFAULT_MODEL,
+    progress=None,
 ) -> Dict[str, int]:
     """한 번 점검. 기록·건너뜀·실패 개수를 돌려줌"""
     counts = {"recorded": 0, "skipped": 0, "failed": 0}
+    if progress:
+        progress.begin("polling")
     try:
         projects = list(api.projects())
     except ApiError as e:
+        if progress:
+            progress.error()
         log.warning("프로젝트 목록을 읽지 못했습니다: %s", e.message)
         return counts
+    if progress:
+        progress.success()  # Includes a successful empty page, never an error returning zero counts.
 
     for project in projects:
         pid = project["id"]
@@ -316,13 +323,19 @@ def run_once(
                 state.done.add(pid)
                 counts["skipped"] += 1
                 continue
+            if progress:
+                progress.begin("analyzing", 300)
             result, digest = analyze_project(project, upload_dir, llm, model, api)
             api.record_analysis(pid, digest, result)
+            if progress:
+                progress.success()
         except RunnerError as e:
             counts["failed"] += 1
             _fail(state, pid, str(e), e.permanent, now)
             continue
         except ApiError as e:
+            if progress:
+                progress.error()
             counts["failed"] += 1
             if e.status in (0, 429) or e.status >= 500:
                 _fail(state, pid, e.message, permanent=False, now=now)
@@ -331,12 +344,18 @@ def run_once(
                 _fail(state, pid, f"{e.status} {e.message}", permanent=True, now=now)
             continue
 
+        finally:
+            if progress:
+                progress.idle()
+
         state.done.add(pid)
         counts["recorded"] += 1
         log.info(
             "프로젝트 %s(%s) 분석 기록: 지원 %s, 못 찾은 값 %s",
             pid, project.get("name", ""), "예" if result["supported"] else "아니오", ", ".join(result["unresolved"]) or "없음",
         )
+    if progress:
+        progress.idle()
     return counts
 
 
@@ -348,10 +367,19 @@ def main(argv=None) -> int:
     parser.add_argument("--once", action="store_true", help="한 번만 점검")
     parser.add_argument("--model", default=None, help="비우면 PAVED_AI_MODEL, 그다음 고른 LLM의 기본 모델")
     parser.add_argument("--no-llm", action="store_true", help="LLM을 부르지 않고 규칙 분석만")
+    parser.add_argument("--no-dotenv", action="store_true", help="ai/.env를 읽지 않음(격리된 로컬 서비스)")
+    parser.add_argument("--progress-file", help="전용 실행기의 진행 상태 파일(옵션)")
+    parser.add_argument("--run-id", help="전용 실행기 식별자(옵션)")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    load_dotenv()
+    if not args.no_dotenv:
+        load_dotenv()
+    progress = None
+    if args.progress_file or args.run_id:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        from onprem_progress import from_args
+        progress = from_args(parser, args)
     llm, default_model = make_llm_client(enabled=not args.no_llm)
     args.model = args.model or os.getenv("PAVED_AI_MODEL") or default_model or DEFAULT_MODEL
     # 백엔드가 소스를 S3에 저장하면 worker 다운로드 API로 받음 (토큰 값은 로그에 남기지 않음)
@@ -361,7 +389,7 @@ def main(argv=None) -> int:
 
     try:
         while True:
-            counts = run_once(api, upload_dir, state, llm=llm, model=args.model)
+            counts = run_once(api, upload_dir, state, llm=llm, model=args.model, progress=progress)
             if args.once:
                 log.info("한 번 점검 끝: 기록 %d, 건너뜀 %d, 실패 %d", counts["recorded"], counts["skipped"], counts["failed"])
                 return 0 if counts["failed"] == 0 else 1

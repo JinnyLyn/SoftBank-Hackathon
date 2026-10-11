@@ -29,6 +29,7 @@ from app.artifacts import (
     s3_enabled,
 )
 from app.database import check_database, connect
+from app.onprem_readiness import readiness as read_onprem_readiness
 from app.schemas import (
     AnalysisIn,
     AnalysisOut,
@@ -135,6 +136,12 @@ def readiness() -> dict[str, str]:
     """Readiness probe for the API and its configured database."""
     check_database()
     return {"status": "ready", "database": "ok"}
+
+
+@app.get("/api/onprem/readiness", tags=["health"])
+def onprem_readiness() -> dict:
+    """Optional same-PC service; legacy /health and /ready remain unchanged."""
+    return read_onprem_readiness(check_database)
 
 
 @app.get("/api/connections", response_model=list[ConnectionOut], tags=["connections"])
