@@ -14,9 +14,12 @@ const PATTERNS: { value: TrafficPattern; label: string }[] = [
   { value: 'unknown', label: '아직 모름' },
 ]
 
-const BUDGETS = [10, 30, 50, 100]
+/** 입력할 수 있는 최소 월 예산(USD). 기본값도 이 금액 */
+export const MIN_BUDGET_USD = 16
 
-export const budgetValid = (n: number) => Number.isFinite(n) && n >= 1
+const BUDGETS = [MIN_BUDGET_USD, 30, 50, 100]
+
+export const budgetValid = (n: number) => Number.isFinite(n) && n >= MIN_BUDGET_USD
 
 interface Props {
   scale: ScaleInput
@@ -70,7 +73,7 @@ export default function ScaleStep({ scale, locked, onChange }: Props) {
             <input
               id="budget"
               type="number"
-              min={1}
+              min={MIN_BUDGET_USD}
               step={1}
               inputMode="numeric"
               className="input mono"
@@ -97,8 +100,8 @@ export default function ScaleStep({ scale, locked, onChange }: Props) {
         </div>
         <p className={budgetValid(scale.monthlyBudgetUsd) ? 'hint' : 'conn-error'}>
           {budgetValid(scale.monthlyBudgetUsd)
-            ? `이 금액을 넘는 구성은 추천하지 않고 고를 수도 없습니다.${ONPREM_ENABLED ? ' 온프레미스(로컬 Docker)는 추가 비용 0으로 계산합니다.' : ''}`
-            : '1 이상의 금액을 넣어 주세요.'}
+            ? `최소 $${MIN_BUDGET_USD}부터 입력할 수 있습니다. 부하가 가장 많을 때의 월 비용이 이 금액 안에 드는 구성으로 계획합니다.${ONPREM_ENABLED ? ' 온프레미스(로컬 Docker)는 추가 비용 0으로 계산합니다.' : ''}`
+            : `$${MIN_BUDGET_USD} 이상의 금액을 넣어 주세요.`}
         </p>
       </div>
 

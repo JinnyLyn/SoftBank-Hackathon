@@ -46,8 +46,12 @@ from app.schemas import (
     DeploymentOut,
     FrontDeployStatus,
     GitHubProjectIn,
+    PlanFailureIn,
+    PlanFailureOut,
     PlanIn,
     PlanOut,
+    PlanRequestIn,
+    PlanRequestOut,
     ProjectListOut,
     ProjectOut,
     RollbackCandidateOut,
@@ -387,7 +391,7 @@ async def create_project(
             cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
                           source_type, source_url, source_ref, expected_users, traffic_pattern,
-                          monthly_budget_usd, purpose, created_at
+                          monthly_budget_usd, purpose, requested_tier, created_at
                    FROM projects WHERE id = %s""",
                 (str(project_id),),
             )
@@ -427,7 +431,7 @@ async def create_github_project(body: GitHubProjectIn) -> ProjectOut:
             cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
                           source_type, source_url, source_ref, expected_users, traffic_pattern,
-                          monthly_budget_usd, purpose, created_at
+                          monthly_budget_usd, purpose, requested_tier, created_at
                    FROM projects WHERE id = %s""",
                 (str(project_id),),
             )
@@ -449,7 +453,7 @@ def list_projects(
             db_cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
                           source_type, source_url, source_ref, expected_users, traffic_pattern,
-                          monthly_budget_usd, purpose, created_at
+                          monthly_budget_usd, purpose, requested_tier, created_at
                    FROM projects WHERE (created_at, id) < (%s, %s)
                    ORDER BY created_at DESC, id DESC LIMIT %s""",
                 (before[0], before[1], limit + 1),
@@ -458,7 +462,7 @@ def list_projects(
             db_cursor.execute(
                 """SELECT id, name, source_filename, source_sha256, source_size_bytes,
                           source_type, source_url, source_ref, expected_users, traffic_pattern,
-                          monthly_budget_usd, purpose, created_at
+                          monthly_budget_usd, purpose, requested_tier, created_at
                    FROM projects ORDER BY created_at DESC, id DESC LIMIT %s""",
                 (limit + 1,),
             )
@@ -475,7 +479,7 @@ def get_project(project_id: UUID) -> ProjectOut:
         cursor.execute(
             """SELECT id, name, source_filename, source_sha256, source_size_bytes,
                       source_type, source_url, source_ref, expected_users, traffic_pattern,
-                      monthly_budget_usd, purpose, created_at
+                      monthly_budget_usd, purpose, requested_tier, created_at
                FROM projects WHERE id = %s""",
             (str(project_id),),
         )
@@ -599,6 +603,11 @@ def create_plan(body: PlanIn) -> PlanOut:
                 body.terraform_plan_sha256, fingerprint,
             ),
         )
+        # 계획이 만들어졌으면 같은 대상의 이전 실패 이유는 더 이상 맞지 않는다
+        cursor.execute(
+            "DELETE FROM plan_failures WHERE project_id = %s AND target = %s",
+            (str(body.project_id), body.target),
+        )
         connection.commit()
         cursor.execute("SELECT * FROM deployment_plans WHERE id = %s", (str(plan_id),))
         row = cursor.fetchone()
@@ -616,6 +625,89 @@ def list_project_plans(project_id: UUID) -> list[PlanOut]:
             (str(project_id),),
         )
         return [_plan_out(row) for row in cursor.fetchall()]
+
+
+@app.post("/api/projects/{project_id}/plan-requests", response_model=PlanRequestOut,
+          status_code=status.HTTP_202_ACCEPTED, tags=["plans"])
+def request_plan(project_id: UUID, body: PlanRequestIn) -> PlanRequestOut:
+    """비교표에서 고른 안으로 다시 계획해 달라고 요청한다. 승인 대기 중인 계획을 대체하고 고른 단계를 저장하면
+    worker가 그 단계로 새 계획을 만든다(새 계획·새 fingerprint로 다시 승인받는다). 실행 승인이 아니다."""
+    with connect() as connection, connection.cursor() as cursor:
+        _lock_project(cursor, str(project_id))
+        cursor.execute(
+            "SELECT status, target, variables FROM deployment_plans WHERE project_id = %s AND operation_type = 'deploy'",
+            (str(project_id),),
+        )
+        plans = cursor.fetchall()
+        if any(p["status"] in ("approved", "consumed") for p in plans):
+            raise HTTPException(status.HTTP_409_CONFLICT, "이미 승인한 계획이 있어 다른 안으로 바꿀 수 없습니다.")
+        waiting = [p for p in plans if p["status"] == "awaiting_approval" and p["target"] == body.target]
+        if waiting:
+            variables = waiting[0]["variables"]
+            if isinstance(variables, (str, bytes)):
+                variables = json.loads(variables)
+            options = variables.get("options") if isinstance(variables, dict) else None
+            offered = {o.get("tier") for o in options if isinstance(o, dict)} if isinstance(options, list) else set()
+            if body.tier not in offered:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                    "이 안은 예산·할당량 안에서 만들 수 없어 고를 수 없습니다.")
+        cursor.execute("UPDATE projects SET requested_tier = %s WHERE id = %s", (body.tier, str(project_id)))
+        cursor.execute(
+            "UPDATE deployment_plans SET status = 'superseded' "
+            "WHERE project_id = %s AND status = 'awaiting_approval' AND target = %s",
+            (str(project_id), body.target),
+        )
+        cursor.execute("DELETE FROM plan_failures WHERE project_id = %s AND target = %s", (str(project_id), body.target))
+        connection.commit()
+    return PlanRequestOut(project_id=project_id, target=body.target, tier=body.tier)
+
+
+@app.get("/api/projects/{project_id}/plan-failures", response_model=list[PlanFailureOut], tags=["plans"])
+def list_plan_failures(project_id: UUID) -> list[PlanFailureOut]:
+    """worker가 이 프로젝트의 계획을 만들지 못한 이유(대상별 최신). 계획이 등록되면 사라진다."""
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM projects WHERE id = %s", (str(project_id),))
+        if cursor.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+        cursor.execute(
+            "SELECT target, reason, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s ORDER BY target",
+            (str(project_id),),
+        )
+        return [
+            PlanFailureOut(target=row["target"], reason=row["reason"], retryable=bool(row["retryable"]),
+                           attempts=row["attempts"], updated_at=row["updated_at"])
+            for row in cursor.fetchall()
+        ]
+
+
+@app.post("/api/worker/projects/{project_id}/plan-failures", response_model=PlanFailureOut, tags=["worker"])
+def record_plan_failure(
+    project_id: UUID,
+    body: PlanFailureIn,
+    x_worker_token: str | None = Header(default=None),
+) -> PlanFailureOut:
+    """worker가 계획 생성 실패를 알린다. 대상별 최신 1건만 둔다(같은 대상의 이전 기록을 덮어씀)."""
+    _require_worker(x_worker_token)
+    reason = _redact(body.reason)[:1000]
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM projects WHERE id = %s", (str(project_id),))
+        if cursor.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+        cursor.execute(
+            """INSERT INTO plan_failures (project_id, target, reason, retryable, attempts)
+               VALUES (%s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE reason = VALUES(reason), retryable = VALUES(retryable),
+                   attempts = VALUES(attempts), updated_at = CURRENT_TIMESTAMP(6)""",
+            (str(project_id), body.target, reason, body.retryable, body.attempts),
+        )
+        connection.commit()
+        cursor.execute(
+            "SELECT target, reason, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s AND target = %s",
+            (str(project_id), body.target),
+        )
+        row = cursor.fetchone()
+    return PlanFailureOut(target=row["target"], reason=row["reason"], retryable=bool(row["retryable"]),
+                          attempts=row["attempts"], updated_at=row["updated_at"])
 
 
 @app.get("/api/plans/{plan_id}", response_model=PlanOut, tags=["plans"])
@@ -1489,6 +1581,7 @@ def _project_out(row: dict[str, Any]) -> ProjectOut:
         source_type=row["source_type"], source_url=row.get("source_url"), source_ref=row.get("source_ref"),
         expected_users=row.get("expected_users"), traffic_pattern=row.get("traffic_pattern"),
         monthly_budget_usd=row.get("monthly_budget_usd"), purpose=row.get("purpose"),
+        requested_tier=row.get("requested_tier"),
         created_at=_as_utc(row["created_at"]),
     )
 

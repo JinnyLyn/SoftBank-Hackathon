@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
@@ -20,8 +21,8 @@ class FakeOllama(OllamaClient):
         super().__init__("fake-key")
         self.text, self.stop_reason, self.calls = text, stop_reason, []
 
-    def chat(self, model, system, user, schema, max_tokens):
-        self.calls.append({"model": model, "system": system, "user": user, "schema": schema})
+    def chat(self, model, system, user, schema, max_tokens, timeout=None):
+        self.calls.append({"model": model, "system": system, "user": user, "schema": schema, "timeout": timeout})
         return Reply(self.text, self.stop_reason, model, "req_fake")
 
 
@@ -72,12 +73,14 @@ class OllamaFillTests(unittest.TestCase):
 
 
 class _Handler(BaseHTTPRequestHandler):
-    status, body, seen = 200, {}, []
+    status, body, seen, delay = 200, {}, [], 0
 
     def do_POST(self):  # noqa: N802
         length = int(self.headers.get("Content-Length", 0))
         _Handler.seen.append({"path": self.path, "auth": self.headers.get("Authorization"),
                               "body": json.loads(self.rfile.read(length))})
+        if _Handler.delay:
+            time.sleep(_Handler.delay)
         data = json.dumps(_Handler.body).encode()
         self.send_response(_Handler.status)
         self.send_header("Content-Type", "application/json")
@@ -125,6 +128,36 @@ class OllamaHttpTests(unittest.TestCase):
             self.assertIn(expect, str(ctx.exception))
             self.assertNotIn("k-secret-value", str(ctx.exception))
         self.assertNotIn("k-secret-value", repr(OllamaClient("k-secret-value")))
+
+
+    def test_transient_errors_are_marked(self):
+        from paved_ai.ollama import OllamaError
+        client = OllamaClient("k-test", base_url=self.url)
+        for status, body, transient, expect in [
+            (503, {"error": "overloaded"}, True, "503"),
+            (429, {"error": "rate"}, True, "한도"),
+            (401, {"error": "unauthorized"}, False, "OLLAMA_API_KEY"),
+            (400, {"error": "bad request"}, False, "400"),
+            (200, {"error": "model is busy"}, True, "model is busy"),  # 200으로 돌아오는 오류
+        ]:
+            _Handler.status, _Handler.body = status, body
+            with self.subTest(status=status, body=body), self.assertRaises(OllamaError) as ctx:
+                client.chat("m", "s", "u", {}, 10)
+            self.assertEqual(ctx.exception.transient, transient)
+            self.assertIn(expect, str(ctx.exception))
+
+    def test_timeout_is_transient_and_uses_call_timeout(self):
+        from paved_ai.ollama import OllamaError
+        _Handler.status, _Handler.body, _Handler.delay = 200, {"message": {"content": "{}"}}, 1.5
+        try:
+            started = time.monotonic()
+            with self.assertRaises(OllamaError) as ctx:
+                OllamaClient("k-test", base_url=self.url, timeout=30).chat("m", "s", "u", {}, 10, timeout=0.3)
+            self.assertLess(time.monotonic() - started, 1.4, "호출별 상한이 client 기본값보다 우선")
+            self.assertTrue(ctx.exception.transient)
+            self.assertIn("초 안에", str(ctx.exception))
+        finally:
+            _Handler.delay = 0
 
 
 class ProviderChoiceTests(unittest.TestCase):

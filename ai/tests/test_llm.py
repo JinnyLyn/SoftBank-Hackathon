@@ -1,6 +1,7 @@
 """LLM 보조 단계 검사. 가짜 client로 돌아서 네트워크·비용이 없다 (실제 LLM 호출은 일반 테스트에서 분리, docs/CI.md)."""
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -339,6 +340,128 @@ class SelectFilesTests(unittest.TestCase):
                 self.assertIsNone(analysis.container_port)
                 self.assertEqual(analysis.dockerfile_draft, original_draft)
                 self.assertEqual(analysis.app_config()["container_port"], 8000)
+
+
+class SequenceClient(FakeClient):
+    """호출마다 다음 결과를 돌려줌. 예외면 던짐"""
+
+    def __init__(self, results):
+        super().__init__({"answers": [], "notes": []})
+        self.results = list(results)
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        r = self.results.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=json.dumps(r))], stop_reason="end_turn",
+                               model=kwargs["model"], _request_id="req_fake", usage=None)
+
+
+class BudgetTests(unittest.TestCase):
+    """LLM 단계의 시간 상한·재시도·오류 구분 (분석이 화면의 5분 대기를 넘기지 않게)"""
+
+    def setUp(self):
+        self.files = files()
+        patcher = mock.patch("paved_ai.llm.RETRY_BACKOFF_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        logger = logging.getLogger("paved_ai.llm")
+        level, logger.level = logger.level, logging.CRITICAL
+        self.addCleanup(setattr, logger, "level", level)
+
+    def ok(self):
+        return {"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []}
+
+    def test_transient_failure_is_retried_once(self):
+        from paved_ai.ollama import OllamaError
+        client = SequenceClient([OllamaError("잠깐 끊김", transient=True), self.ok()])
+        a = analyze_files(self.files)
+        out = fill_unresolved(a, self.files, client)
+        self.assertEqual(out.filled, ["container_port"])
+        self.assertEqual(out.attempts, 2)
+        self.assertEqual(a.ai_usage["attempts"], 2)
+        self.assertTrue(all(c["timeout"] > 0 for c in client.calls), "호출마다 남은 시간을 상한으로 넘김")
+
+    def test_permanent_failure_is_not_retried(self):
+        from paved_ai.llm import LlmUnavailable
+        from paved_ai.ollama import OllamaError
+        client = SequenceClient([OllamaError("인증 실패"), self.ok()])
+        with self.assertRaises(LlmUnavailable) as ctx:
+            fill_unresolved(analyze_files(self.files), self.files, client)
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(ctx.exception.transient)
+        self.assertIn("1회 시도", str(ctx.exception))
+
+    def test_gives_up_after_attempts_and_reports_time(self):
+        from paved_ai.llm import LlmUnavailable
+        from paved_ai.ollama import OllamaError
+        client = SequenceClient([OllamaError("시간 초과", transient=True)] * 3)
+        with self.assertRaises(LlmUnavailable) as ctx:
+            fill_unresolved(analyze_files(self.files), self.files, client)
+        self.assertEqual(len(client.calls), 2, "최대 두 번")
+        self.assertTrue(ctx.exception.transient)
+        self.assertIn("2회 시도", str(ctx.exception))
+
+    def test_no_retry_when_budget_is_spent(self):
+        from paved_ai.llm import LlmUnavailable
+        from paved_ai.ollama import OllamaError
+        client = SequenceClient([OllamaError("시간 초과", transient=True), self.ok()])
+        with mock.patch.dict(os.environ, {"PAVED_AI_LLM_TIMEOUT": "5"}), mock.patch("paved_ai.llm.MIN_ATTEMPT_SECONDS", 10):
+            with self.assertRaises(LlmUnavailable):
+                fill_unresolved(analyze_files(self.files), self.files, client)
+        self.assertEqual(len(client.calls), 1, "남은 시간이 모자라면 다시 묻지 않고 규칙 결과로 진행")
+
+    def test_budget_env_is_validated(self):
+        from paved_ai.llm import LLM_BUDGET_SECONDS, budget_seconds
+        for raw, want in (("30", 30.0), ("abc", LLM_BUDGET_SECONDS), ("0", LLM_BUDGET_SECONDS), ("99999", LLM_BUDGET_SECONDS)):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {"PAVED_AI_LLM_TIMEOUT": raw}):
+                self.assertEqual(budget_seconds(), want)
+
+    def test_code_bug_is_not_hidden(self):
+        client = SequenceClient([KeyError("bug")])
+        with self.assertRaises(KeyError):
+            fill_unresolved(analyze_files(self.files), self.files, client)
+
+
+class ExcerptTests(unittest.TestCase):
+    def test_large_file_sends_hint_lines_with_original_numbers(self):
+        from paved_ai.llm import MAX_FILE_CHARS
+        filler = "".join(f"x{i} = {i}\n" for i in range(4000))
+        big = filler + "app.run(host='0.0.0.0', port=Settings.LISTEN_PORT)\n" + filler
+        head = "from flask import Flask\napp = Flask(__name__)\n@app.route('/ping')\ndef ping():\n    return 'pong'\n"
+        spec = {**APP, "app.py": head + big}
+        fs = files(spec)
+        self.assertGreater(len(spec["app.py"]), MAX_FILE_CHARS)
+        client = FakeClient({"answers": [answer("container_port", "5050", "config.py", 2)], "notes": []})
+        a = analyze_files(fs)
+        out = fill_unresolved(a, fs, client)
+        sent = client.calls[0]["messages"][0]["content"]
+        port_line = 5 + 4000 + 1
+        self.assertIn(f"{port_line:>4}| app.run(host='0.0.0.0', port=Settings.LISTEN_PORT)", sent, "원래 줄 번호 유지")
+        self.assertNotIn("x2000 = 2000", sent, "단서 없는 줄은 보내지 않음")
+        self.assertIn("    | …", sent)
+        self.assertLess(len(sent), MAX_FILE_CHARS * 3)
+        self.assertEqual(out.filled, ["container_port"])
+
+    def test_single_huge_line_stays_within_excerpt_limit(self):
+        # PR #45 리뷰: 압축된 한 줄짜리 큰 파일이 발췌 상한을 넘으면 안 됨
+        from paved_ai.llm import MAX_FILE_CHARS, MAX_LINE_CHARS, MAX_PROMPT_CHARS
+        huge = "var a=1;" * 18000 + "app.listen(5050);" + "var b=2;" * 1000   # 약 15만 자 한 줄
+        spec = {"package.json": json.dumps({"dependencies": {"express": "^4"}, "scripts": {"start": "node server.js"}}),
+                "server.js": huge}
+        fs = files(spec)
+        client = FakeClient({"answers": [answer("container_port", "5050", "server.js", 1)], "notes": []})
+        a = analyze_files(fs)
+        a.unresolved.setdefault("container_port", "테스트")
+        a.container_port = None
+        out = fill_unresolved(a, fs, client)
+        sent = client.calls[0]["messages"][0]["content"]
+        self.assertLess(len(sent), MAX_PROMPT_CHARS)
+        self.assertLess(len(sent), MAX_FILE_CHARS + 5000)
+        self.assertIn("app.listen(5050)", sent, "긴 줄은 단서 주변을 남김")
+        self.assertLessEqual(max(len(l) for l in sent.splitlines()), MAX_LINE_CHARS + 20)
+        self.assertEqual(out.filled, ["container_port"], "근거 검증은 원래 줄 전체로")
 
 
 if __name__ == "__main__":
