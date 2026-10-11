@@ -174,6 +174,20 @@ await checkMixedRecommendation(100, 'local-docker');
     failures = final;   // 다음 확인(2초 뒤)에서 최종 실패가 보이면 끝난다
     await assert.rejects(run, (e) => e.status === 422);
   }
+  // 다른 안으로 다시 계획 요청: 본문과 예전 백엔드(404) 안내
+  const posts = [];
+  http.req = async (path, init) => {
+    posts.push([path, JSON.parse(init.body)]);
+    if (posts.length > 1) throw new http.ApiError(404, 'Not Found');
+    return { project_id: 'p-budget', target: 'aws', tier: 'roomy' };
+  };
+  const api2 = loadTs('../../front/src/api/real.ts', {
+    './http': { ...http, send: (method, body) => ({ method, body: JSON.stringify(body) }) }, '../format': format,
+    '../providers': { isEnabled: (provider) => provider === 'aws' },
+  });
+  await api2.requestTier('p-budget', 'roomy');
+  assert.deepEqual(posts[0], ['/projects/p-budget/plan-requests', { target: 'aws', tier: 'roomy' }]);
+  await assert.rejects(api2.requestTier('p-budget', 'lean'), (e) => e.status === 501);
   console.log('PASS: 계획 실패 보고 — 다시 해도 같은 실패는 즉시 이유 표시, 재시도 가능·예전 백엔드는 계속 대기');
 }
 console.log('PASS: 공개 recommend/generate 어댑터 회귀 5개 (로컬 초기화 있음·없음, AWS, 혼합 대상의 예산 내·초과)');

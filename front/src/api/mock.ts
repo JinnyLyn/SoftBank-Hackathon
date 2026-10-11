@@ -40,6 +40,11 @@ const TARGETS: MockTarget[] = [
 ]
 const findTarget = (id?: string) => TARGETS.find((t) => t.id === id) ?? TARGETS[0]
 
+/** mock은 모든 안의 코드가 이미 있어 바로 고를 수 있음. 실제 백엔드와 모양만 맞춤 */
+export async function requestTier(_projectId: string, _tier: TierKey): Promise<void> {
+  await wait(200)
+}
+
 // ---------- 분석, 추천 ----------
 
 export async function analyze(source: Source, _scale: ScaleInput, onUploaded?: () => void): Promise<Analysis> {

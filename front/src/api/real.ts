@@ -223,8 +223,10 @@ function tiersFromOptions(p: PlanOut): { key: TierKey; tier: Tier }[] {
     const extra = {
       rankLabel: RANK_LABEL[str(o.rank)],
       usualUsd: Number.isFinite(usual) ? usual : undefined,
+      suggested: o.recommended === true,
     }
-    if (o.recommended === true || key === p.variables.tier) {
+    // 계획이 있는 안은 계획 변수의 tier 하나. 사용자가 다른 안을 고르면 worker가 그 안으로 계획하고 추천 표시(o.recommended)는 그대로
+    if (key === p.variables.tier) {
       out.push({ key, tier: { ...toTier(p, key), ...extra, planned: true } })
       continue
     }
@@ -616,6 +618,17 @@ export async function history(): Promise<DeployRecord[]> {
     url: r.url ?? undefined,
     createdAt: r.createdAt,
   }))
+}
+
+/** 비교표의 다른 안으로 다시 계획해 달라고 요청. 승인 대기 계획은 대체되고 worker가 그 안으로 새 계획을 만듦(새로 승인 필요) */
+export async function requestTier(projectId: string, tier: TierKey): Promise<void> {
+  try {
+    await req(`/projects/${projectId}/plan-requests`, send('POST', { target: 'aws', tier }))
+  } catch (e) {
+    if (e instanceof ApiError && (e.status === 404 || e.status === 405))
+      throw new ApiError(501, '서버가 아직 다른 안으로 다시 계획하는 기능을 지원하지 않습니다.')
+    throw e
+  }
 }
 
 // ---------- 도메인 (제안 계약, 백엔드·인프라 구현 대기) ----------

@@ -24,6 +24,7 @@ import type {
   ScaleInput,
   Source,
   TerraformBundle,
+  TierKey,
 } from '../types'
 
 // 앱 제출 → 도메인 → 분석과 추천 → 비용 승인 → 진행 상태
@@ -77,7 +78,7 @@ const PLAN_READY_POLL_MS = 3000
 // 앱 배포가 끝난 뒤 도메인(DNS·인증서) 상태를 확인하는 간격
 const DOMAIN_POLL_MS = 3000
 
-type Busy = null | 'analyze' | 'approve' | 'fix'
+type Busy = null | 'analyze' | 'approve' | 'fix' | 'replan'
 
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e))
 const keyOf = (c: Choice) => `${c.connectionId}:${c.tier}`
@@ -360,6 +361,16 @@ export default function NewDeploy({ onShowHistory }: Props) {
       setStep(ANALYSIS)
     })
 
+  // 비교표의 다른 안으로 다시 계획: 승인 대기 계획은 대체되고 새 계획을 기다림(선택·코드 검토는 새 계획 기준)
+  const requestTier = (projectId: string, tier: TierKey) =>
+    run('replan', async () => {
+      await api.requestTier(projectId, tier)
+      setRec(null)
+      setBundles({})
+      setChoiceState(null)
+      loadRec(projectId)
+    })
+
   const approve = () =>
     run('approve', async () => {
       if (!analysis || !choice) return
@@ -561,6 +572,7 @@ export default function NewDeploy({ onShowHistory }: Props) {
               codeError={key ? codeErrors[key] : undefined}
               locked={locked || busy !== null}
               onChoice={setChoice}
+              onRequestTier={(tier) => requestTier(analysis.projectId, tier)}
             />
           )}
           {step === REVIEW && bundle && option && selectedTier && (

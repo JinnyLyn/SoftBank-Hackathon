@@ -27,6 +27,7 @@ type Api = Pick<
   | 'status'
   | 'history'
   | 'saveDomain'
+  | 'requestTier'
 >
 
 export const api: Api = USE_MOCK ? mock : backend
