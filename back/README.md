@@ -111,6 +111,7 @@ python tests/integration_connections.py
 | `GET` | `/api/projects/{id}/analyses/latest` | 최신 분석 결과 |
 | `POST` | `/api/plans` | 대상, Terraform 모듈/변수, 설명, 비용 추정치로 배포 계획 저장 |
 | `GET` | `/api/projects/{id}/plans` | 프로젝트 배포 계획 목록 |
+| `GET` | `/api/projects/{id}/plan-failures` | worker가 계획을 만들지 못한 이유(대상별 최신) |
 | `GET` | `/api/plans/{id}` | 배포 계획과 fingerprint 조회 |
 | `POST` | `/api/plans/{id}/approve` | 표시된 fingerprint가 일치하는 대기 계획만 승인 |
 | `POST` | `/api/deployments` | 승인된 fingerprint를 다시 확인하고 배포 작업을 대기열에 등록 |

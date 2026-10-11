@@ -46,6 +46,8 @@ from app.schemas import (
     DeploymentOut,
     FrontDeployStatus,
     GitHubProjectIn,
+    PlanFailureIn,
+    PlanFailureOut,
     PlanIn,
     PlanOut,
     ProjectListOut,
@@ -599,6 +601,11 @@ def create_plan(body: PlanIn) -> PlanOut:
                 body.terraform_plan_sha256, fingerprint,
             ),
         )
+        # 계획이 만들어졌으면 같은 대상의 이전 실패 이유는 더 이상 맞지 않는다
+        cursor.execute(
+            "DELETE FROM plan_failures WHERE project_id = %s AND target = %s",
+            (str(body.project_id), body.target),
+        )
         connection.commit()
         cursor.execute("SELECT * FROM deployment_plans WHERE id = %s", (str(plan_id),))
         row = cursor.fetchone()
@@ -616,6 +623,54 @@ def list_project_plans(project_id: UUID) -> list[PlanOut]:
             (str(project_id),),
         )
         return [_plan_out(row) for row in cursor.fetchall()]
+
+
+@app.get("/api/projects/{project_id}/plan-failures", response_model=list[PlanFailureOut], tags=["plans"])
+def list_plan_failures(project_id: UUID) -> list[PlanFailureOut]:
+    """worker가 이 프로젝트의 계획을 만들지 못한 이유(대상별 최신). 계획이 등록되면 사라진다."""
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM projects WHERE id = %s", (str(project_id),))
+        if cursor.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+        cursor.execute(
+            "SELECT target, reason, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s ORDER BY target",
+            (str(project_id),),
+        )
+        return [
+            PlanFailureOut(target=row["target"], reason=row["reason"], retryable=bool(row["retryable"]),
+                           attempts=row["attempts"], updated_at=row["updated_at"])
+            for row in cursor.fetchall()
+        ]
+
+
+@app.post("/api/worker/projects/{project_id}/plan-failures", response_model=PlanFailureOut, tags=["worker"])
+def record_plan_failure(
+    project_id: UUID,
+    body: PlanFailureIn,
+    x_worker_token: str | None = Header(default=None),
+) -> PlanFailureOut:
+    """worker가 계획 생성 실패를 알린다. 대상별 최신 1건만 둔다(같은 대상의 이전 기록을 덮어씀)."""
+    _require_worker(x_worker_token)
+    reason = _redact(body.reason)[:1000]
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM projects WHERE id = %s", (str(project_id),))
+        if cursor.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "프로젝트를 찾을 수 없습니다.")
+        cursor.execute(
+            """INSERT INTO plan_failures (project_id, target, reason, retryable, attempts)
+               VALUES (%s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE reason = VALUES(reason), retryable = VALUES(retryable),
+                   attempts = VALUES(attempts), updated_at = CURRENT_TIMESTAMP(6)""",
+            (str(project_id), body.target, reason, body.retryable, body.attempts),
+        )
+        connection.commit()
+        cursor.execute(
+            "SELECT target, reason, retryable, attempts, updated_at FROM plan_failures WHERE project_id = %s AND target = %s",
+            (str(project_id), body.target),
+        )
+        row = cursor.fetchone()
+    return PlanFailureOut(target=row["target"], reason=row["reason"], retryable=bool(row["retryable"]),
+                          attempts=row["attempts"], updated_at=row["updated_at"])
 
 
 @app.get("/api/plans/{plan_id}", response_model=PlanOut, tags=["plans"])

@@ -124,6 +124,8 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 현재 비용 추정 통화는 `USD`만 허용합니다. 프런트 이력의 `monthlyUsd` 필드는 이 금액을 그대로 표시합니다.
 
 - `GET /api/projects/{project_id}/plans`: 프로젝트 계획 목록
+- `GET /api/projects/{project_id}/plan-failures`: worker가 계획을 만들지 못한 이유. 대상(`aws`·`local_docker`)별 최신 1건 `{target, reason, retryable, attempts, updated_at}`. `retryable=false`면 같은 입력으로는 다시 해도 실패(예: 월 예산이 가장 작은 구성보다 낮음)라 화면이 더 기다리지 않는다. 그 대상의 계획이 등록되면 지워진다.
+- `POST /api/worker/projects/{project_id}/plan-failures`(worker token): `{target, reason(1~1000자), retryable, attempts}`. 같은 대상의 기록을 덮어쓰며 `reason`은 저장 전에 비밀값을 가린다.
 - `GET /api/plans/{plan_id}`: 계획 상세와 fingerprint
 
 #### 승인

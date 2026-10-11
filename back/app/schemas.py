@@ -117,6 +117,22 @@ class ConnectionFailIn(APIModel):
     error: str = Field(min_length=1, max_length=2000)
 
 
+class PlanFailureIn(APIModel):
+    """worker가 계획을 만들지 못한 이유. retryable=False면 같은 입력으로는 다시 해도 실패(예: 예산 부족)"""
+    target: Literal["aws", "local_docker"]
+    reason: str = Field(min_length=1, max_length=1000)
+    retryable: bool
+    attempts: int = Field(ge=1, le=1000)
+
+
+class PlanFailureOut(APIModel):
+    target: Literal["aws", "local_docker"]
+    reason: str
+    retryable: bool
+    attempts: int
+    updated_at: datetime
+
+
 class FrontDeployStatus(APIModel):
     state: Literal["running", "success", "failed"]
     log: list[str]
