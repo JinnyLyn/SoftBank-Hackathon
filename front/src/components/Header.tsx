@@ -1,7 +1,6 @@
 import { isEnabled } from '../providers'
-import type { Connection } from '../types'
 
-export type Page = 'new' | 'history' | 'targets'
+export type Page = 'new' | 'history'
 
 /** 새 배포가 올라갈 곳. 켜 둔 배포 대상(VITE_PROVIDERS)을 따름 */
 const DEPLOY_TARGET = [isEnabled('aws') && '관리형 AWS', isEnabled('onprem') && '이 PC의 Docker'].filter(Boolean).join(' · ')
@@ -9,7 +8,6 @@ const DEPLOY_TARGET = [isEnabled('aws') && '관리형 AWS', isEnabled('onprem') 
 const TABS: { key: Page; label: string }[] = [
   { key: 'new', label: '새 배포' },
   { key: 'history', label: '배포 이력' },
-  { key: 'targets', label: '연결 관리' },
 ]
 
 export function Logo({ size = 22 }: { size?: number }) {
@@ -26,13 +24,9 @@ export function Logo({ size = 22 }: { size?: number }) {
 interface Props {
   page: Page
   onChange: (p: Page) => void
-  connections: Connection[]
-  /** 연결 목록 조회 실패 (0곳과 구분) */
-  loadFailed: boolean
 }
 
-export default function Header({ page, onChange, connections, loadFailed }: Props) {
-  const broken = connections.filter((c) => c.status !== 'connected').length
+export default function Header({ page, onChange }: Props) {
 
   return (
     <header className="topbar">
@@ -52,12 +46,11 @@ export default function Header({ page, onChange, connections, loadFailed }: Prop
             </button>
           ))}
         </nav>
-        {/* 배포는 관리형 AWS. 연결 관리는 운영자용이라 연결 상태 경고는 연결이 있을 때만 */}
-        <button className="account" onClick={() => onChange('targets')} title="연결 관리 (운영자)">
-          <span className={'dot' + (broken || loadFailed ? ' is-warn' : '')} />
+        {/* 배포는 운영자가 준비한 관리형 AWS. 사용자 계정 연결은 없음 */}
+        <span className="account">
+          <span className="dot" />
           배포: {DEPLOY_TARGET}
-          {loadFailed ? ' · 연결 조회 실패' : broken ? ` · 연결 확인 필요 ${broken}` : ''}
-        </button>
+        </span>
       </div>
     </header>
   )

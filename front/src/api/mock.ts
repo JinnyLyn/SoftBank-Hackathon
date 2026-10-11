@@ -1,8 +1,6 @@
 import type {
   Analysis,
   Choice,
-  Connection,
-  ConnectionInput,
   DnsRecord,
   DomainChoice,
   DomainPlan,
@@ -18,7 +16,6 @@ import type {
 } from '../types'
 import { buildFiles, buildPlan, CATALOG, findTier, logScript, publicUrl } from './catalog'
 import { isEnabled, PROVIDERS } from '../providers'
-import { now } from '../format'
 export { sourceName } from '../format'
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -29,130 +26,19 @@ let deployStartedAt = 0
 let deployChoice: Choice | null = null
 
 
-// ---------- 연결 ----------
-
-// 연결이 없어도 배포할 곳: 운영자가 준비한 AWS (관리형 배포)
-const MANAGED_AWS: Connection = {
-  id: 'managed-aws',
-  provider: 'aws',
-  name: '관리형 AWS',
-  status: 'connected',
-  detail: '운영자가 준비한 계정',
-  checkedAt: '2026-10-10 00:00',
-  fields: {},
+// ---------- 배포 대상 ----------
+// 관리형 AWS(운영자가 준비한 계정)와, 온프레미스를 켰을 때의 예시 서버. 연결 관리 화면은 없앰(사용자 계정 연결 없이 배포)
+interface MockTarget {
+  id: string
+  provider: Provider
+  name: string
+  host?: string
 }
-const findConnection = (id?: string) => connections.find((c) => c.id === id) ?? MANAGED_AWS
-
-let connections: Connection[] = [
-  {
-    id: 'c1',
-    provider: 'aws',
-    name: '개인 AWS',
-    status: 'connected',
-    detail: '계정 123456789012',
-    checkedAt: '2026-10-07 13:40',
-    fields: {},
-    accountId: '123456789012',
-    roleArn: 'arn:aws:iam::123456789012:role/PavedCloudsReadOnlyRole',
-  },
-  {
-    id: 'c2',
-    provider: 'onprem',
-    name: '동아리방 서버',
-    status: 'connected',
-    detail: 'deploy@192.168.0.24 · 4 vCPU / 8GB · Docker 27.1',
-    checkedAt: '2026-10-07 13:42',
-    fields: { host: '192.168.0.24', port: '22', user: 'deploy', path: '/srv/apps' },
-  },
+const TARGETS: MockTarget[] = [
+  { id: 'managed-aws', provider: 'aws', name: '관리형 AWS' },
+  { id: 'onprem-demo', provider: 'onprem', name: '동아리방 서버', host: '192.168.0.24' },
 ]
-
-const describe = (input: ConnectionInput) =>
-  input.provider === 'aws' ? '스택 생성 대기 중' : '서버에서 설치 명령 실행 대기'
-
-// 온프레미스: 설치 명령을 낸 시각. mock은 6초 뒤 서버가 보고한 것으로 처리
-const installIssuedAt = new Map<string, number>()
-const INSTALL_TTL_MS = 10 * 60 * 1000
-
-function issueInstall(id: string) {
-  installIssuedAt.set(id, Date.now())
-  const token = 'pc_' + Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, '0')).join('')
-  return {
-    installCommand: `curl -fsSL https://pavedclouds.dev/install.sh | sudo sh -s -- --token ${token}`,
-    expiresAt: new Date(Date.now() + INSTALL_TTL_MS).toISOString(),
-  }
-}
-
-const AWS_STACK_URL =
-  'https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate' +
-  '?stackName=paved-clouds&templateURL=https://pavedclouds-public.s3.amazonaws.com/connect.yaml&param_ExternalId=pc-7f3a91'
-
-export async function listConnections(): Promise<Connection[]> {
-  await wait(150)
-  return connections.filter((c) => isEnabled(c.provider))
-}
-
-export async function saveConnection(input: ConnectionInput): Promise<Connection> {
-  await wait(900)
-  const prev = connections.find((c) => c.id === input.id)
-  // 이미 연결된 걸 수정(이름 변경 등)할 때는 연결 상태 그대로
-  if (prev?.status === 'connected') {
-    const conn = { ...prev, name: input.name, fields: { ...prev.fields, ...input.fields } }
-    connections = connections.map((c) => (c.id === conn.id ? conn : c))
-    return conn
-  }
-  // AWS는 콘솔에서 스택 생성, 온프레미스는 서버에서 설치 명령 실행을 기다림
-  const waits = input.provider === 'aws' || input.provider === 'onprem'
-  const id = input.id ?? 'c' + Date.now()
-  const conn: Connection = {
-    id,
-    provider: input.provider,
-    name: input.name,
-    status: waits ? 'pending' : 'connected',
-    detail: describe(input),
-    setupUrl: input.provider === 'aws' ? AWS_STACK_URL : undefined,
-    ...(input.provider === 'onprem' ? issueInstall(id) : {}),
-    checkedAt: now(),
-    fields: input.fields,
-  }
-  connections = input.id ? connections.map((c) => (c.id === input.id ? conn : c)) : [...connections, conn]
-  return conn
-}
-
-export async function checkConnection(id: string): Promise<Connection> {
-  await wait(800)
-  const c = connections.find((x) => x.id === id)!
-  let next: Connection = { ...c, checkedAt: now() }
-  if (c.status === 'pending' && c.provider === 'aws') {
-    // mock: 스택을 만들었다고 보고 연결 완료 처리
-    const accountId = String(100000000000 + Math.floor(Math.random() * 9e11))
-    next = {
-      ...next,
-      status: 'connected',
-      detail: '계정 ' + accountId,
-      setupUrl: undefined,
-      accountId,
-      roleArn: `arn:aws:iam::${accountId}:role/PavedCloudsReadOnlyRole`,
-    }
-  }
-  if (c.status === 'pending' && c.provider === 'onprem' && Date.now() - (installIssuedAt.get(id) ?? Date.now()) > 6000) {
-    // mock: 설치 스크립트가 서버 사양을 보고했다고 처리
-    next = {
-      ...next,
-      status: 'connected',
-      detail: 'deploy@192.168.0.31 · 4 vCPU / 8GB · Docker 27.3',
-      installCommand: undefined,
-      expiresAt: undefined,
-      fields: { ...c.fields, host: '192.168.0.31', user: 'deploy', vcpu: '4', memoryGb: '8' },
-    }
-  }
-  connections = connections.map((x) => (x.id === id ? next : x))
-  return next
-}
-
-export async function deleteConnection(id: string): Promise<void> {
-  await wait(200)
-  connections = connections.filter((c) => c.id !== id)
-}
+const findTarget = (id?: string) => TARGETS.find((t) => t.id === id) ?? TARGETS[0]
 
 // ---------- 분석, 추천 ----------
 
@@ -193,8 +79,7 @@ const total = (resources: { monthlyUsd: number }[]) => resources.reduce((s, r) =
 
 export async function recommend(_projectId: string, scale: ScaleInput): Promise<Recommendation> {
   await wait(700)
-  const usable = connections.filter((c) => c.status === 'connected' && isEnabled(c.provider))
-  if (!usable.some((c) => c.provider === 'aws')) usable.unshift(MANAGED_AWS)
+  const usable = TARGETS.filter((t) => isEnabled(t.provider))
   const options = usable.map((c) => ({
     connectionId: c.id,
     provider: c.provider,
@@ -225,7 +110,7 @@ export async function recommend(_projectId: string, scale: ScaleInput): Promise<
   const label = (t: TierKey) => findTier('aws', t).label
   const where = best ? `${best.name}(${PROVIDERS[best.provider].label})` : ''
   let reason: string
-  if (options.length === 0) reason = '연결된 배포 대상이 없습니다.'
+  if (options.length === 0) reason = '켜 둔 배포 대상이 없습니다.'
   else if (!best) {
     const cheapest = Math.min(...options.map((o) => cost(o.provider, 'lean')))
     reason = `월 예산 $${budget} 안에 맞는 구성이 없습니다. 가장 싼 구성도 월 $${cheapest.toFixed(2)}입니다. 예산을 늘려 주세요.`
@@ -263,7 +148,7 @@ export async function generate(_projectId: string, choice: Choice): Promise<Terr
 }
 
 function buildBundle(choice: Choice): TerraformBundle {
-  const conn = findConnection(choice.connectionId)
+  const conn = findTarget(choice.connectionId)
   const tier = findTier(conn.provider, choice.tier)
   const n = tier.resources.length
   return {
@@ -294,9 +179,9 @@ const HOST_PATCH = {
 
 export async function status(_projectId: string): Promise<DeployStatus> {
   await wait(120)
-  const conn = findConnection(deployChoice?.connectionId)
+  const conn = findTarget(deployChoice?.connectionId)
   const tier = findTier(conn.provider, deployChoice!.tier)
-  const script = logScript(conn.provider, tier, conn.fields.host)
+  const script = logScript(conn.provider, tier, conn.host)
   const end = script[script.length - 1][0] + 1200
   const t = Date.now() - deployStartedAt
   const log = script.filter(([at]) => at <= t).map(([, l]) => l)
@@ -313,7 +198,7 @@ export async function status(_projectId: string): Promise<DeployStatus> {
       },
     }
   }
-  const appUrl = publicUrl(conn.provider, tier.key, conn.fields.host)
+  const appUrl = publicUrl(conn.provider, tier.key, conn.host)
   return {
     state: 'success',
     log: [...log, '{"status":"ok"}', 'health check passed'],

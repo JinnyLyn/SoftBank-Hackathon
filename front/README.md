@@ -5,7 +5,7 @@
 소스(zip 또는 GitHub public 저장소)와 사용 규모를 한 화면에서 받음 → 분석·구성 추천·추천 조합 코드까지 미리 생성 → 코드 검토·승인 → 배포.
 코드 검토 단계에서는 AI를 돌리지 않고 앞에서 만든 결과를 바로 보여 줌. 추천과 다른 칸을 고르면 고르는 순간 뒤에서 그 조합 코드를 만듦.
 
-제품 배포 대상은 AWS만이다. 새 배포는 사용자 AWS 연결 없이 운영자가 준비한 AWS(관리형)로 진행한다(mock 포함, `QuickConnect` 제거). "연결 관리" 화면은 운영자가 역할 위임으로 계정을 연결할 때 쓰며 계정 ID·역할 ARN을 보여 준다. 온프레미스는 팀이 확정한 제품 범위가 아니다. 다만 발표자 PC의 로컬 Docker로 올리는 **선택 기능**을 실제 백엔드에 연결해 두었고(아래 "온프레미스(로컬 Docker)"), 기본은 꺼져 있다.
+제품 배포 대상은 AWS만이다. 새 배포는 사용자 AWS 연결 없이 운영자가 준비한 AWS(관리형)로 진행한다(mock 포함, `QuickConnect` 제거). 사용자 AWS 계정을 연결하는 "연결 관리" 화면과 관련 코드는 뺐다(10/11, 아래 "연결 관리를 뺀 이유"). 온프레미스는 팀이 확정한 제품 범위가 아니다. 다만 발표자 PC의 로컬 Docker로 올리는 **선택 기능**을 실제 백엔드에 연결해 두었고(아래 "온프레미스(로컬 Docker)"), 기본은 꺼져 있다.
 React + TypeScript + Vite.
 
 ## 도메인 작업의 현재 경계
@@ -34,26 +34,31 @@ npm run build
 
 | 화면 동작 | 백엔드 요청 |
 | --- | --- |
-| 연결 목록 / 추가 / 이름 수정 / 삭제 | `GET/POST /api/connections`, `PUT/DELETE /api/connections/{id}` (본문은 `provider`, `name`, `fields` 만) |
-| 연결 확인 | `POST /api/connections/{id}/check` — 저장된 상태를 다시 읽음. 실제 AWS 확인은 worker가 기록 |
 | 분석 시작 (ZIP) | `POST /api/projects?name=&filename=&expected_users=&traffic_pattern=&monthly_budget_usd=&purpose=` 본문은 ZIP 원본 바이트, `Content-Type: application/zip` |
 | 분석 시작 (GitHub) | `POST /api/projects/github` `{ name, repository_url, ref, expected_users, traffic_pattern, monthly_budget_usd, purpose }` |
 | 분석 결과 대기 | `GET /api/projects/{id}/analyses/latest` 를 2초 간격 (404는 대기, 5분 제한) |
-| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 + `GET /api/connections` (2초 간격, 5분 제한) |
+| 추천 비교표 | `GET /api/projects/{id}/plans` 의 승인 대기 계획 (2초 간격, 5분 제한). AWS 줄 이름은 "관리형 AWS"로 고정 |
 | 코드 검토 | `GET /api/plans/{id}` — 변수값, 설명, 모듈, 가격 기준, fingerprint, plan 파일 준비 여부 |
 | 승인하고 배포 | `POST /api/plans/{id}/approve` `{ expected_fingerprint }` → `POST /api/deployments` `{ plan_id, expected_fingerprint }` (202 = 대기열 등록) |
 | 배포 진행 | `GET /api/projects/{id}/status` 0.7초 간격 (404는 대기열 대기로 표시) |
 | 배포 이력 | `GET /api/deployments?limit=50` |
 | 사용 규모·월 예산 | ZIP은 업로드 쿼리, GitHub는 등록 본문의 `expected_users`·`traffic_pattern`·`monthly_budget_usd`·`purpose`. 백엔드가 저장하고 AI runner가 분석 결과 `scale` 로 복사해 인프라 worker가 구성·예산 검사에 씀 |
 
+### 연결 관리를 뺀 이유
+
+사용자 AWS 계정을 연결하는 화면(CloudFormation 역할 위임)은 10/10 이전, 사용자 계정에 배포하던 설계에서 온 것이다. 지금은 운영자가 준비한 AWS에 배포하고([PRODUCT_DIRECTION.md](../docs/PRODUCT_DIRECTION.md)), 그 연결은 읽기 전용 역할을 확인할 뿐 계획·빌드·배포 어디에서도 쓰이지 않았다. 또 템플릿 공개 주소(`AWS_CONNECTION_TEMPLATE_URL`)와 AWS에서 닿는 백엔드 주소(`PUBLIC_API_BASE_URL`)가 없으면 끝나지 않아 '연결 대기'로만 남았다. 그래서 프런트에서 화면·API 호출·mock을 모두 뺐다.
+
+- 백엔드의 `/api/connections` API와 worker의 연결 확인, `infra/connection/` 템플릿은 그대로 있다(각 담당 범위). 프런트는 이제 부르지 않는다.
+- 다시 살리려면 용도(예: 사용자 계정에 배포)와 권한 범위·승인 방식을 팀에서 먼저 정한다. 연결이 끝나는 조건은 [infra/README.md](../infra/README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용) 참고.
+
 ### 온프레미스(로컬 Docker) — 선택 기능
 
 `VITE_PROVIDERS=aws,onprem`(또는 `onprem`만)이면 실제 백엔드 모드(`real.ts`)에서 분석 뒤 **AWS와 온프레미스 계획을 한 비교표에** 보여 준다. 온프레미스는 worker를 `python infra/worker/worker.py --targets aws,local_docker`(또는 `local_docker`)로 실행했을 때만 계획이 생긴다([infra/worker/README.md](../infra/worker/README.md)). 백엔드의 `target`은 `local_docker`이고 화면의 `provider`는 `onprem`이다.
 
-- 비교표의 칸은 계획 하나이고, 연결(`connections`) 기록과 무관하다(고정 id `local-docker`). AWS는 예전과 같다.
+- 비교표의 칸은 계획 하나다(고정 id `local-docker`). AWS는 예전과 같다.
 - 승인 대상은 `variables.compose_yaml`(코드 검토 화면의 `docker-compose.yml` 탭)이다. 승인 식별자(`fingerprint`)에 그 SHA-256이 들어 있다. plan 파일 업로드가 없어 `terraform_plan_ready`는 항상 `true`다.
 - 추천: 월 예산 안에 드는 AWS 계획이 있으면 AWS의 추천 안, 없으면 추가 비용이 없는 온프레미스. 한쪽 계획만 먼저 오면 다른 쪽을 최대 90초 더 기다린 뒤 있는 것만으로 진행한다(`OTHER_TARGET_GRACE_MS`). 켜 둔 대상만 기다린다(기본 AWS만이면 예전과 같다).
-- 연결 관리 화면의 온프레미스 "서버 연결"(설치 명령)은 mock에만 있다. 실제 백엔드는 `aws` 연결만 받는다(`CONNECTABLE_PROVIDERS`). `onprem`만 켜면(AWS 없음) 연결 관리 화면은 등록 폼 대신 "배포 위치" 안내만 보여 주고, 도메인 단계는 도메인·HTTPS를 지원하지 않는다는 안내를 먼저 보여 준다(선택은 반영되지 않는다). 헤더·안내 문구도 켜 둔 대상을 따른다.
+- `onprem`만 켜면(AWS 없음) 도메인 단계는 도메인·HTTPS를 지원하지 않는다는 안내를 먼저 보여 준다(선택은 반영되지 않는다). 헤더·안내 문구도 켜 둔 대상을 따른다.
 - 접속 주소는 `http://localhost:<포트>`다(도메인·HTTPS 없음). 비용 0에는 전기·회선·PC 사용 비용이 들어 있지 않다고 화면에 적는다.
 
 ### 아직 백엔드와 맞춰야 할 것

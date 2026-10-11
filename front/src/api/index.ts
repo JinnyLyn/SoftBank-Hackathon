@@ -19,10 +19,6 @@ export const DRAFT_BUILD = import.meta.env.VITE_DOCKERFILE_DRAFT_BUILD !== 'fals
 // 화면은 api.* 만 부름. mock과 실제 백엔드(real.ts, back/API.md 기준)가 같은 모양을 지켜야 함
 type Api = Pick<
   typeof backend,
-  | 'listConnections'
-  | 'saveConnection'
-  | 'checkConnection'
-  | 'deleteConnection'
   | 'analyze'
   | 'recommend'
   | 'generate'
