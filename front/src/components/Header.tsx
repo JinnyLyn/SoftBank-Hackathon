@@ -1,4 +1,5 @@
 import { isEnabled } from '../providers'
+import { LangSwitch, useT } from '../i18n'
 
 export type Page = 'new' | 'history'
 
@@ -27,6 +28,7 @@ interface Props {
 }
 
 export default function Header({ page, onChange }: Props) {
+  const t = useT()
 
   return (
     <header className="topbar">
@@ -36,21 +38,22 @@ export default function Header({ page, onChange }: Props) {
           <span>Paved Clouds</span>
         </button>
         <nav className="tabs">
-          {TABS.map((t) => (
+          {TABS.map((tab) => (
             <button
-              key={t.key}
-              className={'tab' + (page === t.key ? ' is-active' : '')}
-              onClick={() => onChange(t.key)}
+              key={tab.key}
+              className={'tab' + (page === tab.key ? ' is-active' : '')}
+              onClick={() => onChange(tab.key)}
             >
-              {t.label}
+              {t(tab.label)}
             </button>
           ))}
         </nav>
         {/* 배포는 운영자가 준비한 관리형 AWS. 사용자 계정 연결은 없음 */}
         <span className="account">
           <span className="dot" />
-          배포: {DEPLOY_TARGET}
+          {t('배포: {target}', { target: DEPLOY_TARGET.split(' · ').map((x) => t(x)).join(' · ') })}
         </span>
+        <LangSwitch />
       </div>
     </header>
   )
