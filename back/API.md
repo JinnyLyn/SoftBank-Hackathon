@@ -124,6 +124,11 @@ AWS 계획에는 월 비용 추정치와 Terraform plan SHA-256이 필요합니�
 현재 비용 추정 통화는 `USD`만 허용합니다. 프런트 이력의 `monthlyUsd` 필드는 이 금액을 그대로 표시합니다.
 
 - `GET /api/projects/{project_id}/plans`: 프로젝트 계획 목록
+- 운영 알림(서버 용량):
+  - `GET /api/worker/deployments/monitored`(worker token): 용량을 확인할 배포. 프로젝트마다 가장 최근의 healthy AWS 배포 `{deployment_id, project_id, deploy_id, min_tasks, max_tasks}`.
+  - `POST /api/worker/deployments/{deployment_id}/alerts`(worker token): `{kind: "capacity", active, message, metrics?: {cpu_percent, running_tasks, max_tasks, window_minutes}}`. 배포·종류마다 최신 1건을 올리거나(`active=true`) 푼다. 메시지는 비밀값을 가린다. 알림일 뿐 구성을 바꾸지 않는다.
+  - `GET /api/alerts?active_only=true`: 알림 목록 `{deployment_id, project_id, app, url, kind, active, message, metrics, updated_at}`.
+  - `GET /api/alerts/stream`: 같은 형식을 SSE(`text/event-stream`, `event: alert`, `id: <updated_at>`)로 보낸다. 처음 연결하면 켜진 알림부터, 이후 바뀐 것만. `Last-Event-ID`로 이어 받고 15초마다 연결 유지 주석을 보낸다.
 - `GET /api/projects/{project_id}/plan-failures`: worker가 계획을 만들지 못한 이유. 대상(`aws`·`local_docker`)별 최신 1건 `{target, reason, kind, retryable, attempts, updated_at}`. `kind`는 `input`(같은 입력으로는 다시 해도 실패), `operator`(운영자 조치 필요: AWS 로그인 만료 등), `transient`(일시 오류) 중 하나다. `retryable=false`면 같은 입력으로는 다시 해도 실패(예: 월 예산이 가장 작은 구성보다 낮음)라 화면이 더 기다리지 않는다. 그 대상의 계획이 등록되면 지워진다.
 - `POST /api/projects/{project_id}/plan-requests` `{target: "aws", tier: "lean"|"balanced"|"roomy"}` → 202: 비교표의 다른 안으로 다시 계획해 달라는 요청. 고른 단계를 `projects.requested_tier`(프로젝트 응답에도 노출)에 저장하고 그 대상의 승인 대기 계획을 `superseded`로 바꾼다. worker가 그 단계로 새 계획(새 fingerprint)을 만들며 다시 승인받는다. 이미 승인·배포한 계획이 있으면 409, 현재 계획의 `variables.options`에 없는 단계(예산·할당량 밖)면 422. 실행 승인이 아니다.
 - `POST /api/worker/projects/{project_id}/plan-failures`(worker token): `{target, reason(1~1000자), retryable, attempts, kind?}`. `kind`를 빼면 `retryable`로 정한다(false→`input`, true→`transient`). 같은 대상의 기록을 덮어쓰며 `reason`은 저장 전에 비밀값을 가린다.

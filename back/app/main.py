@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -31,6 +32,9 @@ from app.artifacts import (
 from app.database import check_database, connect
 from app.onprem_readiness import readiness as read_onprem_readiness
 from app.schemas import (
+    AlertIn,
+    AlertOut,
+    MonitoredDeploymentOut,
     AnalysisIn,
     AnalysisOut,
     ApproveIn,
@@ -712,6 +716,131 @@ def record_plan_failure(
         row = cursor.fetchone()
     return PlanFailureOut(target=row["target"], reason=row["reason"], kind=row["kind"], retryable=bool(row["retryable"]),
                           attempts=row["attempts"], updated_at=row["updated_at"])
+
+
+_ALERT_SELECT = """SELECT a.deployment_id, d.project_id, pr.name AS app, d.url, a.kind, a.active, a.message, a.metrics, a.updated_at
+                    FROM deployment_alerts a
+                    JOIN deployments d ON d.id = a.deployment_id
+                    JOIN projects pr ON pr.id = d.project_id"""
+
+
+def _alert_out(row: dict[str, Any]) -> AlertOut:
+    return AlertOut(
+        deployment_id=UUID(row["deployment_id"]), project_id=UUID(row["project_id"]), app=row["app"], url=row.get("url"),
+        kind=row["kind"], active=bool(row["active"]), message=row["message"],
+        metrics=_json_value(row["metrics"]) if row.get("metrics") else None, updated_at=_as_utc(row["updated_at"]),
+    )
+
+
+@app.get("/api/worker/deployments/monitored", response_model=list[MonitoredDeploymentOut], tags=["worker"])
+def list_monitored_deployments(x_worker_token: str | None = Header(default=None)) -> list[MonitoredDeploymentOut]:
+    """용량을 확인할 배포: 프로젝트마다 가장 최근의 healthy AWS 배포(이전 배포는 같은 서비스를 대체했으므로 뺀다)."""
+    _require_worker(x_worker_token)
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute(
+            """SELECT d.id, d.project_id, d.status, p.variables FROM deployments d JOIN deployment_plans p ON p.id = d.plan_id
+               WHERE d.target = 'aws' ORDER BY d.created_at DESC, d.id DESC LIMIT 500"""
+        )
+        rows = cursor.fetchall()
+    seen: set[str] = set()
+    out: list[MonitoredDeploymentOut] = []
+    for row in rows:
+        if row["project_id"] in seen:
+            continue
+        seen.add(row["project_id"])   # 프로젝트의 가장 최근 배포만 본다(실패했으면 그 프로젝트는 확인하지 않음)
+        if row["status"] != "healthy":
+            continue
+        variables = _json_value(row["variables"]) or {}
+        app_config = variables.get("app") if isinstance(variables.get("app"), dict) else {}
+        deploy_id = variables.get("deploy_id")
+        if not isinstance(deploy_id, str) or not re.fullmatch(r"[a-z0-9]{4,8}", deploy_id):
+            continue
+
+        def as_int(v: Any) -> int | None:
+            return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+        out.append(MonitoredDeploymentOut(
+            deployment_id=UUID(row["id"]), project_id=UUID(row["project_id"]), deploy_id=deploy_id,
+            min_tasks=as_int(app_config.get("min_tasks")), max_tasks=as_int(app_config.get("max_tasks")),
+        ))
+    return out
+
+
+@app.post("/api/worker/deployments/{deployment_id}/alerts", response_model=AlertOut, tags=["worker"])
+def record_alert(deployment_id: UUID, body: AlertIn, x_worker_token: str | None = Header(default=None)) -> AlertOut:
+    """worker가 배포 앱의 운영 알림을 올리거나 푼다(배포·종류마다 최신 1건). 구성은 바꾸지 않는다."""
+    _require_worker(x_worker_token)
+    message = _redact(body.message)[:1000]
+    metrics = body.metrics.model_dump(mode="json") if body.metrics else None
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute("SELECT id FROM deployments WHERE id = %s", (str(deployment_id),))
+        if cursor.fetchone() is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "배포를 찾을 수 없습니다.")
+        cursor.execute(
+            """INSERT INTO deployment_alerts (deployment_id, kind, active, message, metrics) VALUES (%s, %s, %s, %s, %s)
+               ON DUPLICATE KEY UPDATE active = VALUES(active), message = VALUES(message), metrics = VALUES(metrics),
+                   updated_at = CURRENT_TIMESTAMP(6)""",
+            (str(deployment_id), body.kind, body.active, message, _json(metrics) if metrics is not None else None),
+        )
+        connection.commit()
+        cursor.execute(_ALERT_SELECT + " WHERE a.deployment_id = %s AND a.kind = %s", (str(deployment_id), body.kind))
+        row = cursor.fetchone()
+    return _alert_out(row)
+
+
+@app.get("/api/alerts", response_model=list[AlertOut], tags=["alerts"])
+def list_alerts(active_only: bool = True) -> list[AlertOut]:
+    with connect() as connection, connection.cursor() as cursor:
+        cursor.execute(_ALERT_SELECT + (" WHERE a.active = TRUE" if active_only else "") + " ORDER BY a.updated_at DESC LIMIT 100")
+        return [_alert_out(row) for row in cursor.fetchall()]
+
+
+ALERT_STREAM_POLL_SECONDS = 2.0
+ALERT_STREAM_HEARTBEAT_SECONDS = 15.0
+
+
+@app.get("/api/alerts/stream", tags=["alerts"])
+async def stream_alerts(request: Request, last_event_id: str | None = Header(default=None)) -> StreamingResponse:
+    """운영 알림을 SSE(text/event-stream)로 보낸다. 서버→브라우저 한 방향이라 WebSocket이 필요 없고,
+    브라우저 EventSource가 끊기면 Last-Event-ID로 이어 받는다. 처음 연결하면 지금 켜진 알림을 먼저 보낸다."""
+
+    def changed_since(cursor_at: datetime | None) -> list[dict[str, Any]]:
+        with connect() as connection, connection.cursor() as cursor:
+            if cursor_at is None:
+                cursor.execute(_ALERT_SELECT + " WHERE a.active = TRUE ORDER BY a.updated_at")
+            else:
+                cursor.execute(_ALERT_SELECT + " WHERE a.updated_at > %s ORDER BY a.updated_at",
+                               (cursor_at.astimezone(timezone.utc).replace(tzinfo=None),))
+            return cursor.fetchall()
+
+    try:
+        start = datetime.fromisoformat(last_event_id) if last_event_id else None
+        if start is not None and start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+    except ValueError:
+        start = None
+
+    async def events():
+        cursor_at = start
+        idle = 0.0
+        yield "retry: 5000\n\n"
+        while not await request.is_disconnected():
+            rows = await run_in_threadpool(changed_since, cursor_at)
+            for row in rows:
+                alert = _alert_out(row)
+                cursor_at = alert.updated_at
+                yield f"id: {alert.updated_at.isoformat()}\nevent: alert\ndata: {alert.model_dump_json()}\n\n"
+                idle = 0.0
+            if cursor_at is None:
+                cursor_at = datetime.now(timezone.utc)
+            await asyncio.sleep(ALERT_STREAM_POLL_SECONDS)
+            idle += ALERT_STREAM_POLL_SECONDS
+            if idle >= ALERT_STREAM_HEARTBEAT_SECONDS:
+                idle = 0.0
+                yield ": keep-alive\n\n"   # 프록시가 연결을 끊지 않게
+
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/plans/{plan_id}", response_model=PlanOut, tags=["plans"])
