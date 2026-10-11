@@ -128,6 +128,8 @@ class FakeBackend:
         self.source_failures = []     # 앞으로의 소스 요청에 돌려줄 HTTP 코드(먼저 넣은 것부터). 비어 있으면 정상 응답
         self.source_redirect = None   # 지정하면 소스 요청을 이 주소로 302 리다이렉트한다
         self.source_truncate = 0      # 앞으로 몇 번의 소스 응답을 "Content-Length만큼 보내지 않고 연결을 닫는" 방식으로 처리할지
+        self.plan_failures = []       # (project_id, 본문) — 계획 실패 보고
+        self.plan_failure_code = 200  # 404면 이 API가 없는 예전 백엔드
         self.source_no_length = False   # True면 Content-Length 없이 보내고 연결을 닫아 끝을 알린다(길이를 미리 알 수 없는 응답)
         self.source_trickle = 0         # 0보다 크면 소스를 한 바이트씩 이 간격(초)으로 보낸다(연결은 살아 있고 느리게 진행되는 응답)
         self.source_gets = 0          # 소스 요청을 받은 횟수
@@ -239,6 +241,13 @@ class FakeBackend:
                             if pl.get("id") == p.split("/")[4]:
                                 pl["terraform_plan_ready"] = True
                     return self._send(200, {"ok": True})
+                if p.startswith("/api/worker/projects/") and p.endswith("/plan-failures"):
+                    if self.headers.get("X-Worker-Token") != TOKEN:
+                        return self._send(401, {"error": "인증 실패"})
+                    if outer.plan_failure_code != 200:
+                        return self._send(outer.plan_failure_code, {"error": "없음"})
+                    outer.plan_failures.append((p.split("/")[4], json.loads(body)))
+                    return self._send(200, {})
                 if p.startswith("/api/worker/connections/") and p.endswith(("/complete", "/fail")):
                     if self.headers.get("X-Worker-Token") != TOKEN:
                         return self._send(401, {"error": "인증 실패"})
@@ -880,6 +889,25 @@ class PlannerTests(Base):
         worker.plan_pending(self.api, self.cfg, state)
         self.assertEqual(len(self.aws_calls()), before)   # 기다리는 프로젝트는 간격 안에서는 AWS를 다시 부르지 않는다
 
+    def test_budget_too_small_is_reported_once_and_not_retried(self):
+        p1, _ = self.two_projects(budget="30.0000")   # 가장 작은 구성보다 싼 예산
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        for _ in range(3):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(self.backend.created_plans, [])
+        self.assertEqual(len(self.backend.plan_failures), 1, "같은 입력으로는 다시 해도 같아 한 번만 시도·보고")
+        pid, body = self.backend.plan_failures[0]
+        self.assertEqual((pid, body["target"], body["retryable"], body["attempts"]), (p1["id"], "aws", False, 1))
+        self.assertIn("월 예산 $30.00", body["reason"])
+
+    def test_plan_failure_report_tolerates_old_backend(self):
+        p1, _ = self.two_projects(budget="30.0000")
+        self.backend.projects = [p1]
+        self.backend.plan_failure_code = 404
+        worker.plan_pending(self.api, self.cfg, worker.State(retry_after=0.0, recheck_after=0.0))   # 예외 없이 끝난다
+        self.assertEqual(self.backend.plan_failures, [])
+
     def test_shortage_without_any_reservation_is_still_a_counted_failure(self):
         os.environ.update(FAKE_QUOTA_VALUE="0.1", FAKE_QUOTA_USED="0")   # 가장 작은 구성(0.25 vCPU)도 못 담는 계정
         p1, _ = self.two_projects()
@@ -887,6 +915,7 @@ class PlannerTests(Base):
         state = worker.State(retry_after=0.0, recheck_after=0.0)
         worker.plan_pending(self.api, self.cfg, state)
         self.assertEqual(state.failures[p1["id"]][0], 1)   # 예약 때문이 아니면 기다려도 풀리지 않으므로 실패로 센다
+        self.assertTrue(self.backend.plan_failures[0][1]["retryable"], "할당량은 늘거나 풀릴 수 있어 다시 시도 대상")
         self.assertEqual(state.waiting, {})
         self.assertEqual(self.backend.created_plans, [])
 

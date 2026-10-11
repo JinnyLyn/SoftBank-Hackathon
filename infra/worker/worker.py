@@ -98,7 +98,12 @@ SECRET_VALUE_RES = REDACT_RES + [
 
 
 class PlanError(Exception):
-    """계획을 만들 수 없는 프로젝트(분석 결과 부족, 예산 초과 등)."""
+    """계획을 만들 수 없는 프로젝트(분석 결과 부족, 예산 초과 등).
+    retryable=False: 같은 입력으로는 다시 해도 같은 결과(예: 예산 안에 드는 구성이 없음). 다시 시도하지 않는다."""
+
+    def __init__(self, message="", retryable=True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class CapacityWait(PlanError):
@@ -674,7 +679,9 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         if reserved > 0 and cost.recommend(users, pattern, budget, prices, arch, foundation,
                                            max(capacity["quota_vcpu"] - capacity["used_vcpu"], 0.0))["recommended"] is not None:
             raise CapacityWait(f"{rec['reason']} 승인 대기·승인된 다른 계획이 {reserved:g} vCPU를 예약 중이라 그 계획이 처리되면 다시 계획합니다")
-        raise PlanError(rec["reason"])
+        # 할당량과 관계없이 예산만으로도 만들 수 없으면 다시 해도 같다(프로젝트의 예산·규모는 바뀌지 않음). 할당량 부족은 풀릴 수 있어 다시 시도
+        budget_only = budget is not None and cost.recommend(users, pattern, budget, prices, arch, foundation, None)["recommended"] is None
+        raise PlanError(rec["reason"], retryable=not budget_only)
     tier = rec["recommended"]
     est = rec["estimates"][tier]
     app, dockerfile = app_config_from_analysis(result, tier, est)   # est가 예산으로 정한 task_size·min_tasks·max_tasks를 가진다
@@ -869,10 +876,12 @@ def plan_pending_local(api, cfg, state):
             plan_local_project(api, cfg, project, analysis)
             state.local_done[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 오류가 worker 전체를 멈추지 않게 한다
-            state.local_failures[pid] = (tries + 1, time.time())
+            retryable = getattr(e, "retryable", True) and tries + 1 < state.max_tries
+            state.local_failures[pid] = (tries + 1 if retryable else state.max_tries, time.time())
             expected = isinstance(e, (PlanError, ApiError, OSError))
             kind = "" if expected else f"{type(e).__name__}: "
             log(f"로컬 Docker 계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {kind}{redact(str(e))[:300]}")
+            report_plan_failure(api, pid, local_docker.TARGET, f"{kind}{e}", retryable, tries + 1)
 
 
 # --- executor --------------------------------------------------------------------------------------
@@ -1341,6 +1350,18 @@ def list_projects(api, max_pages=10):
     return items
 
 
+def report_plan_failure(api, project_id, target, reason, retryable, attempts):
+    """계획 실패 이유를 백엔드에 남긴다(화면이 5분을 기다리지 않고 바로 보여 줌). 보고 실패는 계획 처리에 영향을 주지 않는다.
+    이 API가 없는 예전 백엔드(404·405)면 조용히 넘어간다."""
+    try:
+        api.post(f"/api/worker/projects/{project_id}/plan-failures",
+                 {"target": target, "reason": redact(reason)[:1000] or "알 수 없는 오류", "retryable": bool(retryable),
+                  "attempts": int(attempts)})
+    except ApiError as e:
+        if e.status not in (404, 405):
+            log(f"계획 실패 보고 실패(프로젝트 {project_id}): {e}")
+
+
 def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
     for project in list_projects(api):
         pid = project["id"]
@@ -1380,10 +1401,13 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
                 log(f"계획 대기(프로젝트 {pid}): {redact(str(e))[:300]}")
             state.waiting[pid] = time.time()
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 예상 못 한 오류(잘못된 분석 결과 등)가 worker 전체를 멈추지 않게 한다
-            state.failures[pid] = (tries + 1, time.time())
+            # 다시 해도 같은 실패(예산 부족 등)는 바로 멈춘다. 같은 입력으로 몇 분씩 다시 시도하지 않게
+            retryable = getattr(e, "retryable", True) and tries + 1 < state.max_tries
+            state.failures[pid] = (tries + 1 if retryable else state.max_tries, time.time())
             expected = isinstance(e, (PlanError, ApiError, subprocess.TimeoutExpired, OSError))
             kind = "" if expected else f"{type(e).__name__}: "   # 예상한 오류가 아니면 종류를 남겨 원인을 찾게 한다
             log(f"계획 생성 실패(프로젝트 {pid}, {tries + 1}/{state.max_tries}회): {kind}{redact(str(e))[:300]}")
+            report_plan_failure(api, pid, "aws", f"{kind}{e}", retryable, tries + 1)
 
 
 def claim_path(cfg):
