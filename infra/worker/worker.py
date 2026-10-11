@@ -674,6 +674,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         reserved = capacity["reserved_vcpu"] = reserved_vcpu(api, project["id"])
         capacity["available_vcpu"] = max(capacity["quota_vcpu"] - capacity["used_vcpu"] - reserved, 0.0)
     rec = cost.recommend(users, pattern, budget, prices, arch, foundation, capacity["available_vcpu"] if capacity else None)
+    rec_tier = rec["recommended"]   # 코드가 추천한 안(사용자가 다른 안을 골라도 그대로 기록)
     if rec["recommended"] is None:
         # 다른 계획의 예약이 없었다면 만들 수 있었을 때는 영구 실패가 아니라 기다린다(그 계획이 승인·대체되면 예약이 풀린다)
         if reserved > 0 and cost.recommend(users, pattern, budget, prices, arch, foundation,
@@ -683,6 +684,15 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         budget_only = budget is not None and cost.recommend(users, pattern, budget, prices, arch, foundation, None)["recommended"] is None
         raise PlanError(rec["reason"], retryable=not budget_only)
     tier = rec["recommended"]
+    # 사용자가 비교표에서 다른 안을 골랐으면(백엔드 projects.requested_tier) 그 안으로 계획한다. 예산·할당량 안에서 만든 안만 고를 수 있다
+    requested = project.get("requested_tier")
+    if requested and requested != tier:
+        if requested in rec["estimates"]:
+            tier = requested
+            # options의 recommended는 코드가 추천한 안 그대로 둔다(화면의 "추천" 표시). 계획이 있는 안은 variables.tier로 구분
+            rec = {**rec, "reason": f"사용자가 고른 '{cost.TIERS[tier]['label']}' 안. (추천 근거: {rec['reason']})"}
+        else:
+            log(f"요청한 단계 {requested}는 예산·할당량 안에서 만들 수 없어 추천 안({tier})으로 계획합니다(프로젝트 {project['id']})")
     est = rec["estimates"][tier]
     app, dockerfile = app_config_from_analysis(result, tier, est)   # est가 예산으로 정한 task_size·min_tasks·max_tasks를 가진다
 
@@ -733,7 +743,7 @@ def plan_project(api, cfg, project, analysis, prices=None, arch="X86_64"):
         "dockerfile_draft": dockerfile_draft_from_analysis(result),
         # 승인된 소스(ZIP)의 SHA-256과 이미지 아키텍처: executor가 빌드 직전에 확인하고 같은 아키텍처로 빌드한다
         "source_sha256": src_sha, "cpu_architecture": arch,
-        "tier": tier, "recommended": True, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
+        "tier": tier, "recommended": tier == rec_tier, "headline": est["headline"], "tradeoff": est["tradeoff"], "reason": rec["reason"],
         "resources": resources,
         # total_monthly는 평소(min_tasks개) 월 비용, peak_monthly는 부하가 최대일 때의 월 비용이다. cost_estimate.amount는 peak_monthly다(amount_basis)
         "cost": {"app_monthly": est["app_monthly"], "shared_monthly": est["shared_monthly"], "total_monthly": est["total_monthly"],

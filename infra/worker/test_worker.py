@@ -966,6 +966,23 @@ class PlannerTests(Base):
             res["scale"] = scale
         return worker.plan_project(self.api, self.cfg, {**PROJECT, **project_fields}, self.analysis(res))
 
+    def test_requested_tier_is_planned_but_recommendation_is_kept(self):
+        # 사용자가 비교표에서 다른 안을 고르면(백엔드 projects.requested_tier) 그 안으로 계획한다. "추천" 표시는 코드 추천 그대로
+        fields = {"expected_users": "~10,000", "traffic_pattern": "steady", "monthly_budget_usd": "1000.0000"}
+        self.plan_with_project({**fields, "requested_tier": "lean"})
+        v = self.backend.created_plans[0]["variables"]
+        self.assertEqual(v["tier"], "lean")
+        self.assertFalse(v["recommended"], "사용자가 고른 안은 코드 추천이 아님")
+        self.assertEqual({o["tier"]: o["recommended"] for o in v["options"]}, {"lean": False, "balanced": False, "roomy": True})
+        self.assertIn("사용자가 고른 '작게 시작' 안", v["reason"])
+        self.assertEqual(v["app"]["task_size"], "xsmall")
+
+    def test_requested_tier_outside_budget_falls_back_to_recommendation(self):
+        self.plan_with_project({"expected_users": "~100", "traffic_pattern": "steady", "monthly_budget_usd": "100.0000",
+                                "requested_tier": "roomy"})   # 월 $100에는 최저 안만 들어간다
+        v = self.backend.created_plans[0]["variables"]
+        self.assertEqual((v["tier"], v["recommended"]), ("lean", True))
+
     def test_project_api_fields_are_used_when_the_analysis_has_no_scale(self):
         # 분석기가 프로젝트 입력을 scale에 복사하지 않아도 사용자가 프로젝트에 입력한 월 예산이 적용돼야 한다.
         # 백엔드는 예산을 "120.0000" 같은 문자열로 돌려준다
