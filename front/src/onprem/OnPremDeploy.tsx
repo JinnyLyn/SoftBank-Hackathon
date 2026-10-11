@@ -5,8 +5,10 @@ import type { Analysis, DeployStatus, ScaleInput, Source } from '../types'
 import { approveLocal, Operations, readiness, recommendLocal, type LocalReview, type Readiness } from './api'
 import './onprem.css'
 
-const names = { api: 'API', db: 'DB', docker: 'Docker', analyzer: '규칙 분석기', worker: '로컬 배포 worker' }
+const names = { api: 'API', db: 'DB', docker: 'Docker', analyzer: '구성 분석기', worker: '로컬 배포 worker' }
 const states = { ready: '준비됨', starting: '시작 중', down: '중단', stale: '상태 만료', unconfigured: '설정 필요' }
+// Preserve the local planner's small default; cloud budgets are not a user decision here.
+const LOCAL_SCALE: ScaleInput = { expectedUsers: '~100', pattern: 'steady', monthlyBudgetUsd: 0, purpose: '' }
 // The shared analyzer describes AWS DB injection; this dedicated route uses local Compose env files.
 const localFindingDetail = (finding: Analysis['findings'][number]) =>
   finding.title === 'DB 접속 정보는 배포가 넣습니다'
@@ -22,7 +24,6 @@ export default function OnPremDeploy() {
   const [kind, setKind] = useState<'zip' | 'github'>('zip')
   const [url, setUrl] = useState('')
   const [branch, setBranch] = useState('main')
-  const [scale, setScale] = useState<ScaleInput>({ expectedUsers: '~100', pattern: 'steady', monthlyBudgetUsd: 100, purpose: '' })
   const [analysis, setAnalysis] = useState<Analysis | null>(null)
   const [review, setReview] = useState<LocalReview | null>(null)
   const [confirmed, setConfirmed] = useState(false)
@@ -85,9 +86,9 @@ export default function OnPremDeploy() {
     const selected = kind === 'zip' ? source : { kind: 'github' as const, url: url.trim(), branch: branch.trim() || 'main' }
     if (!selected || !readyRef.current || busy || deployment) return
     const current = operations.current.next()
-    setReview(null); setAnalysis(null); setConfirmed(false); setError(''); setBusy('소스 업로드 및 규칙 분석 중')
+    setReview(null); setAnalysis(null); setConfirmed(false); setError(''); setBusy('소스 업로드 및 구성 분석 중')
     try {
-      const next = await analyze(selected, scale)
+      const next = await analyze(selected, LOCAL_SCALE)
       if (!current()) return
       setAnalysis(next)
       if (next.blockers?.length || next.dockerfileDraft) return
@@ -116,7 +117,7 @@ export default function OnPremDeploy() {
     finally { if (current()) setBusy('') }
   }
   const validSource = kind === 'zip' ? !!source : /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(?:\.git)?\/?$/.test(url.trim())
-  const costAllowed = review && Number.isFinite(review.monthlyUsd) && review.monthlyUsd <= scale.monthlyBudgetUsd
+  const costAllowed = review?.monthlyUsd === 0
   const locked = !!busy || !!deployment
   const httpUrl = result?.url && /^http:\/\//i.test(result.url) ? result.url : null
 
@@ -140,25 +141,25 @@ export default function OnPremDeploy() {
         {!ready && <p>새 분석·승인은 준비 후 가능합니다. 입력과 검토 중인 계획은 유지됩니다. 이미 승인한 대기 작업은 자동 취소되지 않습니다.</p>}
         <p className="hint">3초 간격으로 확인합니다. 분석·빌드 작업 중에는 새 작업이 대기열에서 기다릴 수 있습니다.</p>
       </section>
-      <section className="onprem-panel" aria-labelledby="onprem-input"><h2 id="onprem-input">1. 소스와 사용 규모</h2>
+      <section className="onprem-panel" aria-labelledby="onprem-input"><h2 id="onprem-input">1. 앱 소스 선택</h2>
         <fieldset disabled={locked} className="onprem-fields">
-          <label>소스 방식<select data-testid="source-kind" value={kind} onChange={(e) => { invalidate(); setKind(e.target.value as typeof kind) }}><option value="zip">ZIP 파일</option><option value="github">GitHub 공개 저장소</option></select></label>
+          <div className="onprem-source-kind" role="group" aria-label="소스 방식">
+            <button type="button" className="btn btn-ghost" data-testid="source-zip-choice" aria-pressed={kind === 'zip'} onClick={() => { if (kind !== 'zip') { invalidate(); setSource(null); setKind('zip') } }}>ZIP 파일</button>
+            <button type="button" className="btn btn-ghost" data-testid="source-github" aria-pressed={kind === 'github'} onClick={() => { if (kind !== 'github') { invalidate(); setSource(null); setKind('github') } }}>GitHub 공개 저장소</button>
+          </div>
           {kind === 'zip' ? <label>앱 ZIP 파일 (최대 200MB)<input data-testid="source-zip" type="file" accept=".zip" onChange={(e) => {
             invalidate(); const file = e.target.files?.[0]; setSource(null)
             if (file && (!file.name.toLowerCase().endsWith('.zip') || file.size > 200 * 1024 * 1024)) setError('200MB 이하의 ZIP 파일을 선택해 주세요.')
             else if (file) setSource({ kind: 'zip', file })
           }} /></label> : <><label>GitHub 저장소 URL<input data-testid="source-url" value={url} placeholder="https://github.com/owner/repo" onChange={(e) => { invalidate(); setUrl(e.target.value) }} /></label><label>브랜치<input value={branch} onChange={(e) => { invalidate(); setBranch(e.target.value) }} /></label></>}
-          <label>예상 사용자<select value={scale.expectedUsers} onChange={(e) => { invalidate(); setScale({ ...scale, expectedUsers: e.target.value as ScaleInput['expectedUsers'] }) }}>{['~100', '~1,000', '~10,000', '10,000+'].map((value) => <option key={value}>{value}</option>)}</select></label>
-          <label>접속 패턴<select value={scale.pattern} onChange={(e) => { invalidate(); setScale({ ...scale, pattern: e.target.value as ScaleInput['pattern'] }) }}><option value="steady">고르게 접속</option><option value="peak">특정 시간에 집중</option><option value="unknown">아직 모름</option></select></label>
-          <label>월 예산 한도 (USD)<input type="number" min="0" value={scale.monthlyBudgetUsd} onChange={(e) => { invalidate(); setScale({ ...scale, monthlyBudgetUsd: e.target.valueAsNumber }) }} /></label>
-          <label>앱 용도·선택 설명<textarea maxLength={500} value={scale.purpose} onChange={(e) => { invalidate(); setScale({ ...scale, purpose: e.target.value }) }} /></label>
         </fieldset>
+        <p className="hint">자원은 ‘작게 시작’ 기본 구성과 이 PC의 Docker CPU·메모리 한도를 기준으로 계산합니다. 실제 자원 한도는 배포 승인 전에 확인할 수 있습니다.</p>
         <p className="hint">Dockerfile·의존성 파일·.env.example을 포함하고 실제 비밀값·.env·node_modules·.venv는 제외해 주세요. 지원하지 않는 구성은 분석 결과로 안내합니다.</p>
-        <button className="btn" data-testid="analyze" disabled={!ready || locked || !validSource || !Number.isFinite(scale.monthlyBudgetUsd) || scale.monthlyBudgetUsd < 0} onClick={() => void start()}>규칙 분석 및 로컬 계획 만들기</button>
+        <button className="btn" data-testid="analyze" disabled={!ready || locked || !validSource} onClick={() => void start()}>구성 분석 및 로컬 계획 만들기</button>
       </section>
       {busy && <p role="status" className="onprem-panel">{busy}</p>}
       {error && <p role="alert" className="onprem-error">{error}</p>}
-      {analysis && <section className="onprem-panel"><h2>2. 규칙 분석 결과</h2>
+      {analysis && <section className="onprem-panel"><h2>2. 구성 분석 결과</h2>
         <dl>{analysis.stack.map((row, i) => <div key={i}><dt>{row.label}</dt><dd>{row.value}</dd></div>)}</dl>
         {analysis.findings.map((finding, i) => <p key={i}><strong>{finding.title}</strong> {localFindingDetail(finding)}</p>)}
         {analysis.blockers?.map((blocker) => <p key={blocker} role="alert">{blocker}</p>)}
@@ -167,12 +168,17 @@ export default function OnPremDeploy() {
         {!deployment && !analysis.blockers?.length && !analysis.dockerfileDraft && <button className="btn btn-ghost" disabled={!!busy} onClick={() => void refreshPlan()}>계획 다시 조회</button>}
       </section>}
       {review && <section className="onprem-panel" data-testid="review"><h2>3. Compose와 실행 변수 검토</h2>
-        <p>{review.bundle.planInfo?.summary}</p><p>월 추가 호스팅 비용 추정: ${review.monthlyUsd}. 전기·장비·네트워크 비용 제외.</p>
+        <p className="onprem-review-summary">{review.bundle.planInfo?.summary}</p>
+        {costAllowed && <p>클라우드 호스팅 요금은 발생하지 않습니다. 이 PC의 전기·장비·네트워크 비용은 별도입니다.</p>}
         {review.bundle.planInfo?.excludedCosts?.length && <p>계획의 추가 제외 항목: {review.bundle.planInfo.excludedCosts.join(', ')}</p>}
-        <p className="onprem-identity">프로젝트 {review.reference.projectId} · 계획 {review.reference.planId}<br />Fingerprint: {review.reference.fingerprint}</p>
+        <dl className="onprem-identity">
+          <div><dt>프로젝트</dt><dd>{review.reference.projectId}</dd></div>
+          <div><dt>계획</dt><dd>{review.reference.planId}</dd></div>
+          <div><dt>Fingerprint</dt><dd>{review.reference.fingerprint}</dd></div>
+        </dl>
         {review.bundle.files.map((file) => <details key={file.name} open><summary>{file.name}</summary><CodeView kind="hcl" text={file.content} numbered /></details>)}
         <CodeView kind="plan" text={review.bundle.plan.text} />
-        {!costAllowed && <p role="alert">계획 금액이 예산을 넘거나 올바르지 않습니다. 입력을 확인해 주세요.</p>}
+        {!costAllowed && <p role="alert" data-testid="plan-cost-error">로컬 Docker 계획의 추가 호스팅 금액은 0이어야 합니다. 운영자에게 계획 확인을 요청해 주세요.</p>}
         {!review.bundle.planInfo?.ready && <p>실행 계획 파일이 아직 준비되지 않았습니다. 계획을 다시 조회해 주세요.</p>}
         <label className="onprem-consent"><input type="checkbox" data-testid="review-confirm" checked={confirmed} disabled={locked} onChange={(e) => setConfirmed(e.target.checked)} />이 PC의 Docker에서 위 파일과 변수로 빌드·배포하며 HTTP로만 접속함을 확인했습니다.</label>
         <button className="btn" data-testid="approve" disabled={!ready || !confirmed || locked || !costAllowed || !review.bundle.planInfo?.ready} onClick={() => void approve()}>검토한 계획 승인 및 배포</button>
