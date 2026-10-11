@@ -46,6 +46,20 @@ npm run build
 | 배포 이력 | `GET /api/deployments?limit=50` |
 | 사용 규모·월 예산 | ZIP은 업로드 쿼리, GitHub는 등록 본문의 `expected_users`·`traffic_pattern`·`monthly_budget_usd`·`purpose`. 백엔드가 저장하고 AI runner가 분석 결과 `scale` 로 복사해 인프라 worker가 구성·예산 검사에 씀 |
 
+### AWS 계정 연결이 완료되는 조건
+
+연결 관리 화면의 AWS 연결은 읽기 전용 역할을 맡는 기능이고, **새 배포에는 쓰이지 않는다**(배포는 운영자 AWS). 아래가 모두 갖춰져야 `pending` → `connected`가 된다. 하나라도 없으면 끝나지 않으므로 시연에서는 연결 카드를 지운다.
+
+1. 운영자가 `infra/connection/paved-clouds-connection.yaml`을 공개 HTTPS(S3 객체 URL)에 올린다.
+2. 백엔드 env `AWS_CONNECTION_TEMPLATE_URL`에 그 주소를 넣는다. 없으면 콘솔 링크(`setupUrl`)가 만들어지지 않아 화면에 '설정 없음'으로 표시한다(5초 폴링도 하지 않음).
+3. 백엔드 env `PLATFORM_AWS_ACCOUNT_ID`에 worker가 쓰는 운영자 계정 ID를 넣는다.
+4. 백엔드 env `PUBLIC_API_BASE_URL`에 **AWS에서 닿는** 백엔드 HTTPS 주소를 넣는다. 스택이 이 주소로 계정 ID·역할 ARN을 보낸다. `127.0.0.1` 같은 로컬 주소면 스택을 만들어도 `pending`에 머문다.
+5. 사용자가 링크로 자기 계정에 스택을 만든다(IAM 역할 생성 권한 필요, 역할 이름이 고정이라 계정당 하나).
+6. worker 자격 증명이 `PavedCloudsReadOnlyRole`에 `sts:AssumeRole` 할 수 있어야 한다.
+7. worker가 실행 중이어야 한다. 콜백이 오면 AssumeRole로 확인한 뒤 `connected`(실패하면 `error`, 화면에는 '확인 필요')를 기록한다.
+
+자세한 흐름은 [infra/README.md](../infra/README.md#사용자-aws-연결-기존-연결-화면백엔드-호환용)와 [back/API.md](../back/API.md)를 따른다.
+
 ### 온프레미스(로컬 Docker) — 선택 기능
 
 `VITE_PROVIDERS=aws,onprem`(또는 `onprem`만)이면 실제 백엔드 모드(`real.ts`)에서 분석 뒤 **AWS와 온프레미스 계획을 한 비교표에** 보여 준다. 온프레미스는 worker를 `python infra/worker/worker.py --targets aws,local_docker`(또는 `local_docker`)로 실행했을 때만 계획이 생긴다([infra/worker/README.md](../infra/worker/README.md)). 백엔드의 `target`은 `local_docker`이고 화면의 `provider`는 `onprem`이다.

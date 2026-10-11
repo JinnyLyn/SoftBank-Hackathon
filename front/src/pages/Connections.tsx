@@ -255,7 +255,7 @@ export default function Connections({ connections, loadError, onReload, onChange
                           콘솔에서 연결 스택 만들기
                         </a>
                       ) : (
-                        '이 서버에는 AWS 계정 연결 템플릿이 설정되지 않아 이 연결은 완료되지 않습니다. 새 배포는 연결 없이 운영자 AWS로 진행되니, 필요 없으면 삭제하세요.'
+                        '운영자 설정이 없어 이 연결은 완료되지 않습니다(필요: 공개 HTTPS에 올린 연결 템플릿 주소, AWS에서 닿는 백엔드 공개 주소). 새 배포는 연결 없이 운영자 AWS로 진행되니, 필요 없으면 삭제하세요.'
                       )}
                       {c.setupUrl ? ' → 스택을 만들면 자동으로 확인합니다' : ''}
                     </span>
