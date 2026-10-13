@@ -1,0 +1,63 @@
+import assert from 'node:assert/strict';
+import { parseArgs } from 'node:util';
+import { launchBrowser } from './browser.mjs';
+const { values } = parseArgs({ options: { url: { type: 'string' } } });
+const base = new URL(values.url);
+assert(base.protocol === 'http:' && ['127.0.0.1', '[::1]'].includes(base.hostname));
+const browser = await launchBrowser();
+const apiCalls = [];
+const errors = [];
+const click = (id) => browser.evaluate(`document.querySelector('[data-testid=${id}]').click()`);
+const input = (name) => browser.evaluate(`(() => {
+  const field = document.querySelector('[data-testid=source-zip]');
+  const data = new DataTransfer(); data.items.add(new File(['demo'], ${JSON.stringify(name)}));
+  field.files = data.files; field.dispatchEvent(new Event('change', {bubbles: true}));
+})()`);
+try {
+  browser.onEvent((method, params) => {
+    if (method === 'Network.requestWillBeSent' && new URL(params.request.url).pathname.startsWith('/api/')) apiCalls.push(params.request.url);
+    if (method === 'Runtime.exceptionThrown') errors.push(params.exceptionDetails.text);
+  });
+  await browser.send('Page.navigate', { url: new URL('/onprem', base).href });
+  await browser.waitFor("!!document.querySelector('[data-testid=mock-notice]')", 'MOCK notice');
+  assert(await browser.evaluate("document.querySelector('[data-testid=analyze]').disabled"));
+  await input('invalid.txt');
+  await browser.waitFor("!!document.querySelector('[role=alert]')", 'Invalid file rejected');
+  assert(await browser.evaluate("document.querySelector('[data-testid=analyze]').disabled"));
+  await input('sample.zip');
+  await browser.waitFor("!document.querySelector('[data-testid=analyze]').disabled", 'ZIP enables demo without readiness');
+  await click('analyze');
+  await browser.waitFor("!!document.querySelector('[data-testid=review]')", 'Example review');
+  assert(await browser.evaluate("document.querySelector('[data-testid=approve]').disabled"));
+  assert(!await browser.evaluate("!!document.querySelector('[data-testid=deployment]')"));
+  await click('review-confirm');
+  await input('changed.zip');
+  await browser.waitFor("!document.querySelector('[data-testid=review]')", 'Source change invalidates consent');
+  await click('analyze');
+  await browser.waitFor("!!document.querySelector('[data-testid=approve]')", 'New review');
+  assert(await browser.evaluate("document.querySelector('[data-testid=approve]').disabled"));
+  await click('review-confirm'); await click('approve');
+  await browser.waitFor("!!document.querySelector('[data-testid=new-analysis]')", 'Mock completes');
+  assert(await browser.evaluate("document.querySelector('[data-testid=deployment-state]').textContent.includes('실제 앱은 배포되지 않았습니다')"));
+  assert.equal(await browser.evaluate("document.querySelectorAll('.onprem-main a').length"), 0, 'No fake app URL');
+  await click('new-analysis');
+  await click('source-github');
+  await browser.waitFor("!!document.querySelector('[data-testid=source-url]')", 'GitHub input');
+  assert(await browser.evaluate("document.querySelector('[data-testid=analyze]').disabled"));
+  await browser.evaluate(`(() => {
+    const field = document.querySelector('[data-testid=source-url]');
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(field, 'https://github.com/example/demo');
+    field.dispatchEvent(new Event('input', {bubbles: true}));
+  })()`);
+  await browser.waitFor("!document.querySelector('[data-testid=analyze]').disabled", 'GitHub enables demo');
+  await click('analyze');
+  await browser.waitFor("!!document.querySelector('[data-testid=review]')", 'GitHub review');
+  await browser.evaluate("[...document.querySelectorAll('.lang-switch button')].find(b => b.textContent === '日本語').click()");
+  await browser.waitFor("document.documentElement.lang === 'ja'", 'Japanese selected');
+  assert(!await browser.evaluate("/[가-힣]/.test(document.querySelector('.onprem-main').innerText)"), 'Japanese demo translated');
+  await browser.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  assert(await browser.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'No mobile overflow');
+  assert.deepEqual(apiCalls, [], 'Demo must never call readiness/upload/approval/deployment APIs');
+  assert.deepEqual(errors, []);
+  console.log('PASS public onprem MOCK: ZIP/GitHub, validation, consent reset, completion, no API calls, Japanese, mobile');
+} finally { await browser.close(); }

@@ -3,6 +3,7 @@ import app from './app'
 import steps from './steps'
 import api from './api'
 import extra from './extra'
+import onprem from './onprem'
 
-const ja: Record<string, string> = { ...app, ...steps, ...api, ...extra }
+const ja: Record<string, string> = { ...app, ...steps, ...api, ...extra, ...onprem }
 export default ja

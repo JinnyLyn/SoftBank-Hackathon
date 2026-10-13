@@ -75,6 +75,8 @@ PR #10에서 실패했던 `back/` 존재 자체의 차단 가드는 제거하고
 
 ### on-prem 전용 서비스 검사
 
+일반 `/onprem`은 `test_onprem_mock.mjs`로 서버 없이 ZIP/GitHub 입력·승인·모의 완료·API 호출 0건·일본어·모바일을 검사한다. 실제 로컬 화면의 기존 `test_onprem_front.mjs`는 `VITE_ONPREM_ONLY=true VITE_USE_MOCK=false`에서 실행한다. MOCK 완료는 파일 분석·Docker 배포 증거가 아니다.
+
 [실행 안내](ONPREM.md)와 [경계 테스트](../tests/edge_case/onprem-service.md)를 따른다. `test_onprem_front.mjs`는 실제 Docker 성공을 흉내 내는 HTTP 대역 회귀다. 실제 샘플 배포는 새 실행기와 `test_onprem_deploy.mjs`, 최종 URL의 `test_sample_front.mjs --mode real`을 별도로 실행해야 한다. 원격 서버·HTTPS·AWS·유료 LLM 검증은 이 경로의 범위가 아니다. 기존 AWS 화면을 바꾸거나 기존 AWS CI 판정을 전체 배포 성공으로 확대하지 않는다.
 
 `infra/scripts/test_infra.py --skip-aws` 전체를 CI에 연결하지 않았다. 확인한 버전은 foundation 실조회만 건너뛰고 다른 plan은 일반 AWS provider를 사용한다. 인증 없는 환경의 전체 회귀 검사라는 근거가 부족하다. 격리된 provider mock을 갖춘 뒤 별도 검사로 추가한다.
