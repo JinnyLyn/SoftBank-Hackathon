@@ -54,6 +54,8 @@ npm run build
 
 ### 온프레미스(로컬 Docker) — 선택 기능
 
+일반 `/onprem`은 독립 **MOCK 체험** 화면이다. 서버 준비 상태와 무관하게 ZIP/GitHub 입력·예시 검토·승인·모의 완료를 제공하며 파일 전송·실제 분석·배포는 하지 않는다. `bash scripts/run_onprem.sh`는 `VITE_ONPREM_ONLY=true`를 주입해 기존 실제 로컬 Docker 화면을 선택한다. AWS의 `VITE_USE_MOCK`와 별개이며 [실행 안내](../docs/ONPREM.md)를 따른다. 아래 비교표 기능은 기존 공통 배포 화면의 선택 기능이다.
+
 `VITE_PROVIDERS=aws,onprem`(또는 `onprem`만)이면 실제 백엔드 모드(`real.ts`)에서 분석 뒤 **AWS와 온프레미스 계획을 한 비교표에** 보여 준다. 온프레미스는 worker를 `python infra/worker/worker.py --targets aws,local_docker`(또는 `local_docker`)로 실행했을 때만 계획이 생긴다([infra/worker/README.md](../infra/worker/README.md)). 백엔드의 `target`은 `local_docker`이고 화면의 `provider`는 `onprem`이다.
 
 - 비교표의 칸은 계획 하나다(고정 id `local-docker`). AWS는 예전과 같다.
