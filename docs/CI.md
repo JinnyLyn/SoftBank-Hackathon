@@ -137,7 +137,7 @@ smoke 스크립트는 loopback의 임시 포트에서 실제 Uvicorn을 실행�
 bash scripts/ci/run_platform_stack.sh
 ```
 
-runner는 CI 전용 Compose 구성으로 임의 프로젝트·네트워크·볼륨을 만들고, 호스트 포트와 `.env`·AWS/LLM/기존 worker 키를 전달하지 않는다. API 기동 후 모든 migration을 두 차례 실행해 적용 이력을 확인하고 `test_platform_back_rollbacks.py`, `test_platform_back_masking.py`, `test_platform_back_local_docker.py`(발표자 PC 로컬 Docker 대상의 계획·승인·claim 계약. Docker·AWS는 실행하지 않는다), `test_platform_back_alerts.py`(용량 알림: 새 배포가 healthy가 되거나 최신 배포가 실패하면 이전 배포의 켜진 알림이 풀리고 SSE로 전달되는지. AWS는 실행하지 않는다)를 컨테이너 안에서 실행한다. 성공·실패 시 생성한 프로젝트만 `down --volumes`로 정리한다. 각 단계에 timeout을 두며 원문 서비스 로그는 출력하지 않는다.
+runner는 CI 전용 Compose 구성으로 임의 프로젝트·네트워크·볼륨을 만들고, 호스트 포트와 `.env`·AWS/LLM/기존 worker 키를 전달하지 않는다. API 기동 후 모든 migration을 두 차례 실행해 적용 이력을 확인하고 `test_platform_back_rollbacks.py`, `test_platform_back_masking.py`, `test_platform_back_local_docker.py`(발표자 PC 로컬 Docker 대상의 계획·승인·claim 계약. Docker·AWS는 실행하지 않는다), `test_platform_back_alerts.py`(용량 알림: 새 배포가 healthy가 되거나 최신 배포가 실패하면 이전 배포의 켜진 알림이 풀리고 SSE로 전달되는지. AWS는 실행하지 않는다), `test_platform_back_contract.py`(라우터가 만드는 404·405의 `{error}` 형식과 긴 ZIP 파일명 자르기)를 컨테이너 안에서 실행한다. 성공·실패 시 생성한 프로젝트만 `down --volumes`로 정리한다. 각 단계에 timeout을 두며 원문 서비스 로그는 출력하지 않는다.
 
 이 검사는 실제 DB·HTTP를 사용한다. 업로드하는 plan 바이트와 worker 상태 보고는 합성 테스트 데이터이며 실제 Terraform plan/apply·AWS rollback 성공을 의미하지 않는다. [Issue #16](https://github.com/JinnyLyn/SoftBank-Hackathon/issues/16) 이전에는 롤백 검사 파일만 있었고 workflow에서 호출하지 않았으며, 이 runner 연결부터 DB 검증 범위가 추가된다.
 

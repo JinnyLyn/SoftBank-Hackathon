@@ -107,6 +107,14 @@ def main() -> int:
     api.require(bystander["id"] in ids, "another project's alert must not be closed")
     print("PASS: a new healthy deployment closes the previous deployment's alert only")
 
+    # 늦게 도착한 알림이 옛 배포에 다시 켜지면 worker가 다시 보지 않아 영원히 켜져 있게 된다 → 최신 healthy AWS 배포만 켤 수 있다
+    api.request(f"/api/worker/deployments/{first['id']}/alerts", method="POST", expected=409, headers=TOKEN, payload=ALERT)
+    api.require(first["id"] not in active_ids(), "a rejected late alert must not be stored as active")
+    api.request(f"/api/worker/deployments/{first['id']}/alerts", method="POST", expected=200, headers=TOKEN,
+                payload={**ALERT, "active": False, "message": "해제"})
+    api.request(f"/api/worker/deployments/{uuid.uuid4()}/alerts", method="POST", expected=404, headers=TOKEN, payload=ALERT)
+    print("PASS: only the project's latest healthy AWS deployment can raise an alert; resolving stays allowed")
+
     # 2. 해제는 SSE로도 전달된다(Last-Event-ID로 이어 받은 연결은 변경분만 받는다)
     resumed = read_stream(
         lambda t: any(e["deployment_id"] == first["id"] and not e["active"] for e in stream_events(t)), last_event_id)

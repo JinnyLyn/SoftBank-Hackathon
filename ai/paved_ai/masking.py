@@ -146,14 +146,14 @@ def mask_files(files: List[SourceFile]) -> MaskReport:
 # 백엔드는 "이름=" 자리를 모두 찾고(값을 먹지 않아서 "environment: API_KEY=..." 안쪽도 봄), 이름이 비밀스러우면 거절한다.
 # 값이 JSON 문자열이면 풀어서 안쪽도 본다. 그래서 "FROM python:3.12" 는 통과하고 "SECRET_KEY=<가림>" 은 거절된다.
 
-BACKEND_SECRET_KEY = re.compile(r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)")
+BACKEND_SECRET_KEY = re.compile(r"(?i)(^|[_-])(password|passwd|pass|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)([_-]|$)")
 BACKEND_KEY_ASSIGNMENT = re.compile(
     r"""(?ix)(?<![A-Z0-9_-])(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)\s*[:=]\s*"""
 )
 BACKEND_ASSIGNMENT_VALUE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]"']+"""
+    r""""(?:\\.|[^"\\])*(?:"|\Z)|'(?:\\.|[^'\\])*(?:'|\Z)|\\"(?:(?!\\").)*(?:\\"|\Z)|\\'(?:(?!\\').)*(?:\\'|\Z)|[^\s,;}\]"']+"""
 )
-BACKEND_CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
+BACKEND_CREDENTIAL_URL = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*)://[^/\s:@]*:[^/\s@]+@")
 BACKEND_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 BACKEND_AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 

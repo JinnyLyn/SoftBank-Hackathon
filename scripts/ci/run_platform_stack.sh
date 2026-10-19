@@ -73,3 +73,6 @@ timeout 120 "${compose[@]}" exec -T api python /ci/test_platform_back_local_dock
 
 echo '실제 DB/API 용량 알림 계약 검사 (AWS 실행 없음)'
 timeout 120 "${compose[@]}" exec -T api python /ci/test_platform_back_alerts.py
+
+echo '실제 API 오류 형식·파일명 계약 검사'
+timeout 60 "${compose[@]}" exec -T api python /ci/test_platform_back_contract.py

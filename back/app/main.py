@@ -7,8 +7,9 @@ import hmac
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit
 from uuid import UUID, uuid4
@@ -20,6 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.artifacts import (
     artifact_exists,
@@ -88,15 +90,15 @@ if _cors_origins:
 PLAN_TARGETS = ("aws", "local_docker")
 
 _SECRET_KEY = re.compile(
-    r"(?i)(^|[_-])(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)([_-]|$)"
+    r"(?i)(^|[_-])(password|passwd|pass|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)([_-]|$)"
 )
 _KEY_ASSIGNMENT = re.compile(
     r"""(?ix)(?<![A-Z0-9_-])(?P<key_quote>["']?)(?P<key>[A-Z_][A-Z0-9_-]*)(?P=key_quote)\s*[:=]\s*"""
 )
 _ASSIGNMENT_VALUE = re.compile(
-    r""""(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;}\]"']+"""
+    r""""(?:\\.|[^"\\])*(?:"|\Z)|'(?:\\.|[^'\\])*(?:'|\Z)|\\"(?:(?!\\").)*(?:\\"|\Z)|\\'(?:(?!\\').)*(?:\\'|\Z)|[^\s,;}\]"']+"""
 )
-_CREDENTIAL_URL = re.compile(r"(?i)\b(mysql(?:\+pymysql)?|https?)://[^/\s:@]+:[^/\s@]+@")
+_CREDENTIAL_URL = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*)://[^/\s:@]*:[^/\s@]+@")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 
@@ -110,8 +112,9 @@ async def database_error_handler(_: Request, exc: pymysql.MySQLError) -> JSONRes
     )
 
 
-@app.exception_handler(HTTPException)
-async def http_error_handler(_: Request, exc: HTTPException) -> JSONResponse:
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(_: Request, exc: StarletteHTTPException) -> JSONResponse:
+    # fastapi.HTTPException뿐 아니라 라우터가 만드는 404·405도 {"error": ...} 형식으로 돌려준다
     message = exc.detail if isinstance(exc.detail, str) else "요청을 처리할 수 없습니다."
     return JSONResponse(status_code=exc.status_code, content={"error": message}, headers=exc.headers)
 
@@ -378,7 +381,10 @@ async def create_project(
     if clean_purpose is not None:
         _reject_secret_fields(clean_purpose)
     safe_filename = filename.replace("\\", "/").rsplit("/", maxsplit=1)[-1]
-    safe_filename = "".join(char for char in safe_filename if char.isprintable())[:255]
+    safe_filename = "".join(char for char in safe_filename if char.isprintable())
+    if len(safe_filename) > 255:
+        suffix = Path(safe_filename).suffix[:16]
+        safe_filename = safe_filename[:255 - len(suffix)] + suffix
     project_id = uuid4()
     stored = await save_project_zip(request.stream(), safe_filename, project_id)
     try:
@@ -773,9 +779,20 @@ def record_alert(deployment_id: UUID, body: AlertIn, x_worker_token: str | None 
     message = _redact(body.message)[:1000]
     metrics = body.metrics.model_dump(mode="json") if body.metrics else None
     with connect() as connection, connection.cursor() as cursor:
-        cursor.execute("SELECT id FROM deployments WHERE id = %s", (str(deployment_id),))
-        if cursor.fetchone() is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "배포를 찾을 수 없습니다.")
+        # 새 배포가 healthy가 될 때의 알림 정리(_close_superseded_alerts)와 같은 프로젝트 잠금: 둘 중 하나가 먼저 끝난다
+        _lock_deployment_project(cursor, str(deployment_id))
+        if body.active:
+            cursor.execute(
+                """SELECT d.status, d.target,
+                          (SELECT n.id FROM deployments n WHERE n.project_id = d.project_id AND n.target = 'aws'
+                           ORDER BY n.created_at DESC, n.id DESC LIMIT 1) AS latest_id
+                   FROM deployments d WHERE d.id = %s""",
+                (str(deployment_id),),
+            )
+            target = cursor.fetchone()
+            if target["target"] != "aws" or target["status"] != "healthy" or target["latest_id"] != str(deployment_id):
+                # worker가 monitored를 읽고 CloudWatch를 조회하는 사이 새 배포가 나왔다면, 늦게 온 알림이 옛 배포에 영구히 켜지지 않게 한다
+                raise HTTPException(status.HTTP_409_CONFLICT, "용량 확인 대상(프로젝트의 최신 healthy AWS 배포)이 아닌 배포입니다.")
         cursor.execute(
             """INSERT INTO deployment_alerts (deployment_id, kind, active, message, metrics) VALUES (%s, %s, %s, %s, %s)
                ON DUPLICATE KEY UPDATE active = VALUES(active), message = VALUES(message), metrics = VALUES(metrics),
@@ -809,6 +826,8 @@ def list_alerts(active_only: bool = True) -> list[AlertOut]:
 
 ALERT_STREAM_POLL_SECONDS = 2.0
 ALERT_STREAM_HEARTBEAT_SECONDS = 15.0
+# 트랜잭션 안에서 updated_at을 찍고 나중에 커밋하는 행(예: 새 배포 healthy 이벤트 안의 알림 정리)이 커서보다 늦게 보이는 것을 받아내려고 조금 앞부터 읽는다
+ALERT_STREAM_OVERLAP_SECONDS = 5.0
 
 
 @app.get("/api/alerts/stream", tags=["alerts"])
@@ -816,14 +835,18 @@ async def stream_alerts(request: Request, last_event_id: str | None = Header(def
     """운영 알림을 SSE(text/event-stream)로 보낸다. 서버→브라우저 한 방향이라 WebSocket이 필요 없고,
     브라우저 EventSource가 끊기면 Last-Event-ID로 이어 받는다. 처음 연결하면 지금 켜진 알림을 먼저 보낸다."""
 
-    def changed_since(cursor_at: datetime | None) -> list[dict[str, Any]]:
+    def changed_since(cursor_at: datetime | None) -> tuple[list[dict[str, Any]], datetime]:
+        """(바뀐 알림, DB의 현재 시각). 커서는 updated_at과 같은 DB 시계로 잡아야 API 서버와 시계가 어긋나도 알림을 놓치지 않는다."""
         with connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT CURRENT_TIMESTAMP(6) AS now")
+            db_now = _as_utc(cursor.fetchone()["now"])
             if cursor_at is None:
                 cursor.execute(_ALERT_SELECT + " WHERE a.active = TRUE ORDER BY a.updated_at")
             else:
+                since = (cursor_at - timedelta(seconds=ALERT_STREAM_OVERLAP_SECONDS)).astimezone(timezone.utc)
                 cursor.execute(_ALERT_SELECT + " WHERE a.updated_at > %s ORDER BY a.updated_at",
-                               (cursor_at.astimezone(timezone.utc).replace(tzinfo=None),))
-            return cursor.fetchall()
+                               (since.replace(tzinfo=None),))
+            return cursor.fetchall(), db_now
 
     try:
         start = datetime.fromisoformat(last_event_id) if last_event_id else None
@@ -834,17 +857,22 @@ async def stream_alerts(request: Request, last_event_id: str | None = Header(def
 
     async def events():
         cursor_at = start
+        sent: dict[tuple[str, str], datetime] = {}   # (배포, 종류) → 마지막으로 보낸 updated_at. 겹쳐 읽은 행을 다시 보내지 않으려고
         idle = 0.0
         yield "retry: 5000\n\n"
         while not await request.is_disconnected():
-            rows = await run_in_threadpool(changed_since, cursor_at)
+            rows, db_now = await run_in_threadpool(changed_since, cursor_at)
             for row in rows:
                 alert = _alert_out(row)
-                cursor_at = alert.updated_at
+                key = (str(alert.deployment_id), alert.kind)
+                if sent.get(key) == alert.updated_at:
+                    continue
+                sent[key] = alert.updated_at
+                cursor_at = alert.updated_at if cursor_at is None else max(cursor_at, alert.updated_at)
                 yield f"id: {alert.updated_at.isoformat()}\nevent: alert\ndata: {alert.model_dump_json()}\n\n"
                 idle = 0.0
             if cursor_at is None:
-                cursor_at = datetime.now(timezone.utc)
+                cursor_at = db_now
             await asyncio.sleep(ALERT_STREAM_POLL_SECONDS)
             idle += ALERT_STREAM_POLL_SECONDS
             if idle >= ALERT_STREAM_HEARTBEAT_SECONDS:
