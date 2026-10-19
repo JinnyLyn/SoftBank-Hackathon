@@ -43,25 +43,56 @@ const toAlert = (a: AlertOut): AppAlert => ({
   updatedAt: a.updated_at,
 })
 
-/** 알림을 구독. 돌려준 함수로 끊는다. 이 기능이 없는 예전 백엔드(404)면 EventSource가 다시 시도하다 멈추게 몇 번 뒤 닫는다 */
-export function subscribeAlerts(onAlert: (a: AppAlert) => void): () => void {
+/**
+ * 알림을 구독. 돌려준 함수로 끊는다.
+ * 브라우저가 스스로 다시 연결하는 동안(readyState CONNECTING)에는 아무것도 하지 않고 Last-Event-ID로 이어 받게 둔다.
+ * 응답을 거부당해 브라우저가 포기한 경우(CLOSED: 404·잘못된 Content-Type, 프록시 오류 등)에는 점점 늘리는 간격으로 직접 다시 연다.
+ * 한 번도 연결되지 못한 채 5번 연속 거부당하면 알림 기능이 없는 예전 백엔드로 보고 그만둔다(화면 동작에는 영향 없음).
+ * 직접 다시 연 연결은 Last-Event-ID가 없어 켜진 알림 전체를 다시 받으므로, 그 전에 onReset으로 화면의 알림을 비운다.
+ */
+const RETRY_FIRST_MS = 5_000
+const RETRY_MAX_MS = 60_000
+const GIVE_UP_AFTER = 5
+
+export function subscribeAlerts(onAlert: (a: AppAlert) => void, onReset?: () => void): () => void {
   if (import.meta.env.VITE_USE_MOCK === 'true' || typeof EventSource === 'undefined') return () => {}
-  const source = new EventSource('/api/alerts/stream')
-  let failures = 0
-  source.addEventListener('alert', (e) => {
-    failures = 0
-    try {
-      onAlert(toAlert(JSON.parse((e as MessageEvent<string>).data) as AlertOut))
-    } catch {
-      // 형식이 다른 메시지는 무시
+  let source: EventSource | null = null
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+  let delay = RETRY_FIRST_MS
+  let rejected = 0
+  let reopened = false
+
+  const connect = () => {
+    const es = new EventSource('/api/alerts/stream')
+    source = es
+    es.addEventListener('alert', (e) => {
+      try {
+        onAlert(toAlert(JSON.parse((e as MessageEvent<string>).data) as AlertOut))
+      } catch {
+        // 형식이 다른 메시지는 무시
+      }
+    })
+    es.onopen = () => {
+      delay = RETRY_FIRST_MS
+      rejected = 0
+      if (reopened) onReset?.()
+      reopened = false
     }
-  })
-  source.onopen = () => {
-    failures = 0
+    es.onerror = () => {
+      if (stopped || es.readyState !== EventSource.CLOSED) return
+      es.close()
+      if (++rejected >= GIVE_UP_AFTER) return
+      reopened = true
+      timer = setTimeout(connect, delay)
+      delay = Math.min(delay * 2, RETRY_MAX_MS)
+    }
   }
-  source.onerror = () => {
-    failures += 1
-    if (failures >= 5) source.close()   // 서버에 알림 기능이 없거나 계속 끊기면 그만둔다(화면 동작에는 영향 없음)
+  connect()
+
+  return () => {
+    stopped = true
+    if (timer) clearTimeout(timer)
+    source?.close()
   }
-  return () => source.close()
 }

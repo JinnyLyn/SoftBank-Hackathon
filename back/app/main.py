@@ -788,6 +788,18 @@ def record_alert(deployment_id: UUID, body: AlertIn, x_worker_token: str | None 
     return _alert_out(row)
 
 
+def _close_superseded_alerts(cursor: Any, project_id: str, keep_deployment_id: str | None = None) -> None:
+    """프로젝트에서 용량 확인 대상이 아니게 된 배포의 켜진 알림을 푼다.
+    worker는 프로젝트마다 가장 최근의 healthy 배포만 확인하므로, 새 배포가 healthy가 되거나 최신 배포가 실패·롤백하면
+    이전 배포의 알림은 worker가 다시 보지 않아 영원히 켜져 있게 된다. updated_at이 바뀌어 SSE로도 해제가 전달된다."""
+    cursor.execute(
+        """UPDATE deployment_alerts a JOIN deployments d ON d.id = a.deployment_id
+           SET a.active = FALSE, a.message = %s, a.updated_at = CURRENT_TIMESTAMP(6)
+           WHERE d.project_id = %s AND a.active = TRUE AND a.deployment_id <> %s""",
+        ("이후 배포로 바뀌어 알림을 닫았습니다.", project_id, keep_deployment_id or ""),
+    )
+
+
 @app.get("/api/alerts", response_model=list[AlertOut], tags=["alerts"])
 def list_alerts(active_only: bool = True) -> list[AlertOut]:
     with connect() as connection, connection.cursor() as cursor:
@@ -1526,6 +1538,10 @@ def record_worker_event(
                 """UPDATE deployments SET status = %s, url = %s WHERE id = %s""",
                 (body.status, body.url if body.status == "healthy" else None, str(deployment_id)),
             )
+            if body.status == "healthy":
+                _close_superseded_alerts(cursor, current["project_id"], keep_deployment_id=str(deployment_id))
+            elif body.status in {"failed", "rolling_back"}:
+                _close_superseded_alerts(cursor, current["project_id"])
         _insert_event(
             cursor,
             deployment_id,

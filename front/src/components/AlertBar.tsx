@@ -13,13 +13,16 @@ export default function AlertBar() {
 
   useEffect(
     () =>
-      subscribeAlerts((a) =>
-        setAlerts((m) => {
-          const next = { ...m }
-          if (a.active) next[a.deploymentId] = a
-          else delete next[a.deploymentId]
-          return next
-        }),
+      subscribeAlerts(
+        (a) =>
+          setAlerts((m) => {
+            const next = { ...m }
+            if (a.active) next[a.deploymentId] = a
+            else delete next[a.deploymentId]
+            return next
+          }),
+        // 연결을 새로 열면 켜진 알림 전체가 다시 오므로, 끊긴 사이에 풀린 알림이 남지 않게 비운다
+        () => setAlerts({}),
       ),
     [],
   )

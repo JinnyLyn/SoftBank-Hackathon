@@ -2462,5 +2462,30 @@ class CapacityTests(Base):
         worker.check_capacity(self.api, self.cfg, self.state)
         self.assertEqual(self.aws_calls(), [], "1분 안에는 다시 확인하지 않음")
 
+    def test_unexpected_error_does_not_escape_and_is_logged_once(self):
+        """잘못된 응답 형식(목록 항목이 객체가 아님)이어도 tick을 멈추지 않고, 같은 오류는 한 번만 로그에 남기며, 정상으로 돌아오면 다시 동작한다"""
+        self.backend.monitored = ["not-an-object"]
+        with mock.patch.object(worker, "log") as log:
+            self.check()
+            self.check()
+        self.assertEqual(self.backend.alerts, [])
+        errors = [c.args[0] for c in log.call_args_list if "예상 못 한 오류" in c.args[0]]
+        self.assertEqual(len(errors), 1, "같은 오류는 성공할 때까지 한 번만 기록")
+        self.assertIn("AttributeError", errors[0])
+        self.assertIn("*", self.state.capacity_errors)
+        self.backend.monitored = [{"deployment_id": "d-1", "project_id": "p-1", "deploy_id": "laun1234", "min_tasks": 1, "max_tasks": 2}]
+        os.environ.update(FAKE_ECS_RUNNING="2", FAKE_CPU="90")
+        self.check()
+        self.assertEqual([b["active"] for _, b in self.backend.alerts], [True], "정상 응답이 오면 알림을 다시 올림")
+        self.assertNotIn("*", self.state.capacity_errors)
+
+    def test_tick_keeps_running_when_capacity_check_fails(self):
+        self.backend.monitored = {"unexpected": "shape"}   # 목록이 아님
+        self.state.capacity_checked = 0.0
+        with mock.patch.object(worker, "verify_connections"), mock.patch.object(worker, "plan_pending") as planned:
+            self.cfg.targets = ("aws",)
+            worker.tick(self.api, self.cfg, self.state)
+        planned.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
