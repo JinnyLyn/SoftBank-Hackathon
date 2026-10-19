@@ -1412,7 +1412,11 @@ def read_capacity(cfg, env, cluster, deploy_id):
 
 def check_capacity(api, cfg, state):
     """용량 확인(_check_capacity)에서 예상 못 한 오류가 나도 tick을 멈추지 않는다(배포 작업과 계획은 계속한다).
-    같은 오류는 성공할 때까지 한 번만 로그에 남긴다(capacity_errors의 "*")."""
+    CAPACITY_CHECK_SECONDS마다 한 번만 실제로 확인한다. 같은 오류는 다음 확인이 성공할 때까지 한 번만 로그에 남긴다(capacity_errors의 "*").
+    간격 때문에 건너뛴 tick은 성공으로 세지 않는다(세면 5초마다 "*"가 지워져 같은 오류가 60초마다 다시 찍힌다)."""
+    if not state.capacity_enabled or time.time() - state.capacity_checked < CAPACITY_CHECK_SECONDS:
+        return
+    state.capacity_checked = time.time()
     try:
         _check_capacity(api, cfg, state)
     except Exception as e:   # noqa: BLE001 - 용량 알림은 부가 기능이라 예상 못 한 오류(잘못된 응답 형식 등)가 배포 작업을 멈추면 안 된다
@@ -1425,10 +1429,7 @@ def check_capacity(api, cfg, state):
 
 def _check_capacity(api, cfg, state):
     """healthy AWS 배포의 CPU·태스크 수를 읽어, 최대 태스크 수를 다 쓰고도 CPU가 높으면 알림을 올리고 내려가면 푼다.
-    CAPACITY_CHECK_SECONDS마다 한 번. 실패는 배포 작업을 막지 않는다(이 백엔드에 API가 없으면 조용히 끈다)."""
-    if not state.capacity_enabled or time.time() - state.capacity_checked < CAPACITY_CHECK_SECONDS:
-        return
-    state.capacity_checked = time.time()
+    간격 검사는 check_capacity가 한다. 실패는 배포 작업을 막지 않는다(이 백엔드에 API가 없으면 조용히 끈다)."""
     try:
         monitored = api.get("/api/worker/deployments/monitored") or []
     except ApiError as e:

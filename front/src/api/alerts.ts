@@ -46,13 +46,23 @@ const toAlert = (a: AlertOut): AppAlert => ({
 /**
  * 알림을 구독. 돌려준 함수로 끊는다.
  * 브라우저가 스스로 다시 연결하는 동안(readyState CONNECTING)에는 아무것도 하지 않고 Last-Event-ID로 이어 받게 둔다.
- * 응답을 거부당해 브라우저가 포기한 경우(CLOSED: 404·잘못된 Content-Type, 프록시 오류 등)에는 점점 늘리는 간격으로 직접 다시 연다.
- * 한 번도 연결되지 못한 채 5번 연속 거부당하면 알림 기능이 없는 예전 백엔드로 보고 그만둔다(화면 동작에는 영향 없음).
+ * 응답을 거부당해 브라우저가 포기한 경우(CLOSED: 프록시 502·잘못된 Content-Type, 404 등)에는 점점 늘리는 간격(최대 60초)으로
+ * 직접 다시 연다. 백엔드를 다시 배포하는 동안 오래 끊겨도 포기하지 않고 계속 시도한다.
+ * 포기하는 경우는 하나뿐이다: 알림 API(/api/alerts)가 404·405인 알림 기능이 없는 예전 백엔드. EventSource는 HTTP 상태를
+ * 알려주지 않아서, 포기하기 전에 fetch로 한 번 확인한다(화면 동작에는 영향 없음).
  * 직접 다시 연 연결은 Last-Event-ID가 없어 켜진 알림 전체를 다시 받으므로, 그 전에 onReset으로 화면의 알림을 비운다.
  */
 const RETRY_FIRST_MS = 5_000
 const RETRY_MAX_MS = 60_000
-const GIVE_UP_AFTER = 5
+
+async function backendHasAlerts(): Promise<boolean> {
+  try {
+    const res = await fetch('/api/alerts?active_only=true', { cache: 'no-store' })
+    return res.status !== 404 && res.status !== 405
+  } catch {
+    return true   // 연결이 안 되는 것이지 기능이 없는 것이 아니다: 계속 시도한다
+  }
+}
 
 export function subscribeAlerts(onAlert: (a: AppAlert) => void, onReset?: () => void): () => void {
   if (import.meta.env.VITE_USE_MOCK === 'true' || typeof EventSource === 'undefined') return () => {}
@@ -60,7 +70,6 @@ export function subscribeAlerts(onAlert: (a: AppAlert) => void, onReset?: () => 
   let timer: ReturnType<typeof setTimeout> | undefined
   let stopped = false
   let delay = RETRY_FIRST_MS
-  let rejected = 0
   let reopened = false
 
   const connect = () => {
@@ -75,17 +84,18 @@ export function subscribeAlerts(onAlert: (a: AppAlert) => void, onReset?: () => 
     })
     es.onopen = () => {
       delay = RETRY_FIRST_MS
-      rejected = 0
       if (reopened) onReset?.()
       reopened = false
     }
     es.onerror = () => {
       if (stopped || es.readyState !== EventSource.CLOSED) return
       es.close()
-      if (++rejected >= GIVE_UP_AFTER) return
-      reopened = true
-      timer = setTimeout(connect, delay)
-      delay = Math.min(delay * 2, RETRY_MAX_MS)
+      void backendHasAlerts().then((supported) => {
+        if (stopped || !supported) return
+        reopened = true
+        timer = setTimeout(connect, delay)
+        delay = Math.min(delay * 2, RETRY_MAX_MS)
+      })
     }
   }
   connect()

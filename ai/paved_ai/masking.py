@@ -153,7 +153,7 @@ BACKEND_KEY_ASSIGNMENT = re.compile(
 BACKEND_ASSIGNMENT_VALUE = re.compile(
     r""""(?:\\.|[^"\\])*(?:"|\Z)|'(?:\\.|[^'\\])*(?:'|\Z)|\\"(?:(?!\\").)*(?:\\"|\Z)|\\'(?:(?!\\').)*(?:\\'|\Z)|[^\s,;}\]"']+"""
 )
-BACKEND_CREDENTIAL_URL = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*)://[^/\s:@]*:[^/\s@]+@")
+BACKEND_CREDENTIAL_URL = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,31})://[^/\s:@]*:[^/\s@]+@")
 BACKEND_BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 BACKEND_AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 

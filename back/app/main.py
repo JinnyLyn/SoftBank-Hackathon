@@ -98,7 +98,7 @@ _KEY_ASSIGNMENT = re.compile(
 _ASSIGNMENT_VALUE = re.compile(
     r""""(?:\\.|[^"\\])*(?:"|\Z)|'(?:\\.|[^'\\])*(?:'|\Z)|\\"(?:(?!\\").)*(?:\\"|\Z)|\\'(?:(?!\\').)*(?:\\'|\Z)|[^\s,;}\]"']+"""
 )
-_CREDENTIAL_URL = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*)://[^/\s:@]*:[^/\s@]+@")
+_CREDENTIAL_URL = re.compile(r"(?i)\b([a-z][a-z0-9+.-]{0,31})://[^/\s:@]*:[^/\s@]+@")
 _BEARER = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
 _AWS_ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 
@@ -782,15 +782,16 @@ def record_alert(deployment_id: UUID, body: AlertIn, x_worker_token: str | None 
         # 새 배포가 healthy가 될 때의 알림 정리(_close_superseded_alerts)와 같은 프로젝트 잠금: 둘 중 하나가 먼저 끝난다
         _lock_deployment_project(cursor, str(deployment_id))
         if body.active:
-            cursor.execute(
-                """SELECT d.status, d.target,
-                          (SELECT n.id FROM deployments n WHERE n.project_id = d.project_id AND n.target = 'aws'
-                           ORDER BY n.created_at DESC, n.id DESC LIMIT 1) AS latest_id
-                   FROM deployments d WHERE d.id = %s""",
-                (str(deployment_id),),
-            )
+            # 잠금 읽기(FOR UPDATE)는 스냅샷이 아니라 최신 커밋 상태를 읽는다. 일반 읽기는 프로젝트 잠금을 기다리기 전의 옛 상태를 볼 수 있다
+            cursor.execute("SELECT status, target, project_id FROM deployments WHERE id = %s FOR UPDATE", (str(deployment_id),))
             target = cursor.fetchone()
-            if target["target"] != "aws" or target["status"] != "healthy" or target["latest_id"] != str(deployment_id):
+            cursor.execute(
+                """SELECT id FROM deployments WHERE project_id = %s AND target = 'aws'
+                   ORDER BY created_at DESC, id DESC LIMIT 1 FOR UPDATE""",
+                (target["project_id"],),
+            )
+            latest = cursor.fetchone()
+            if target["target"] != "aws" or target["status"] != "healthy" or latest is None or latest["id"] != str(deployment_id):
                 # worker가 monitored를 읽고 CloudWatch를 조회하는 사이 새 배포가 나왔다면, 늦게 온 알림이 옛 배포에 영구히 켜지지 않게 한다
                 raise HTTPException(status.HTTP_409_CONFLICT, "용량 확인 대상(프로젝트의 최신 healthy AWS 배포)이 아닌 배포입니다.")
         cursor.execute(
@@ -812,7 +813,7 @@ def _close_superseded_alerts(cursor: Any, project_id: str, keep_deployment_id: s
     cursor.execute(
         """UPDATE deployment_alerts a JOIN deployments d ON d.id = a.deployment_id
            SET a.active = FALSE, a.message = %s, a.updated_at = CURRENT_TIMESTAMP(6)
-           WHERE d.project_id = %s AND a.active = TRUE AND a.deployment_id <> %s""",
+           WHERE d.project_id = %s AND d.target = 'aws' AND a.active = TRUE AND a.deployment_id <> %s""",
         ("이후 배포로 바뀌어 알림을 닫았습니다.", project_id, keep_deployment_id or ""),
     )
 
@@ -1331,6 +1332,8 @@ def claim_deployment(
                         failure_message,
                         None,
                     )
+                    if job["target"] == "aws":
+                        _close_superseded_alerts(cursor, job["project_id"])
                     connection.commit()
                 else:
                     connection.rollback()
@@ -1566,10 +1569,11 @@ def record_worker_event(
                 """UPDATE deployments SET status = %s, url = %s WHERE id = %s""",
                 (body.status, body.url if body.status == "healthy" else None, str(deployment_id)),
             )
-            if body.status == "healthy":
-                _close_superseded_alerts(cursor, current["project_id"], keep_deployment_id=str(deployment_id))
-            elif body.status in {"failed", "rolling_back"}:
-                _close_superseded_alerts(cursor, current["project_id"])
+            if current["target"] == "aws":   # 용량 알림은 AWS 배포에만 있다. 다른 대상의 이벤트가 AWS 알림을 닫지 않게 한다
+                if body.status == "healthy":
+                    _close_superseded_alerts(cursor, current["project_id"], keep_deployment_id=str(deployment_id))
+                elif body.status in {"failed", "rolling_back"}:
+                    _close_superseded_alerts(cursor, current["project_id"])
         _insert_event(
             cursor,
             deployment_id,

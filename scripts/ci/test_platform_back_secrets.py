@@ -3,11 +3,12 @@
 import json
 from pathlib import Path
 import sys
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "back"))
 from fastapi import HTTPException
-from app.main import _contains_inline_secret, _redact, _redact_tree, _reject_secret_fields
+from app.main import _CREDENTIAL_URL, _contains_inline_secret, _redact, _redact_tree, _reject_secret_fields
 
 
 SENTINEL = "SYNTHETIC_CI_SECRET"
@@ -69,6 +70,16 @@ class SecretBoundaryTests(unittest.TestCase):
                 self.assertNotIn(SENTINEL, raised.exception.detail)
                 self.assertNotIn(SENTINEL, _redact(text))
                 self.assertIn("[REDACTED]@", _redact(text))
+
+    def test_credential_url_pattern_stays_fast_on_long_adversarial_input(self):
+        # scheme 길이에 상한이 없으면 "a-" 반복처럼 :// 가 없는 긴 입력에서 O(n²)로 느려진다(4만 자에 6초). /api/plans의 variables는 최대 64KiB다
+        for unit in ("a-", "a.", "a+", "a1"):
+            text = unit * 20_000
+            with self.subTest(unit=unit):
+                started = time.perf_counter()
+                self.assertIsNone(_CREDENTIAL_URL.search(text))
+                self.assertLess(time.perf_counter() - started, 0.5, "정규식 검색이 입력 길이에 제곱으로 느려진다")
+        self.assertIsNotNone(_CREDENTIAL_URL.search("amqp+ssl://user:pw@mq"))   # 상한 안의 scheme은 그대로 잡는다
 
     def test_unterminated_quote_redacts_the_rest_of_the_text(self):
         self.assertEqual(_redact(f'PASSWORD="{SENTINEL}'), "PASSWORD=[REDACTED]")

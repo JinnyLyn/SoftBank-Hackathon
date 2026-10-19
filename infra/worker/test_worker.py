@@ -2518,6 +2518,18 @@ class CapacityTests(Base):
         self.assertEqual([b["active"] for _, b in self.backend.alerts], [True], "정상 응답이 오면 알림을 다시 올림")
         self.assertNotIn("*", self.state.capacity_errors)
 
+    def test_skipped_ticks_do_not_clear_the_error_flag(self):
+        """tick은 5초마다 돌고 실제 확인은 60초에 한 번이다. 간격 때문에 건너뛴 tick을 성공으로 세면 "*"가 지워져 같은 오류가 60초마다 다시 로그에 찍힌다"""
+        self.backend.monitored = ["not-an-object"]
+        with mock.patch.object(worker, "log") as log:
+            self.check()   # 첫 확인: 오류, 로그 한 번
+            for _ in range(5):   # 간격 안의 tick: 확인하지 않는다
+                worker.check_capacity(self.api, self.cfg, self.state)
+            self.check()   # 60초 뒤 다시 확인: 같은 오류
+        errors = [c.args[0] for c in log.call_args_list if "예상 못 한 오류" in c.args[0]]
+        self.assertEqual(len(errors), 1, "같은 오류를 다시 확인해도 한 번만 기록")
+        self.assertIn("*", self.state.capacity_errors)
+
     def test_tick_keeps_running_when_capacity_check_fails(self):
         self.backend.monitored = {"unexpected": "shape"}   # 목록이 아님
         self.state.capacity_checked = 0.0

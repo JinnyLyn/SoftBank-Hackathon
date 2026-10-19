@@ -13,6 +13,7 @@ import os
 import sys
 import time
 import uuid
+from pathlib import Path
 from urllib.request import Request, build_opener, ProxyHandler
 
 import test_platform_back_rollbacks as api
@@ -32,6 +33,13 @@ def new_project() -> dict:
 
 
 def deploy(project_id: str, suffix: str, deploy_id: str, final_state: str) -> dict:
+    _, deployment = queue_aws(project_id, suffix, deploy_id)
+    api.finish(deployment["id"], final_state, url=f"https://{suffix}.example.test" if final_state == "healthy" else None)
+    return deployment
+
+
+def queue_aws(project_id: str, suffix: str, deploy_id: str) -> tuple[dict, dict]:
+    """승인한 AWS 계획을 실행 대기열에 넣는다(아직 claim하지 않는다). (계획, 배포)를 돌려준다."""
     content = f"alert-plan-{suffix}".encode("utf-8")
     plan = api.request(
         "/api/plans", method="POST", expected=201,
@@ -49,9 +57,38 @@ def deploy(project_id: str, suffix: str, deploy_id: str, final_state: str) -> di
     )
     api.request(f"/api/plans/{plan['id']}/approve", method="POST", expected=200,
                 payload={"expected_fingerprint": plan["fingerprint"]})
-    deployment = api.queue_plan(plan)
-    api.finish(deployment["id"], final_state, url=f"https://{suffix}.example.test" if final_state == "healthy" else None)
-    return deployment
+    return plan, api.queue_plan(plan)
+
+
+COMPOSE = 'services:\n  app:\n    image: "pc-local/ab12cd34:s0123456789ab"\n    pull_policy: never\n'
+
+
+def queue_local(project_id: str) -> dict:
+    """같은 프로젝트의 로컬 Docker 배포를 실행 대기열에 넣는다."""
+    plan = api.request(
+        "/api/plans", method="POST", expected=201,
+        payload={
+            "project_id": project_id, "target": "local_docker", "module_id": "local-docker-compose",
+            "variables": {"deploy_id": "ab12cd34", "tier": "balanced", "connection_name": "발표자 PC (로컬 Docker)",
+                          "compose_yaml": COMPOSE},
+            "summary": "local docker plan",
+            "cost_estimate": {"amount": "0.0000", "currency": "USD", "period": "month", "pricing_as_of": "해당 없음(로컬 Docker)"},
+            "terraform_plan_sha256": hashlib.sha256(COMPOSE.encode("utf-8")).hexdigest(),
+        },
+    )
+    api.request(f"/api/plans/{plan['id']}/approve", method="POST", expected=200,
+                payload={"expected_fingerprint": plan["fingerprint"]})
+    return api.queue_plan(plan)
+
+
+def claim_until_quarantined(project_id: str, deployment_id: str, limit: int = 50) -> None:
+    """기본(AWS) worker로 claim을 반복해 deployment_id가 claim 단계에서 격리(failed)될 때까지 진행한다. 앞선 대기 작업이 있으면 그것부터 처리된다."""
+    for _ in range(limit):
+        api.request("/api/worker/deployments/claim", method="POST", expected=200, headers=TOKEN)
+        rows = api.request(f"/api/deployments?project_id={project_id}", expected=200)
+        if any(row["id"] == deployment_id and row["status"] == "failed" for row in rows):
+            return
+    raise AssertionError(f"deployment {deployment_id} was not quarantined by claim")
 
 
 def raise_alert(deployment_id: str) -> None:
@@ -128,6 +165,32 @@ def main() -> int:
     api.require(second["id"] not in ids, "alert stayed active after the latest deployment failed")
     api.require(bystander["id"] in ids, "another project's alert must not be closed by a failure")
     print("PASS: a failed latest deployment closes the project's alerts")
+
+    # 4. 로컬 Docker 배포의 이벤트(healthy·failed)는 같은 프로젝트의 AWS 알림을 닫지 않는다.
+    #    닫으면 worker는 이미 켜진 걸로 알고 다시 올리지 않아, 서버가 계속 과부하여도 사용자가 알림을 못 본다
+    mixed = new_project()
+    aws_first = deploy(mixed["id"], "mixed", "eeee5555", "healthy")
+    raise_alert(aws_first["id"])
+    local_ok = queue_local(mixed["id"])
+    api.finish(local_ok["id"], "healthy", url="http://localhost:18999")
+    api.require(aws_first["id"] in active_ids(), "a healthy local_docker deployment closed the AWS alert")
+    local_bad = queue_local(mixed["id"])
+    api.finish(local_bad["id"], "failed")
+    api.require(aws_first["id"] in active_ids(), "a failed local_docker deployment closed the AWS alert")
+    print("PASS: local_docker deployment events do not close the AWS alert")
+
+    # 5. claim 단계에서 격리(failed)된 새 배포도 이전 배포의 켜진 알림을 닫는다(worker는 최신 배포가 failed인 프로젝트를 더 확인하지 않는다)
+    quarantined = new_project()
+    stays = deploy(quarantined["id"], "quarantine-old", "ffff6666", "healthy")
+    raise_alert(stays["id"])
+    plan, broken = queue_aws(quarantined["id"], "quarantine-new", "gggg7777")
+    plan_dir = Path(os.environ.get("PLAN_ARTIFACT_DIR", "/var/lib/paved-clouds/plans"))
+    files = list(plan_dir.glob(f"{plan['id']}-*.tfplan"))
+    api.require(len(files) == 1, f"stored Terraform plan file not found for {plan['id']} in {plan_dir}")
+    files[0].write_bytes(b"tampered after approval")   # 승인 뒤 파일이 바뀌면 SHA-256 검증이 실패해 claim이 격리한다
+    claim_until_quarantined(quarantined["id"], broken["id"])
+    api.require(stays["id"] not in active_ids(), "alert stayed active after claim quarantined the newest deployment")
+    print("PASS: a deployment quarantined by claim closes the project's alerts")
     return 0
 
 
