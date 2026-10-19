@@ -1018,6 +1018,45 @@ class PlannerTests(Base):
         worker.plan_pending(self.api, self.cfg, state)
         self.assertEqual(len(self.backend.created_plans), 1)
 
+    def test_success_clears_the_failure_count_so_old_transient_errors_do_not_pile_up(self):
+        os.environ.update(FAKE_QUOTA_VALUE="0.1", FAKE_QUOTA_USED="0")   # 계획을 못 만드는 계정(일시 오류로 센다)
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        for _ in range(state.max_tries - 1):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(state.failures[p1["id"]][0], state.max_tries - 1)
+        os.environ["FAKE_QUOTA_VALUE"] = "1000"   # 할당량이 늘어 계획이 만들어진다
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        self.assertNotIn(p1["id"], state.failures, "성공하면 실패 횟수를 지운다")
+        # 사용자가 다른 안을 골라 다시 계획하다 일시 오류가 한 번 나도 쌓인 횟수 때문에 영구 중단되지 않는다
+        for plan in self.backend.plans[p1["id"]]:
+            plan["status"] = "superseded"
+        p1["requested_tier"] = "lean"
+        os.environ["FAKE_QUOTA_VALUE"] = "0.1"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(state.failures[p1["id"]][0], 1)
+        os.environ["FAKE_QUOTA_VALUE"] = "1000"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 2, "한 번의 일시 오류 뒤에도 다시 계획한다")
+
+    def test_new_user_request_retries_a_project_whose_attempts_are_used_up(self):
+        os.environ.update(FAKE_QUOTA_VALUE="0.1", FAKE_QUOTA_USED="0")
+        p1, _ = self.two_projects()
+        self.backend.projects = [p1]
+        state = worker.State(retry_after=0.0, recheck_after=0.0)
+        for _ in range(state.max_tries + 2):
+            worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(state.failures[p1["id"]][0], state.max_tries)
+        os.environ["FAKE_QUOTA_VALUE"] = "1000"
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(self.backend.created_plans, [], "사용자 요청이 없으면 횟수를 다 쓴 프로젝트는 계속 멈춘다")
+        p1["requested_tier"] = "lean"   # 사용자가 비교표에서 안을 골랐다
+        worker.plan_pending(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1, "새 요청은 이전 실패 횟수로 막지 않는다")
+        self.assertNotIn(p1["id"], state.failures)
+
     def test_budget_failure_is_reported_as_input(self):
         p1, _ = self.two_projects(budget="10.0000")
         self.backend.projects = [p1]

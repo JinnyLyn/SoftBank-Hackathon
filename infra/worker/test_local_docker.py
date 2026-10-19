@@ -711,6 +711,18 @@ class LocalPlannerTests(WorkerBase):
         self.assertEqual(self.backend.created_plans, [])
         self.assertEqual(state.local_failures[test_worker.PROJECT["id"]][0], 1)
 
+    def test_success_clears_the_local_failure_count(self):
+        pid = self.seed_project()["id"]
+        os.environ["FAKE_INFO_FAIL"] = "1"
+        state = worker.State(retry_after=0.0)
+        for _ in range(state.max_tries - 1):
+            worker.plan_pending_local(self.api, self.cfg, state)
+        self.assertEqual(state.local_failures[pid][0], state.max_tries - 1)
+        os.environ.pop("FAKE_INFO_FAIL")   # Docker가 다시 응답한다
+        worker.plan_pending_local(self.api, self.cfg, state)
+        self.assertEqual(len(self.backend.created_plans), 1)
+        self.assertNotIn(pid, state.local_failures, "성공하면 실패 횟수를 지운다")
+
     def test_existing_local_plan_or_a_decision_skips(self):
         pid = self.seed_project()["id"]
         for plans in (

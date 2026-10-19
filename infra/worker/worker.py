@@ -923,6 +923,7 @@ def plan_pending_local(api, cfg, state):
         try:
             plan_local_project(api, cfg, project, analysis)
             state.local_done[pid] = time.time()
+            state.local_failures.pop(pid, None)   # 성공하면 실패 횟수를 지운다(AWS 계획과 같은 이유)
         except Exception as e:  # noqa: BLE001 - 프로젝트 하나의 오류가 worker 전체를 멈추지 않게 한다
             retryable = getattr(e, "retryable", True)
             state.local_failures[pid] = (tries + 1 if retryable else state.max_tries, time.time())
@@ -1572,6 +1573,7 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
         if requested and state.requested.get(pid) != requested:
             state.requested[pid] = requested
             state.done.pop(pid, None)
+            state.failures.pop(pid, None)   # 사용자의 새 요청은 이전 실패 횟수로 막지 않는다(횟수를 다 쓴 프로젝트도 다시 시도한다)
         # 활성 계획이 있는 프로젝트도 recheck_after마다 다시 조회한다(같은 프로세스에서 계획이 superseded로 바뀔 수 있다)
         if pid in state.done and pid not in state.repair and time.time() - state.done[pid] < state.recheck_after:
             continue
@@ -1601,6 +1603,7 @@ def plan_pending(api, cfg, state, prices=None, arch="X86_64"):
             plan = plan_project(api, cfg, project, analysis, prices, arch)
             state.done[pid] = time.time()
             state.waiting.pop(pid, None)
+            state.failures.pop(pid, None)   # 성공하면 실패 횟수를 지운다. 안 지우면 일시 오류가 쌓여 나중에 한 번만 실패해도 영구 중단된다
             if plan.get("_upload_pending"):
                 state.repair.add(pid)
         except CapacityWait as e:
